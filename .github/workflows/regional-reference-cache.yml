@@ -1,0 +1,196 @@
+name: Regional Reference Cache
+
+on:
+  push:
+    paths:
+      - '.github/workflows/regional-reference-cache.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regional-reference-cache
+  cancel-in-progress: false
+
+jobs:
+  webtris:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/webtris
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Prepare storage
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+      - name: Fetch 20 sites x 30 days
+        run: |
+          python -m pip install -q requests
+          cat > /tmp/fetch.py <<'PY'
+          import json,time,requests,hashlib
+          from pathlib import Path
+          out=Path('out'); base='https://webtris.nationalhighways.co.uk/api/v1.0'
+          s=requests.Session(); s.headers['User-Agent']='public-transport-reference-cache/1.0'
+          r=s.get(base+'/sites',timeout=60); r.raise_for_status(); (out/'sites.json').write_bytes(r.content)
+          j=r.json()
+          rows=[]
+          if isinstance(j,list): rows=j
+          elif isinstance(j,dict):
+              for k in ('sites','Sites','rows','Rows'):
+                  if isinstance(j.get(k),list): rows=j[k]; break
+              if not rows:
+                  for v in j.values():
+                      if isinstance(v,list) and v and isinstance(v[0],dict): rows=v; break
+          ids=[]
+          for x in rows:
+              for k in ('Id','ID','id','SiteId','siteId','site_id'):
+                  if x.get(k) not in (None,''):
+                      ids.append(str(x[k])); break
+          # fallback known valid site from published sample
+          ids=['2']+[x for x in ids if x!='2']
+          picked=[]; failures=[]
+          for site in ids[:600]:
+              if len(picked)>=20: break
+              try:
+                  rr=s.get(base+'/reports/daily',params={'sites':site,'start_date':'01072026','end_date':'30072026'},timeout=90)
+                  rr.raise_for_status(); jj=rr.json()
+                  dat=jj.get('Rows') or jj.get('rows') or []
+                  if len(dat)>=500:
+                      fn=f'webtris_site_{site}_2026-07-01_30.json'
+                      (out/fn).write_bytes(rr.content)
+                      picked.append({'site_id':site,'rows':len(dat),'file':fn})
+              except Exception as e:
+                  failures.append({'site_id':site,'error':str(e)[:160]})
+              time.sleep(.03)
+          (out/'selection.json').write_text(json.dumps({'period':'2026-07-01..2026-07-30','selected':picked,'failures':failures[:100]},indent=2),encoding='utf-8')
+          if len(picked)<20: raise SystemExit(f'only {len(picked)} sites met >=500 rows')
+          for f in out.iterdir():
+              if f.is_file():
+                  (out/'SHA256SUMS.txt').open('a').write(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n')
+          PY
+          python /tmp/fetch.py
+      - name: Store
+        run: |
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 4 --checkers 8 --retries 5 --low-level-retries 10
+          rclone lsf "gdrive:$DEST" > /tmp/remote.txt
+          test "$(wc -l </tmp/remote.txt)" -ge 23
+
+  lodes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/lodes_ny_2023
+    steps:
+      - name: Fetch and store
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          base='https://lehd.ces.census.gov/data/lodes/LODES8/ny'
+          curl -fL --retry 5 "$base/od/ny_od_main_JT00_2023.csv.gz" -o out/ny_od_main_JT00_2023.csv.gz
+          curl -fL --retry 5 "$base/wac/ny_wac_S000_JT00_2023.csv.gz" -o out/ny_wac_S000_JT00_2023.csv.gz
+          curl -fL --retry 5 "$base/rac/ny_rac_S000_JT00_2023.csv.gz" -o out/ny_rac_S000_JT00_2023.csv.gz
+          curl -fL --retry 5 "$base/ny_xwalk.csv.gz" -o out/ny_xwalk.csv.gz
+          (cd out && sha256sum *.gz > SHA256SUMS.txt)
+          printf '%s\n' 'source=https://lehd.ces.census.gov/data/lodes/LODES8/ny/' 'version=LODES8' 'year=2023' > out/SOURCE.txt
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 4 --checkers 8 --retries 5 --low-level-retries 10
+
+  tlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/nyc_tlc_2026_05
+    steps:
+      - name: Fetch and store
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          curl -fL --retry 5 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2026-05.parquet' -o out/yellow_tripdata_2026-05.parquet
+          curl -fL --retry 5 'https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv' -o out/taxi_zone_lookup.csv
+          (cd out && sha256sum yellow_tripdata_2026-05.parquet taxi_zone_lookup.csv > SHA256SUMS.txt)
+          printf '%s\n' 'source=https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page' 'period=2026-05' > out/SOURCE.txt
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 2 --checkers 4 --retries 5 --low-level-retries 10
+
+  mta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/mta_nyc
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Fetch public schedule and demand slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install -q requests
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          curl -fL --retry 5 'https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip' -o out/mta_subway_gtfs_supplemented_20260902.zip
+          cat > /tmp/soda.py <<'PY'
+          import gzip,json,requests,time
+          from pathlib import Path
+          s=requests.Session(); s.headers['User-Agent']='public-transport-reference-cache/1.0'; out=Path('out')
+          def page(dataset,dest,extra=None,max_rows=50000000):
+              url=f'https://data.ny.gov/resource/{dataset}.csv'; off=0; total=0; first=True; limit=50000
+              with gzip.open(dest,'wt',encoding='utf-8',newline='') as g:
+                  while off<max_rows:
+                      p={'$limit':limit,'$offset':off}; p.update(extra or {})
+                      r=s.get(url,params=p,timeout=180); r.raise_for_status(); lines=r.text.splitlines()
+                      if not lines: break
+                      if first: g.write(r.text if r.text.endswith('\n') else r.text+'\n'); first=False
+                      else:
+                          body='\n'.join(lines[1:])
+                          if body: g.write(body+'\n')
+                      n=max(0,len(lines)-1); total+=n
+                      if n<limit: break
+                      off+=n; time.sleep(.03)
+              return total
+          od=page('28vm-gjqr',out/'mta_subway_od_beginning_2026.csv.gz')
+          q={'$select':'transit_timestamp,transit_mode,station_complex_id,station_complex,borough,sum(ridership) as ridership,sum(transfers) as transfers,latitude,longitude','$where':"transit_timestamp between '2026-07-01T00:00:00.000' and '2026-07-31T23:59:59.999'",'$group':'transit_timestamp,transit_mode,station_complex_id,station_complex,borough,latitude,longitude','$order':'transit_timestamp,station_complex_id'}
+          hr=page('5wq4-mkjj',out/'mta_subway_hourly_2026-07_station_aggregate.csv.gz',q)
+          (out/'QUERY_MANIFEST.json').write_text(json.dumps({'OD':{'dataset':'28vm-gjqr','rows':od,'coverage':'all rows returned at acquisition'},'hourly':{'dataset':'5wq4-mkjj','rows':hr,'coverage':'2026-07-01..2026-07-31','aggregation':'station_complex x hour, fare classes summed'}},indent=2),encoding='utf-8')
+          PY
+          python /tmp/soda.py
+          (cd out && sha256sum * > SHA256SUMS.txt)
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 3 --checkers 6 --retries 5 --low-level-retries 10
+
+  osm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/osm_socal_20260829
+    steps:
+      - name: Fetch pinned snapshot and store
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          curl -fL --retry 5 'https://download.geofabrik.de/north-america/us/california/socal-260829.osm.pbf' -o out/socal-260829.osm.pbf
+          curl -fL --retry 5 'https://download.geofabrik.de/north-america/us/california/socal-260829.osm.pbf.md5' -o out/socal-260829.osm.pbf.md5
+          (cd out && md5sum -c socal-260829.osm.pbf.md5 && sha256sum socal-260829.osm.pbf > SHA256SUMS.txt)
+          printf '%s\n' 'source=https://download.geofabrik.de/north-america/us/california/socal.html' 'snapshot=2026-08-29' > out/SOURCE.txt
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 1 --checkers 2 --drive-chunk-size 128M --retries 5 --low-level-retries 10

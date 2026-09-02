@@ -1,0 +1,61 @@
+name: OpenCity T1 OSM Scotland repair 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t1-osm-scotland-repair-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  FOLDER_ID: '11__NCGmNOEKHWaCuOxfuCkyGo5qbB5uj'
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+      - name: Acquire Scotland OSM from the current Geofabrik UK path
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rclone lsjson "$R:ACQUISITION_MANIFEST.json" --drive-root-folder-id "$FOLDER_ID" --files-only 2>/dev/null | jq -e 'length>0' >/dev/null 2>&1; then
+            echo 'SKIP: OSM Scotland acquisition manifest already present'; exit 0
+          fi
+          W=/tmp/osm_scotland; mkdir -p "$W"
+          URL='https://download.geofabrik.de/europe/united-kingdom/scotland-latest.osm.pbf'
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 5400 "$URL" -o "$W/scotland-latest.osm.pbf"
+          curl -fL --retry 5 "$URL.md5" -o "$W/provider.md5"
+          curl -fsSI -L "$URL" > "$W/HEADERS.txt" || true
+          EMD5="$(awk '{print tolower($1); exit}' "$W/provider.md5")"
+          GOT_MD5="$(md5sum "$W/scotland-latest.osm.pbf" | awk '{print $1}')"
+          test "$GOT_MD5" = "$EMD5"
+          SHA="$(sha256sum "$W/scotland-latest.osm.pbf" | awk '{print $1}')"
+          BYTES="$(stat -c '%s' "$W/scotland-latest.osm.pbf")"
+          MOD="$(awk 'BEGIN{IGNORECASE=1}/^last-modified:/{sub(/^[^:]+:[[:space:]]*/,""); sub(/\r$/,""); print; exit}' "$W/HEADERS.txt")"
+          python - "$URL" "$SHA" "$BYTES" "$GOT_MD5" "$MOD" > "$W/ACQUISITION_MANIFEST.json" <<'PY'
+          import datetime,json,sys
+          url,sha,nbytes,md5,lastmod=sys.argv[1:]
+          print(json.dumps({'state':'ACQUIRED','evidence_class':'public_data registry / official public source','provider':'Geofabrik / OpenStreetMap','dataset':'Scotland OSM PBF','source_url':url,'provider_md5_url':url+'.md5','retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'provider_last_modified':lastmod or None,'file':'scotland-latest.osm.pbf','bytes':int(nbytes),'provider_md5':md5,'sha256':sha,'authentication':'none','license':'OpenStreetMap ODbL','repair_note':'The first attempt used obsolete /europe/great-britain/scotland-latest.osm.pbf. Geofabrik currently lists Scotland under /europe/united-kingdom/.'},indent=2))
+          PY
+          printf '%s  scotland-latest.osm.pbf\n' "$SHA" > "$W/SHA256SUMS.txt"
+          rclone copy "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 2 --checkers 4
+          rclone check "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --one-way --size-only
+          echo "ACQUIRED Scotland OSM sha256=$SHA bytes=$BYTES"

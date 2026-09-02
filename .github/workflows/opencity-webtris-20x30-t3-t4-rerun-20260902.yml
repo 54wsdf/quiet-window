@@ -41,15 +41,15 @@ jobs:
           echo "config=$CFG" >> "$GITHUB_OUTPUT"
           echo "remote=$R" >> "$GITHUB_OUTPUT"
 
-      - name: Copy frozen WebTRIS acquisition and verify manifest exists
+      - name: Copy usable frozen WebTRIS acquisition and verify manifest exists
         shell: bash
         env:
           CFG: ${{ steps.storage.outputs.config }}
           R: ${{ steps.storage.outputs.remote }}
         run: |
           set -euo pipefail
-          SRC="$ROOT/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day"
-          IN="$RUNNER_TEMP/webtris_20site_30day"
+          SRC="$ROOT/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day_v2_usable_M1"
+          IN="$RUNNER_TEMP/webtris_20site_30day_v2_usable_M1"
           mkdir -p "$IN"
           rclone copy "$R:$SRC" "$IN" --config "$CFG" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
           test -s "$IN/ACQUISITION_MANIFEST.json"
@@ -59,8 +59,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          IN="$RUNNER_TEMP/webtris_20site_30day"
-          OUT="$RUNNER_TEMP/t3_t4_webtris_20x30"
+          IN="$RUNNER_TEMP/webtris_20site_30day_v2_usable_M1"
+          OUT="$RUNNER_TEMP/t3_t4_webtris_M1_20x30"
           python opencity_exec/t3_t4_webtris_20site_30day_public_registry.py --input-dir "$IN" --output "$OUT"
           test -s "$OUT/summary.json"
           jq -e '.site_count >= 20 and .min_days_per_site >= 30 and .input_hash_mismatches == 0' "$OUT/summary.json" >/dev/null
@@ -74,8 +74,8 @@ jobs:
             "executor_commit": "${GITHUB_SHA}",
             "canonical_code_path": "54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t3_t4_webtris_20site_30day_public_registry.py",
             "execution_copy_sha256": "${SCRIPT_SHA}",
-            "input_drive_path": "$ROOT/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day",
-            "output_drive_path": "$ROOT/04_outputs/OpenCity_T3_T4_WebTRIS_20x30_public_registry_rerun_20260902"
+            "input_drive_path": "$ROOT/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day_v2_usable_M1",
+            "output_drive_path": "$ROOT/04_outputs/OpenCity_T3_T4_WebTRIS_M1_20x30_public_registry_rerun_20260902"
           }
           EOF
           (cd "$OUT" && sha256sum README.md summary.json t3_site_metrics.csv t4_loso_site_metrics.csv t4_loso_regime_metrics.csv INPUT_SHA256.txt EXECUTION_MANIFEST.json > OUTPUT_SHA256.txt)
@@ -87,8 +87,8 @@ jobs:
           R: ${{ steps.storage.outputs.remote }}
         run: |
           set -euo pipefail
-          OUT="$RUNNER_TEMP/t3_t4_webtris_20x30"
-          DEST="$ROOT/04_outputs/OpenCity_T3_T4_WebTRIS_20x30_public_registry_rerun_20260902"
+          OUT="$RUNNER_TEMP/t3_t4_webtris_M1_20x30"
+          DEST="$ROOT/04_outputs/OpenCity_T3_T4_WebTRIS_M1_20x30_public_registry_rerun_20260902"
           rclone copy "$OUT" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
           rclone check "$OUT" "$R:$DEST" --config "$CFG" --one-way --size-only
           echo "COMPLETED -> $DEST"

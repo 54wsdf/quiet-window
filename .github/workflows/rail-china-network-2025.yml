@@ -1,0 +1,33 @@
+name: Rail China Network 2025
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-china-network-2025.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  cptond:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Figshare 全文件直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/research_record_direct.py --provider figshare --record-id '29377427' --dataset-id 'cptond_2025' --drive-path '01_rail/CN_CPTOND_2025/06_infrastructure' --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

@@ -1,0 +1,88 @@
+name: OpenCity T1 OSM OpenRoads public registry 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t1-osm-openroads-public-registry-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OSM_FOLDER_ID: '11__NCGmNOEKHWaCuOxfuCkyGo5qbB5uj'
+  OPENROADS_FOLDER_ID: '1LrsppubjW6BwLE0Nr0amZrRh0gAv2QsO'
+  OUTPUT_FOLDER_ID: '1b2gRoxUxWN5U_oD9l1_8L6oJ9mlIn5GE'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Install runtime and configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip
+          python -m pip install --disable-pip-version-check pandas numpy scipy geopandas shapely pyogrio pyproj networkx osmium
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"; test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+      - name: Materialize and verify closed official source bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          D=/tmp/t1src; mkdir -p "$D/openroads"
+          rclone copyto "$R:scotland-latest.osm.pbf" "$D/scotland-latest.osm.pbf" --drive-root-folder-id "$OSM_FOLDER_ID" --retries 8 --low-level-retries 20
+          rclone copyto "$R:oproad_gpkg_gb.zip" "$D/oproad_gpkg_gb.zip" --drive-root-folder-id "$OPENROADS_FOLDER_ID" --retries 8 --low-level-retries 20
+          echo 'aa41b545007da110375d0c46e258ad035c75e8bb97339b71d891c04cc0378f91  /tmp/t1src/scotland-latest.osm.pbf' | sha256sum -c -
+          echo '908c0edabfa5301571456197cce95b2a8ce15046960a988141722c69e36f202b  /tmp/t1src/oproad_gpkg_gb.zip' | sha256sum -c -
+          unzip -q "$D/oproad_gpkg_gb.zip" -d "$D/openroads"
+          GPKG="$(find "$D/openroads" -type f -iname '*.gpkg' | head -1)"; test -n "$GPKG"
+          cp "$GPKG" "$D/openroads.gpkg"
+          sha256sum "$D/openroads.gpkg" > /tmp/OPENROADS_GPKG_SHA256.txt
+      - name: Run Glasgow OSM/OpenRoads topology rehearsal
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/t1out; mkdir -p "$OUT"
+          python scripts/opencity/t1_osm_openroads_public_registry.py --osm /tmp/t1src/scotland-latest.osm.pbf --openroads /tmp/t1src/openroads.gpkg --output "$OUT" --audit-links 200 --od-pairs 500
+      - name: Acceptance and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          s=json.load(open('/tmp/t1out/summary.json'))
+          assert s['scale']['openroads_links_in_window'] >= 200
+          assert s['audit']['public_reference_links'] == 200
+          assert s['routing']['truth_connected_od_pairs_scored'] == 500
+          assert s['source_sha256']['osm_scotland_pbf']=='aa41b545007da110375d0c46e258ad035c75e8bb97339b71d891c04cc0378f91'
+          assert s['status']=='PUBLIC_OSM_OPENROADS_TOPOLOGY_REHEARSAL_CLOSED'
+          print(json.dumps(s,indent=2))
+          PY
+          CORE_SHA="$(sha256sum scripts/opencity/t1_osm_openroads_public_registry.py | awk '{print $1}')"
+          GPKG_SHA="$(awk '{print $1}' /tmp/OPENROADS_GPKG_SHA256.txt)"
+          python - "$CORE_SHA" "$GPKG_SHA" "$GITHUB_RUN_ID" "$GITHUB_SHA" > /tmp/t1out/EXECUTION_MANIFEST.json <<'PY'
+          import json,sys
+          core,gpkg,run,commit=sys.argv[1:]
+          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'executor_commit':commit,'canonical_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t1_osm_openroads_public_registry.py','execution_code_sha256':core,'source_archives':{'osm_pbf_sha256':'aa41b545007da110375d0c46e258ad035c75e8bb97339b71d891c04cc0378f91','os_open_roads_zip_sha256':'908c0edabfa5301571456197cce95b2a8ce15046960a988141722c69e36f202b','os_open_roads_extracted_gpkg_sha256':gpkg},'output_drive_folder_id':'1b2gRoxUxWN5U_oD9l1_8L6oJ9mlIn5GE'},indent=2))
+          PY
+          (cd /tmp/t1out && sha256sum * > OUTPUT_SHA256SUMS.txt)
+      - name: Persist results and verify remote sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/t1out "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check /tmp/t1out "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --one-way --size-only
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true

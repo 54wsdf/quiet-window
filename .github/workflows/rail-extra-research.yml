@@ -1,0 +1,62 @@
+name: Rail Extra Research
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-extra-research.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  records:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {provider: figshare, record: '25904512', id: shanghai_metro_peak_od_network, path: '01_rail/CN_Shanghai_Metro/04_demand_od/peak_network_od'}
+          - {provider: zenodo, record: '6468325', id: railtoolkit_rolling_stock_data, path: '01_rail/EU_RailToolKit/07_rolling_stock_composition/vehicle_parameters'}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: 研究记录全文件直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          python scripts/fetchers/research_record_direct.py --provider '${{ matrix.provider }}' --record-id '${{ matrix.record }}' --dataset-id '${{ matrix.id }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"
+
+  vehicle-dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 获取 ECOPT Vehicle Dispatching benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          URL='https://www.eur.nl/sites/corporate/files/transitNetworks.zip'; P="$RUNNER_TEMP/transitNetworks.zip"
+          curl -fL --retry 8 --retry-all-errors "$URL" -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST='05_simulation_benchmarks/public_transit/ECOPT_vehicle_dispatch/transitNetworks.zip'
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","source":"Erasmus ECOPT","file":"transitNetworks.zip","bytes":%s,"sha256":"%s","run_id":"%s"}\n' "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/manifest.json"
+          rclone copyto "$RUNNER_TEMP/manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

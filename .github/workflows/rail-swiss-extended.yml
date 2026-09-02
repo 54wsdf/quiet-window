@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  ckan:
+  public-pages:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -18,16 +18,16 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-          - {package: occupancy-forecast-siri-dataset, id: ch_occupancy_siri, path: '01_rail/CH_swiss/04_demand_od/occupancy_forecast_siri'}
-          - {package: occupancy-forecast-json-dataset, id: ch_occupancy_json, path: '01_rail/CH_swiss/04_demand_od/occupancy_forecast_json'}
-          - {package: timetablenetex_2026, id: ch_netex_2026, path: '01_rail/CH_swiss/01_schedule/netex_2026'}
+          - {page: 'https://data.opentransportdata.swiss/en/dataset/occupancy-forecast-siri-dataset', id: ch_occupancy_siri, path: '01_rail/CH_swiss/04_demand_od/occupancy_forecast_siri'}
+          - {page: 'https://data.opentransportdata.swiss/en/dataset/occupancy-forecast-json-dataset', id: ch_occupancy_json, path: '01_rail/CH_swiss/04_demand_od/occupancy_forecast_json'}
+          - {page: 'https://data.opentransportdata.swiss/en/dataset/timetablenetex_2026', id: ch_netex_2026, path: '01_rail/CH_swiss/01_schedule/netex_2026'}
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with: {python-version: '3.12'}
-      - name: CKAN 全资源直传
+      - name: 公开页面资源全量直传
         shell: bash
         run: |
           set -euo pipefail
@@ -36,5 +36,5 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
           CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
-          python scripts/fetchers/ckan_package_direct.py --base 'https://data.opentransportdata.swiss' --package '${{ matrix.package }}' --dataset-id '${{ matrix.id }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R"
+          python scripts/fetchers/ckan_html_direct.py --page '${{ matrix.page }}' --dataset-id '${{ matrix.id }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R"
           shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

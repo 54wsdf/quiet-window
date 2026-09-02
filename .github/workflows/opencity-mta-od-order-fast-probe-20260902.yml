@@ -1,0 +1,46 @@
+name: OpenCity MTA OD fast order probe 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-order-fast-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Probe likely stable orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests
+          python - <<'PY'
+          import csv,io,json,requests
+          base='https://data.ny.gov/resource/28vm-gjqr.csv'
+          expected={
+            0:['2026','1','Monday','1','2026-01-05T01:00:00.000','16','8 St-NYU (R,W)','40.730328','-73.992629','452','90 St-Elmhurst Av (7)','40.748408','-73.876613','0.3332','POINT (-73.992629 40.730328)','POINT (-73.876613 40.748408)'],
+            56100000:['2026','6','Wednesday','10','2026-06-10T10:00:00.000','259','Kew Gardens-Union Tpke (E,F)','40.714441','-73.831008','86','Cypress Hills (J)','40.689941','-73.87255','0.3033','POINT (-73.831008 40.714441)','POINT (-73.87255 40.689941)']
+          }
+          orders=['timestamp,origin_station_complex_id,destination_station_complex_id',':id']
+          s=requests.Session(); s.headers['User-Agent']='OpenCity-MTA-OD-fast-order-probe/20260902'
+          out=[]
+          for order in orders:
+              rec={'order':order,'checks':{}}
+              for off,want in expected.items():
+                  r=s.get(base,params={'$limit':1,'$offset':off,'$order':order},timeout=240); r.raise_for_status()
+                  rows=list(csv.reader(io.StringIO(r.text))); got=rows[1] if len(rows)>1 else None
+                  rec['checks'][str(off)]={'exact':got==want,'got':got}
+              out.append(rec)
+          print('__RESULT_BEGIN__')
+          print(json.dumps(out,indent=2))
+          print('__RESULT_END__')
+          PY

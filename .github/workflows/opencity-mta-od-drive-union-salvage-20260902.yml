@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/opencity-mta-od-drive-union-salvage-20260902.yml'
       - 'scripts/opencity/mta_od_drive_union_salvage.py'
+      - 'scripts/opencity/mta_od_drive_union_salvage_entry.py'
   workflow_dispatch:
 
 permissions:
@@ -76,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/opencity/mta_od_drive_union_salvage.py --mode shard --shard '${{ matrix.shard }}'
+          python scripts/opencity/mta_od_drive_union_salvage_entry.py --mode shard --shard '${{ matrix.shard }}'
       - name: Cleanup Drive credentials
         if: always()
         shell: bash
@@ -108,7 +109,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/opencity/mta_od_drive_union_salvage.py --mode finalize
+          python scripts/opencity/mta_od_drive_union_salvage_entry.py --mode finalize
       - name: Cleanup Drive credentials
         if: always()
         shell: bash

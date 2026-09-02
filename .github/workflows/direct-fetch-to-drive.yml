@@ -1,0 +1,234 @@
+name: Direct Fetch
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: '公开数据资产 ID'
+        required: true
+        type: string
+      source_url:
+        description: '公开 HTTPS 下载地址'
+        required: true
+        type: string
+      drive_path:
+        description: '长期存储相对路径'
+        required: true
+        type: string
+      filename:
+        description: '目标文件名；留空则使用 URL 文件名'
+        required: false
+        type: string
+      expected_sha256:
+        description: '可选：已知 SHA-256'
+        required: false
+        type: string
+      terms_url:
+        description: '可选：License / Terms 页面'
+        required: false
+        type: string
+      time_coverage:
+        description: '可选：数据覆盖时期'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - name: 检查长期存储运行时配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo '缺少运行时长期存储配置：GDRIVE_RCLONE_CONFIG_B64'
+            echo '本任务不会下载数据，也不会创建 Artifact。'
+            exit 3
+          fi
+
+      - name: 检出执行工具
+        uses: actions/checkout@v5
+
+      - name: 准备 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 安装运行依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 2
+
+      - name: 恢复临时 rclone 配置
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          if [[ -z "$REMOTE_NAME" ]]; then
+            echo 'rclone 配置中没有找到 remote section' >&2
+            exit 4
+          fi
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          echo 'rclone 配置已载入；内容不会写入日志。'
+
+      - name: 校验输入路径
+        id: path
+        shell: bash
+        env:
+          DRIVE_PATH: ${{ inputs.drive_path }}
+        run: |
+          set -euo pipefail
+          P="${DRIVE_PATH#/}"
+          P="${P%/}"
+          if [[ -z "$P" ]]; then
+            echo '长期存储路径不能为空' >&2
+            exit 5
+          fi
+          if [[ "$P" == *'..'* || "$P" == *$'\n'* || "$P" == *$'\r'* ]]; then
+            echo '长期存储路径包含不允许的内容' >&2
+            exit 5
+          fi
+          echo "drive_path=$P" >> "$GITHUB_OUTPUT"
+
+      - name: 获取公开数据并生成校验信息
+        id: fetch
+        shell: bash
+        env:
+          DATASET_ID: ${{ inputs.dataset_id }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          REQUESTED_FILENAME: ${{ inputs.filename }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+          TERMS_URL: ${{ inputs.terms_url }}
+          TIME_COVERAGE: ${{ inputs.time_coverage }}
+        run: |
+          set -euo pipefail
+          WORKDIR="$RUNNER_TEMP/quiet-window-payload"
+          mkdir -p "$WORKDIR"
+          ARGS=(
+            --dataset-id "$DATASET_ID"
+            --url "$SOURCE_URL"
+            --output-dir "$WORKDIR"
+          )
+          if [[ -n "${REQUESTED_FILENAME:-}" ]]; then
+            ARGS+=(--filename "$REQUESTED_FILENAME")
+          fi
+          if [[ -n "${EXPECTED_SHA256:-}" ]]; then
+            ARGS+=(--expected-sha256 "$EXPECTED_SHA256")
+          fi
+          if [[ -n "${TERMS_URL:-}" ]]; then
+            ARGS+=(--terms-url "$TERMS_URL")
+          fi
+          if [[ -n "${TIME_COVERAGE:-}" ]]; then
+            ARGS+=(--time-coverage "$TIME_COVERAGE")
+          fi
+          python scripts/lib/direct_fetch_to_rclone.py "${ARGS[@]}"
+
+          PAYLOAD="$(find "$WORKDIR" -maxdepth 1 -type f ! -name '*.manifest.json' -print -quit)"
+          if [[ -z "$PAYLOAD" ]]; then
+            echo '没有找到下载结果' >&2
+            exit 6
+          fi
+          FILENAME="$(basename "$PAYLOAD")"
+          MANIFEST="$WORKDIR/$FILENAME.manifest.json"
+          SIZE="$(stat -c '%s' "$PAYLOAD")"
+          echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+          echo "payload=$PAYLOAD" >> "$GITHUB_OUTPUT"
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "manifest=$MANIFEST" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: 直接写入长期存储
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          DRIVE_PATH: ${{ steps.path.outputs.drive_path }}
+          PAYLOAD: ${{ steps.fetch.outputs.payload }}
+          FILENAME: ${{ steps.fetch.outputs.filename }}
+        run: |
+          set -euo pipefail
+          DEST="$REMOTE_NAME:$DRIVE_PATH/$FILENAME"
+          rclone copyto "$PAYLOAD" "$DEST" \
+            --config "$CONFIG_FILE" \
+            --retries 8 \
+            --low-level-retries 20 \
+            --transfers 1 \
+            --checkers 4 \
+            --stats 30s \
+            --stats-one-line
+
+      - name: 核验远端字节数
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          DRIVE_PATH: ${{ steps.path.outputs.drive_path }}
+          FILENAME: ${{ steps.fetch.outputs.filename }}
+          LOCAL_SIZE: ${{ steps.fetch.outputs.size }}
+        run: |
+          set -euo pipefail
+          REMOTE_JSON="$(rclone lsjson "$REMOTE_NAME:$DRIVE_PATH/$FILENAME" --config "$CONFIG_FILE" --files-only)"
+          REMOTE_SIZE="$(printf '%s' "$REMOTE_JSON" | jq -r '.[0].Size // empty')"
+          if [[ -z "$REMOTE_SIZE" || "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
+            echo "远端字节数核验失败: local=$LOCAL_SIZE remote=${REMOTE_SIZE:-missing}" >&2
+            exit 7
+          fi
+          echo "远端字节数核验通过: $LOCAL_SIZE bytes"
+
+      - name: 将 manifest 升级为 ACQUIRED 并写入长期存储
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          DRIVE_PATH: ${{ steps.path.outputs.drive_path }}
+          FILENAME: ${{ steps.fetch.outputs.filename }}
+          MANIFEST: ${{ steps.fetch.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['MANIFEST'])
+          d = json.loads(p.read_text(encoding='utf-8'))
+          d['state'] = 'ACQUIRED'
+          d['durable_storage'] = {
+              'backend': 'rclone',
+              'path': os.environ['DRIVE_PATH'] + '/' + os.environ['FILENAME'],
+              'verified_by': 'remote_size',
+          }
+          p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+          rclone copyto "$MANIFEST" "$REMOTE_NAME:$DRIVE_PATH/$FILENAME.manifest.json" \
+            --config "$CONFIG_FILE" \
+            --retries 5 \
+            --low-level-retries 10 \
+            --transfers 1 \
+            --checkers 2
+          echo '数据与 ACQUIRED manifest 已写入长期存储。'
+
+      - name: 清理临时配置
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -47,5 +48,41 @@ def discover_source_ids(remote):
     return verified
 
 
+def provider_snapshot_without_count_query(session):
+    """Validate the frozen Socrata data version without an expensive count(*) call.
+
+    The producer run already froze EXPECTED_ROWS=72,639,113 and the :id chunk
+    contract. Refill safety therefore needs to prove that the live dataset is still
+    the same data revision before querying a missing chunk. rowsUpdatedAt and
+    viewLastModified come from the lightweight metadata endpoint and are both
+    pinned to the acquisition snapshot. This avoids repeated count(*) timeouts
+    while preserving a hard version gate.
+    """
+    last = None
+    for attempt in range(8):
+        try:
+            r = session.get(mod.META_URL, timeout=120)
+            r.raise_for_status()
+            meta = r.json()
+            rows_updated = int(meta.get("rowsUpdatedAt") or 0)
+            view_modified = int(meta.get("viewLastModified") or 0)
+            return {
+                "rowsUpdatedAt": rows_updated,
+                "viewLastModified": view_modified,
+                "row_count": mod.EXPECTED_ROWS,
+                "row_count_evidence": "frozen producer contract; live count(*) intentionally skipped",
+                "matches_required_version": (
+                    rows_updated == mod.EXPECTED_ROWS_UPDATED_AT
+                    and view_modified == mod.EXPECTED_VIEW_LAST_MODIFIED
+                ),
+            }
+        except Exception as exc:
+            last = exc
+            if attempt < 7:
+                time.sleep(min(2 ** attempt, 30))
+    raise RuntimeError(f"metadata version probe failed after retries: {last}")
+
+
 mod.discover_source_ids = discover_source_ids
+mod.provider_snapshot = provider_snapshot_without_count_query
 mod.main()

@@ -1,0 +1,115 @@
+name: OpenCity MTA OD Drive union salvage 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-drive-union-salvage-20260902.yml'
+      - 'scripts/opencity/mta_od_drive_union_salvage.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  PRODUCER_RUN_ID: '33615833576'
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify producer completed with all 8 download shards successful
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, urllib.request
+          repo=os.environ['GITHUB_REPOSITORY']
+          run=os.environ['PRODUCER_RUN_ID']
+          req=urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/actions/runs/{run}/jobs?per_page=100',
+              headers={'Authorization':f"Bearer {os.environ['GH_TOKEN']}",'Accept':'application/vnd.github+json'}
+          )
+          with urllib.request.urlopen(req, timeout=60) as r:
+              j=json.load(r)
+          shards=[x for x in j.get('jobs',[]) if 'MTA OD download shard' in x.get('name','')]
+          if len(shards)!=8:
+              raise SystemExit(f'producer shard job count {len(shards)} != 8')
+          bad=[(x.get('name'),x.get('status'),x.get('conclusion')) for x in shards if x.get('conclusion')!='success']
+          if bad:
+              raise SystemExit(f'producer shards not all successful: {bad}')
+          print(json.dumps({'producer_run_id':run,'producer_download_shards':8,'all_shards_success':True},indent=2))
+          PY
+
+  salvage:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure direct Google Drive access
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check requests
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$REMOTE_NAME"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+      - name: Union shard into pre-created canonical folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/opencity/mta_od_drive_union_salvage.py --mode shard --shard '${{ matrix.shard }}'
+      - name: Cleanup Drive credentials
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true
+
+  finalize:
+    needs: salvage
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure direct Google Drive access
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check requests
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$REMOTE_NAME"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+      - name: Close canonical acquisition manifest only after all gates pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/opencity/mta_od_drive_union_salvage.py --mode finalize
+      - name: Cleanup Drive credentials
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true

@@ -1,0 +1,52 @@
+name: Rail Source Discovery Debug
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-source-discovery-debug.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  swiss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Inspect Swiss actual archive listing
+        shell: bash
+        run: |
+          set -euo pipefail
+          for URL in \
+            'https://archive.opentransportdata.swiss/istdaten.php' \
+            'https://archive.opentransportdata.swiss/actual_data_archive.htm'; do
+            echo "===== $URL ====="
+            curl --compressed -fsSL --retry 5 -A 'curl/8.5.0' "$URL" -o /tmp/page.html
+            echo "bytes=$(wc -c < /tmp/page.html)"
+            echo '-- 2016/2017 related lines --'
+            grep -Eio '.{0,120}(2016|2017).{0,180}' /tmp/page.html | head -n 120 || true
+            echo '-- zip hrefs --'
+            grep -Eio 'href=["'"'][^"'"']+\.zip[^"'"']*["'"']' /tmp/page.html | head -n 160 || true
+          done
+
+  numbat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Inspect TfL crowding and NUMBAT listings
+        shell: bash
+        run: |
+          set -euo pipefail
+          for URL in \
+            'https://crowding.data.tfl.gov.uk/' \
+            'https://crowding.data.tfl.gov.uk/NUMBAT/' \
+            'https://crowding.data.tfl.gov.uk/NUMBAT/NUMBAT%202020/' \
+            'https://crowding.data.tfl.gov.uk/NUMBAT/NUMBAT%202023/' \
+            'https://crowding.data.tfl.gov.uk/NUMBAT/NUMBAT%202024/'; do
+            echo "===== $URL ====="
+            curl --compressed -fLsS --retry 3 -A 'Mozilla/5.0' "$URL" -o /tmp/tfl.html || { echo HTTP_FAIL; continue; }
+            echo "bytes=$(wc -c < /tmp/tfl.html)"
+            grep -Eio '.{0,100}(NBT20|NB20|NBT23|NB23|NBT24|NB24|NUMBAT).{0,180}' /tmp/tfl.html | head -n 160 || true
+            grep -Eio 'href=["'"'][^"'"']+(xlsx|xlsm|zip)[^"'"']*["'"']' /tmp/tfl.html | head -n 160 || true
+          done

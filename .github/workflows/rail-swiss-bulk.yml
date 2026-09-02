@@ -1,0 +1,48 @@
+name: Rail Swiss Bulk
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-swiss-bulk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        kind: [actual, gtfs]
+        year: [2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - name: 检查存储配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo '缺少长期存储配置' >&2; exit 3; }
+      - uses: actions/checkout@v5
+      - name: 安装 rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: 恢复配置并执行
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          REMOTE="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$REMOTE"
+          python3 scripts/fetchers/swiss_archive_direct.py --kind '${{ matrix.kind }}' --year '${{ matrix.year }}' --config "$CFG" --remote "$REMOTE"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

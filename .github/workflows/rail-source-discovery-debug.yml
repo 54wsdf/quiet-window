@@ -14,14 +14,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Inspect TfL crowding root implementation
+      - name: Enumerate TfL public S3 bucket for NUMBAT
         shell: bash
         run: |
           set -euo pipefail
-          URL='https://crowding.data.tfl.gov.uk/'
-          curl --compressed -fLsS --retry 3 -A 'Mozilla/5.0' "$URL" -o /tmp/tfl.html
-          echo "bytes=$(wc -c < /tmp/tfl.html)"
-          echo '===== href/src attributes ====='
-          grep -Eio 'src="[^"]+"|href="[^"]+"' /tmp/tfl.html | head -n 300 || true
-          echo '===== root html ====='
-          cat /tmp/tfl.html
+          python - <<'PY'
+          import urllib.parse, urllib.request, xml.etree.ElementTree as ET
+
+          HOST = 'https://s3-eu-west-1.amazonaws.com/crowding.data.tfl.gov.uk/'
+          NS = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+
+          def get(params):
+              url = HOST + '?' + urllib.parse.urlencode(params)
+              req = urllib.request.Request(url, headers={'User-Agent':'quiet-window-public-data-worker/2.1'})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return ET.fromstring(r.read())
+
+          root = get({'list-type':'2','delimiter':'/'})
+          prefixes = [x.text or '' for x in root.findall('.//s3:CommonPrefixes/s3:Prefix', NS)]
+          print('ROOT_PREFIXES')
+          for p in prefixes:
+              print(repr(p))
+
+          candidates = [p for p in prefixes if any(t in p.lower() for t in ('numbat','crowd','demand','rail'))]
+          print('CANDIDATE_PREFIXES', candidates)
+          for p in candidates:
+              print('==== PREFIX', repr(p), '====')
+              token = None
+              n = 0
+              while True:
+                  params={'list-type':'2','prefix':p,'max-keys':'1000'}
+                  if token: params['continuation-token']=token
+                  doc=get(params)
+                  for c in doc.findall('.//s3:Contents', NS):
+                      key=(c.findtext('s3:Key', default='', namespaces=NS) or '')
+                      size=(c.findtext('s3:Size', default='', namespaces=NS) or '')
+                      if any(t in key.lower() for t in ('numbat','nbt20','nb20','nbt23','nb23','nbt24','nb24')):
+                          print(size, key)
+                          n += 1
+                  if doc.findtext('s3:IsTruncated', default='false', namespaces=NS) != 'true': break
+                  token=doc.findtext('s3:NextContinuationToken', default='', namespaces=NS)
+                  if not token: break
+              print('MATCHES', n)
+          PY

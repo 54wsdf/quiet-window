@@ -1,0 +1,75 @@
+name: Sensor Reference Cache
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sensor-reference-cache.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/webtris_2024_03
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install -q requests
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+      - name: Fetch verified historical window
+        run: |
+          cat > /tmp/fetch.py <<'PY'
+          import json,time,hashlib,requests
+          from pathlib import Path
+          out=Path('out'); base='https://webtris.nationalhighways.co.uk/api/v1.0'
+          s=requests.Session(); s.headers['User-Agent']='public-transport-reference-cache/1.0'
+          r=s.get(base+'/sites',timeout=60); r.raise_for_status(); (out/'sites.json').write_bytes(r.content)
+          j=r.json(); rows=[]
+          if isinstance(j,list): rows=j
+          elif isinstance(j,dict):
+              for k in ('sites','Sites','rows','Rows'):
+                  if isinstance(j.get(k),list): rows=j[k]; break
+              if not rows:
+                  for v in j.values():
+                      if isinstance(v,list) and v and isinstance(v[0],dict): rows=v; break
+          ids=[]
+          for x in rows:
+              for k in ('Id','ID','id','SiteId','siteId','site_id'):
+                  if x.get(k) not in (None,''):
+                      ids.append(str(x[k])); break
+          ids=['2']+[x for x in ids if x!='2']
+          selected=[]; failures=[]
+          for site in ids[:1000]:
+              if len(selected)>=20: break
+              try:
+                  rr=s.get(base+'/reports/daily',params={'sites':site,'start_date':'04032024','end_date':'02042024'},timeout=90)
+                  rr.raise_for_status(); jj=rr.json(); dat=jj.get('Rows') or jj.get('rows') or []
+                  if len(dat)>=500:
+                      fn=f'webtris_site_{site}_2024-03-04_04-02.json'; (out/fn).write_bytes(rr.content)
+                      selected.append({'site_id':site,'rows':len(dat),'file':fn,'first':dat[0] if dat else None})
+              except Exception as e: failures.append({'site_id':site,'error':str(e)[:180]})
+              time.sleep(.02)
+          (out/'selection.json').write_text(json.dumps({'period':'2024-03-04..2024-04-02','selected':[{'site_id':x['site_id'],'rows':x['rows'],'file':x['file']} for x in selected],'failures':failures[:100]},indent=2),encoding='utf-8')
+          if len(selected)<20: raise SystemExit(f'only {len(selected)} sites met >=500 rows')
+          with (out/'SHA256SUMS.txt').open('w') as h:
+              for f in sorted(out.iterdir()):
+                  if f.is_file() and f.name!='SHA256SUMS.txt': h.write(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n')
+          PY
+          python /tmp/fetch.py
+      - name: Store
+        run: |
+          set -euo pipefail
+          rclone mkdir "gdrive:$DEST"
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 4 --checkers 8 --retries 5 --low-level-retries 10
+          COUNT=$(rclone lsf "gdrive:$DEST" --files-only | wc -l)
+          test "$COUNT" -ge 23

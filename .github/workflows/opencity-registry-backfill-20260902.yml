@@ -1,0 +1,208 @@
+name: OpenCity Registry Backfill 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-registry-backfill-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  BASE: transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Configure durable Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'GDRIVE_RCLONE_CONFIG_B64 missing'; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"
+          echo "remote=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire missing official source bytes only
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/opencity-backfill"
+          mkdir -p "$WORK"
+
+          exists_remote() {
+            local p="$1"
+            rclone lsjson "$R:$p" --config "$CFG" --files-only 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1
+          }
+
+          store_one() {
+            local dataset="$1" url="$2" destdir="$3" filename="$4" expected="${5:-}"
+            local dest="$destdir/$filename"
+            if exists_remote "$dest" && exists_remote "$dest.manifest.json"; then
+              echo "SKIP already archived: $dest"
+              return 0
+            fi
+            local p="$WORK/$filename"
+            curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 3600 "$url" -o "$p"
+            local size hash
+            size="$(stat -c '%s' "$p")"
+            hash="$(sha256sum "$p" | awk '{print $1}')"
+            test "$size" -gt 0
+            if [[ -n "$expected" && "$hash" != "$expected" ]]; then
+              echo "HASH_VERSION_CHANGE dataset=$dataset expected=$expected observed=$hash" >&2
+            fi
+            rclone copyto "$p" "$R:$dest" --config "$CFG" --retries 8 --low-level-retries 20 --transfers 1 --checkers 4
+            remote_size="$(rclone lsjson "$R:$dest" --config "$CFG" --files-only | jq -r '.[0].Size // empty')"
+            test "$remote_size" = "$size"
+            python - "$dataset" "$url" "$dest" "$size" "$hash" "$expected" "$GITHUB_RUN_ID" > "$WORK/$filename.manifest.json" <<'PY'
+          import json,sys,datetime
+          dataset,url,dest,size,sha,expected,run_id=sys.argv[1:]
+          obj={
+            'state':'ACQUIRED',
+            'dataset_id':dataset,
+            'source_url':url,
+            'retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'drive_path':dest,
+            'bytes':int(size),
+            'sha256':sha,
+            'previous_expected_sha256':expected or None,
+            'source_version_relation':'matches_previous' if expected and sha==expected else ('version_changed_or_unpinned' if expected else 'newly_pinned'),
+            'executor_repo':'54wsdf/quiet-window',
+            'github_run_id':run_id,
+          }
+          print(json.dumps(obj,indent=2))
+          PY
+            rclone copyto "$WORK/$filename.manifest.json" "$R:$dest.manifest.json" --config "$CFG" --retries 5 --low-level-retries 10
+            echo "ACQUIRED $dataset $size $hash -> $dest"
+          }
+
+          GTFS_DIR="$BASE/public_data_registry_acquisition_20260902/mta_nyc_gtfs_20260902"
+          T10_DIR="$BASE/T6_T10_PublicSources_20260902/T10_NationalHighways_Roadworks_WebTRIS_20260902"
+
+          store_one \
+            'MTA_STATIC_GTFS_SUPPLEMENTED_20260902' \
+            'https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip' \
+            "$GTFS_DIR" \
+            'mta_subway_gtfs_supplemented_20260902.zip'
+
+          store_one \
+            'NATIONAL_HIGHWAYS_PLANNED_ROADWORKS_2026_03_08' \
+            'https://s3.eu-west-2.amazonaws.com/webdata.nationalhighways.co.uk/ha-roadworks/nh_roadworks_2026_03_08.xml' \
+            "$T10_DIR" \
+            'nh_roadworks_2026_03_08.xml' \
+            '0f79bda386143fd74d14f790213d0e81d9a849fc7aeff0176bf56795d3082475'
+
+          store_one \
+            'WEBTRIS_SITE_INVENTORY_20260902' \
+            'https://webtris.nationalhighways.co.uk/api/v1.0/sites' \
+            "$T10_DIR" \
+            'webtris_sites_20260902.json' \
+            'f2351755b3e40dadab25d3f48d0ae29da1a508c8d8271744cbf9e93a215aa22f'
+
+      - name: Acquire and freeze WebTRIS 20-site x 30-day historical instance
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          DEST="$BASE/public_data_registry_acquisition_20260902/webtris_20site_30day"
+          if rclone lsjson "$R:$DEST/ACQUISITION_MANIFEST.json" --config "$CFG" --files-only 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1; then
+            echo "SKIP WebTRIS historical instance already has acquisition manifest"
+            exit 0
+          fi
+          OUT="$RUNNER_TEMP/webtris_20site_30day"
+          mkdir -p "$OUT"
+          python - "$OUT" <<'PY'
+          import json,time,requests,sys,hashlib,datetime
+          from pathlib import Path
+          out=Path(sys.argv[1]); base='https://webtris.nationalhighways.co.uk/api/v1.0'
+          s=requests.Session(); s.headers['User-Agent']='OpenCity-public-data-rehearsal/20260902'
+          r=s.get(base+'/sites',timeout=90); r.raise_for_status(); (out/'sites.json').write_bytes(r.content)
+          js=r.json(); rows=js.get('Rows') or js.get('rows') or js.get('Sites') or js.get('sites') or []
+          ids=[]
+          for row in rows:
+              for k in ('Id','ID','id','Site Id','site_id'):
+                  if k in row and str(row[k]).strip(): ids.append(str(row[k]).strip()); break
+          ids=['2']+[x for x in ids if x!='2']
+          selected=[]; failures=[]
+          def fetch(site,start,end):
+              allrows=[]; header={}; page=1
+              while True:
+                  rr=s.get(base+'/reports/daily',params={'sites':site,'start_date':start,'end_date':end,'page':page,'page_size':5000},timeout=120)
+                  if rr.status_code==204: return {'Header':{},'Rows':[]}
+                  rr.raise_for_status(); jj=rr.json()
+                  if not header: header=jj.get('Header') or jj.get('header') or {}
+                  batch=jj.get('Rows') or jj.get('rows') or []; allrows.extend(batch)
+                  if len(batch)<5000 or page>=20: break
+                  page+=1
+              return {'Header':header,'Rows':allrows}
+          periods=[('01072026','30072026'),('01072025','30072025'),('04032024','02042024')]
+          for period in periods:
+              for site in ids[:400]:
+                  if len(selected)>=20: break
+                  if site in {x['site_id'] for x in selected}: continue
+                  try:
+                      jj=fetch(site,*period)
+                      if len(jj['Rows'])>=500:
+                          fn=f'site_{site}_{period[0]}_{period[1]}.json'
+                          (out/fn).write_text(json.dumps(jj,separators=(',',':')),encoding='utf-8')
+                          selected.append({'site_id':site,'rows':len(jj['Rows']),'start_date':period[0],'end_date':period[1],'file':fn})
+                  except Exception as e:
+                      failures.append({'site_id':site,'period':period,'error':str(e)[:200]})
+                  time.sleep(0.04)
+              if len(selected)>=20: break
+          if len(selected)<20: raise SystemExit(f'Only {len(selected)} usable sites')
+          (out/'selected_sites.json').write_text(json.dumps(selected,indent=2),encoding='utf-8')
+          (out/'fetch_failures.json').write_text(json.dumps(failures,indent=2),encoding='utf-8')
+          hashes=[]; total=0
+          for p in sorted(out.iterdir()):
+              if p.is_file():
+                  b=p.read_bytes(); total+=len(b); hashes.append({'file':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          manifest={
+            'state':'ACQUIRED',
+            'source':'National Highways WebTRIS API v1.0',
+            'source_url':base,
+            'retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'selection_rule':'first 20 distinct sites among first 400 inventory IDs with >=500 rows in the first qualifying 30-day period; site 2 prioritized',
+            'period_candidates':periods,
+            'selected_site_count':len(selected),
+            'files':hashes,
+            'total_bytes_before_manifest':total,
+          }
+          (out/'ACQUISITION_MANIFEST.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+          with (out/'SHA256SUMS.txt').open('w') as f:
+              for x in hashes: f.write(f"{x['sha256']}  {x['file']}\n")
+          PY
+          rclone copy "$OUT" "$R:$DEST" --config "$CFG" --ignore-existing --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check "$OUT" "$R:$DEST" --config "$CFG" --one-way --size-only
+          echo "ACQUIRED WebTRIS 20-site x 30-day -> $DEST"
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

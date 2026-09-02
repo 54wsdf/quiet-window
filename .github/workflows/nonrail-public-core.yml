@@ -1,0 +1,75 @@
+name: Nonrail Public Core
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/nonrail-public-core.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - {id: uk_dft_count_points, url: 'https://storage.googleapis.com/dft-statistics/road-traffic/downloads/data-gov-uk/count_points.zip', file: count_points.zip, path: '02_road/UK_DfT/count_points'}
+          - {id: uk_dft_raw_counts, url: 'https://storage.googleapis.com/dft-statistics/road-traffic/downloads/data-gov-uk/dft_traffic_counts_raw_counts.zip', file: dft_traffic_counts_raw_counts.zip, path: '02_road/UK_DfT/raw_counts'}
+          - {id: uk_dft_aadf, url: 'https://storage.googleapis.com/dft-statistics/road-traffic/downloads/data-gov-uk/dft_traffic_counts_aadf.zip', file: dft_traffic_counts_aadf.zip, path: '02_road/UK_DfT/aadf'}
+          - {id: uk_dft_aadf_direction, url: 'https://storage.googleapis.com/dft-statistics/road-traffic/downloads/data-gov-uk/dft_traffic_counts_aadf_by_direction.zip', file: dft_traffic_counts_aadf_by_direction.zip, path: '02_road/UK_DfT/aadf_direction'}
+          - {id: uk_dft_major_roads, url: 'https://storage.googleapis.com/dft-statistics/road-traffic/mrdb-2025.zip', file: mrdb-2025.zip, path: '02_road/UK_DfT/major_roads'}
+          - {id: stats19_collision_2025, url: 'https://data.dft.gov.uk/road-accidents-safety-data/dft-road-casualty-statistics-collision-2025.csv', file: collision-2025.csv, path: '02_road/UK_STATS19/2025'}
+          - {id: stats19_vehicle_2025, url: 'https://data.dft.gov.uk/road-accidents-safety-data/dft-road-casualty-statistics-vehicle-2025.csv', file: vehicle-2025.csv, path: '02_road/UK_STATS19/2025'}
+          - {id: stats19_casualty_2025, url: 'https://data.dft.gov.uk/road-accidents-safety-data/dft-road-casualty-statistics-casualty-2025.csv', file: casualty-2025.csv, path: '02_road/UK_STATS19/2025'}
+          - {id: porto_taxi_uci_339, url: 'https://archive.ics.uci.edu/static/public/339/taxi%2Bservice%2Btrajectory%2Bprediction%2Bchallenge%2Becml%2Bpkdd%2B2015.zip', file: uci_porto_taxi_339.zip, path: '03_trajectory/PT_Porto_Taxi'}
+    steps:
+      - name: 下载并直接写 Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; P="$RUNNER_TEMP/${{ matrix.file }}"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 7200 '${{ matrix.url }}' -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST='${{ matrix.path }}/${{ matrix.file }}'
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","dataset_id":"%s","source_url":"%s","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s"}\n' '${{ matrix.id }}' '${{ matrix.url }}' '${{ matrix.file }}' "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/${{ matrix.file }}.manifest.json"
+          rclone copyto "$RUNNER_TEMP/${{ matrix.file }}.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"
+
+  socrata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {domain: 'data.cityofnewyork.us', id: 'h9gi-nx95', name: 'NYC Motor Vehicle Collisions', path: '02_road/US_NYC/collisions'}
+          - {domain: 'data.ny.gov', id: 'gxb3-akrn', name: 'MTA Bus Hourly Ridership beginning 2025', path: '04_mobility_demand/US_NY_MTA_bus/hourly_ridership_2025'}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Socrata 分页直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/socrata_direct.py --domain '${{ matrix.domain }}' --dataset-id '${{ matrix.id }}' --name '${{ matrix.name }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R" --chunk-rows 100000
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

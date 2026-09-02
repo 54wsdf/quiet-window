@@ -1,0 +1,111 @@
+name: OpenCity T2 OSM HPMS public registry 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t2-osm-hpms-public-registry-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OSM_FOLDER_ID: '10TrjwGtiMfiXUa-IiGcc1suTf7HKwntP'
+  HPMS_FOLDER_ID: '1s_hsF5EI40FSvDw2rKx8u-RqxQJImI-I'
+  OUTPUT_FOLDER_ID: '10BjpRRFoE9ysw8EzheyZnoH8gOzdchae'
+  KNOWLEDGE_HUB_REF: '2e378a7288c073d86a7b12d79c0891d75ecdcc27'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime and configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check pandas numpy geopandas shapely pyogrio osmium scikit-learn pyarrow
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+
+      - name: Materialize already-archived OSM and HPMS source bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          D=/tmp/t2src; mkdir -p "$D"
+          rclone copyto "$R:socal-260829.osm.pbf" "$D/socal-260829.osm.pbf" --drive-root-folder-id "$OSM_FOLDER_ID" --retries 8 --low-level-retries 20
+          rclone copyto "$R:california_2018_hpms_layer_0.geojson" "$D/california_2018_hpms_layer_0.geojson" --drive-root-folder-id "$HPMS_FOLDER_ID" --retries 8 --low-level-retries 20
+          echo '9019654dab6af5fde5e7c7481da58cfbcee91f9913916c6c0c329eeede089145  /tmp/t2src/socal-260829.osm.pbf' | sha256sum -c -
+          echo '321e91060fcb627fff7ee7adb3bcf4ed838b8a3ed8281e872e3e3c61fd5f9509  /tmp/t2src/california_2018_hpms_layer_0.geojson' | sha256sum -c -
+
+      - name: Fetch pinned canonical T2 code from knowledge-hub
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/t2code
+          BASE="https://raw.githubusercontent.com/54wsdf/knowledge-hub/$KNOWLEDGE_HUB_REF/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code"
+          curl -fL --retry 5 "$BASE/t2_osm_hpms_public_registry.py" -o /tmp/t2code/t2_osm_hpms_public_registry.py
+          curl -fL --retry 5 "$BASE/t2_osm_hpms_public_registry_wrapper.py" -o /tmp/t2code/t2_osm_hpms_public_registry_wrapper.py
+          chmod +x /tmp/t2code/*.py
+          sha256sum /tmp/t2code/*.py > /tmp/T2_CODE_SHA256.txt
+
+      - name: Run OSM-to-HPMS conflation and masked-attribute baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/t2out; mkdir -p "$OUT"
+          python /tmp/t2code/t2_osm_hpms_public_registry_wrapper.py \
+            --osm /tmp/t2src/socal-260829.osm.pbf \
+            --hpms /tmp/t2src/california_2018_hpms_layer_0.geojson \
+            --output "$OUT" \
+            --target-matches 20000 \
+            --max-distance-m 15 \
+            --max-orientation-diff-deg 25
+
+      - name: Acceptance checks and execution provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          s=json.load(open('/tmp/t2out/summary.json'))
+          assert s['conflation']['high_confidence_matches'] >= 500
+          assert 0.295 <= s['masking']['lane_truth_fraction'] <= 0.305
+          assert 0.295 <= s['masking']['road_class_truth_fraction'] <= 0.305
+          assert s['source_sha256']['osm_pbf']=='9019654dab6af5fde5e7c7481da58cfbcee91f9913916c6c0c329eeede089145'
+          assert s['source_sha256']['hpms_geojson']=='321e91060fcb627fff7ee7adb3bcf4ed838b8a3ed8281e872e3e3c61fd5f9509'
+          assert s['status']=='PUBLIC_OSM_HPMS_CONFLATION_REHEARSAL_CLOSED'
+          print(json.dumps(s,indent=2))
+          PY
+          CORE_SHA="$(sha256sum /tmp/t2code/t2_osm_hpms_public_registry.py | awk '{print $1}')"
+          WRAP_SHA="$(sha256sum /tmp/t2code/t2_osm_hpms_public_registry_wrapper.py | awk '{print $1}')"
+          python - "$CORE_SHA" "$WRAP_SHA" "$GITHUB_RUN_ID" > /tmp/t2out/EXECUTION_MANIFEST.json <<'PY'
+          import json,sys
+          core,wrapper,run=sys.argv[1:]
+          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'knowledge_hub_ref':'2e378a7288c073d86a7b12d79c0891d75ecdcc27','canonical_core_code':'domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry.py','canonical_wrapper':'domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry_wrapper.py','execution_core_sha256':core,'execution_wrapper_sha256':wrapper,'output_drive_folder_id':'10BjpRRFoE9ysw8EzheyZnoH8gOzdchae'},indent=2))
+          PY
+          cp /tmp/T2_CODE_SHA256.txt /tmp/t2out/CODE_SHA256SUMS.txt
+          (cd /tmp/t2out && sha256sum * > OUTPUT_SHA256SUMS.txt)
+
+      - name: Persist results and verify remote sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/t2out "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check /tmp/t2out "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --one-way --size-only
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true

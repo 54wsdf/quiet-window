@@ -1,0 +1,33 @@
+{
+  "run_id": "rail-source-refresh-20260902",
+  "summary_drive_path": "transport_data_lake/01_rail/99_manifests/rail_source_refresh_20260902",
+  "mbta": {
+    "enabled": true,
+    "dataset_id": "mbta_lamp_nonoverlap_20weekday_20260902",
+    "index_url": "https://performancedata.mbta.com/lamp/subway-on-time-performance-v1/index.csv",
+    "family_base_url": "https://performancedata.mbta.com/lamp/subway-on-time-performance-v1",
+    "cutoff_date": "2026-08-12",
+    "exclude_dates": [
+      "2026-08-12",
+      "2026-08-13",
+      "2026-08-14",
+      "2026-08-17",
+      "2026-08-18"
+    ],
+    "days": 20,
+    "terms_url": "https://performancedata.mbta.com/",
+    "drive_path": "transport_data_lake/01_rail/mbta/02_actual_operations/lamp_nonoverlap_20weekday_20260902"
+  },
+  "cta": {
+    "enabled": true,
+    "dataset_id": "cta_station_route_local_service_20260902",
+    "gtfs_url": "https://www.transitchicago.com/downloads/sch_data/google_transit.zip",
+    "ridership_api": "https://data.cityofchicago.org/resource/5neh-572f.json",
+    "station_metadata_api": "https://data.cityofchicago.org/resource/3tzw-cg4m.json",
+    "demand_start": "2026-06-01",
+    "demand_end": "2026-06-30",
+    "service_date": "2026-08-19",
+    "terms_url": "https://www.transitchicago.com/developers/gtfs/",
+    "drive_path": "transport_data_lake/01_rail/cta/01_schedule/station_route_service_20260902"
+  }
+}

@@ -1,0 +1,64 @@
+name: Rail Public Core
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-public-core.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - {id: fi_gtfs_passenger, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger.zip', file: 'gtfs-passenger.zip', path: '01_rail/FI_digitraffic/01_schedule/current'}
+          - {id: fi_gtfs_passenger_stops, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger-stops.zip', file: 'gtfs-passenger-stops.zip', path: '01_rail/FI_digitraffic/01_schedule/current'}
+          - {id: fi_gtfs_all, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-all.zip', file: 'gtfs-all.zip', path: '01_rail/FI_digitraffic/01_schedule/current'}
+          - {id: fi_trackwork_yearly, url: 'https://rata.digitraffic.fi/api/v1/yearly-plans/yearly-plans.json', file: 'yearly-plans.json', path: '01_rail/FI_digitraffic/05_disruptions_trackwork/snapshot'}
+          - {id: fi_trackwork_projects, url: 'https://rata.digitraffic.fi/api/v1/project-plans/project-plans.json', file: 'project-plans.json', path: '01_rail/FI_digitraffic/05_disruptions_trackwork/snapshot'}
+          - {id: sncf_gtfs, url: 'https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip', file: 'sncf_gtfs.zip', path: '01_rail/FR_SNCF/01_schedule/current'}
+          - {id: sncf_netex, url: 'https://eu.ftp.opendatasoft.com/sncf/plandata/export-opendata-sncf-netex.zip', file: 'sncf_netex.zip', path: '01_rail/FR_SNCF/01_schedule/current'}
+          - {id: sncf_trip_updates, url: 'https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-trip-updates', file: 'sncf_trip_updates.pb', path: '01_rail/FR_SNCF/03_realtime/snapshots'}
+          - {id: sncf_service_alerts, url: 'https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-service-alerts', file: 'sncf_service_alerts.pb', path: '01_rail/FR_SNCF/05_disruptions_trackwork/snapshots'}
+          - {id: sncf_siri_estimated, url: 'https://proxy.transport.data.gouv.fr/resource/sncf-siri-lite-estimated-timetable', file: 'sncf_siri_estimated.xml', path: '01_rail/FR_SNCF/03_realtime/snapshots'}
+          - {id: sncf_siri_situation, url: 'https://proxy.transport.data.gouv.fr/resource/sncf-siri-lite-situation-exchange', file: 'sncf_siri_situation.xml', path: '01_rail/FR_SNCF/05_disruptions_trackwork/snapshots'}
+          - {id: eurostar_gtfs, url: 'https://integration-storage.dm.eurostar.com/gtfs-prod/gtfs_static_commercial_v2.zip', file: 'eurostar_gtfs.zip', path: '01_rail/EU_Eurostar/01_schedule/current'}
+          - {id: eurostar_realtime, url: 'https://integration-storage.dm.eurostar.com/gtfs-prod/gtfs_rt_v2.bin', file: 'eurostar_gtfs_rt.bin', path: '01_rail/EU_Eurostar/03_realtime/snapshots'}
+          - {id: tokyo_toei_gtfs, url: 'https://api-public.odpt.org/api/v4/files/Toei/data/Toei-Train-GTFS.zip', file: 'Toei-Train-GTFS.zip', path: '01_rail/JP_Tokyo_Toei/01_schedule/current'}
+          - {id: hk_public_gtfs, url: 'https://static.data.gov.hk/td/pt-headway-en/gtfs.zip', file: 'hong_kong_public_transport_gtfs.zip', path: '01_rail/CN_HK_PublicTransport/01_schedule/current'}
+          - {id: sydney_time_loc_aug, url: 'https://opendata.transport.nsw.gov.au/data/dataset/f3ea9e21-9fbf-45da-84cf-54e95cd7b841/resource/36e442e0-600d-4916-bc59-af57d1fb86e8/download/time-loc_24aug.csv', file: 'time-loc_24aug.csv', path: '01_rail/AU_Sydney_Opal/04_demand_od/2020'}
+          - {id: sydney_time_loc_nov, url: 'https://opendata.transport.nsw.gov.au/data/dataset/f3ea9e21-9fbf-45da-84cf-54e95cd7b841/resource/08c548d6-551c-44a2-a6cc-8c2eb4af4a46/download/time-loc_16nov.csv', file: 'time-loc_16nov.csv', path: '01_rail/AU_Sydney_Opal/04_demand_od/2020'}
+          - {id: sydney_alerts_aug, url: 'https://opendata.transport.nsw.gov.au/data/dataset/f3ea9e21-9fbf-45da-84cf-54e95cd7b841/resource/6029df6d-f426-47f9-ad87-043904770898/download/alertsnf20200824-30.csv', file: 'alerts_24aug.csv', path: '01_rail/AU_Sydney_Opal/05_disruptions_trackwork/2020'}
+          - {id: sydney_alerts_nov, url: 'https://opendata.transport.nsw.gov.au/data/dataset/f3ea9e21-9fbf-45da-84cf-54e95cd7b841/resource/7ef21348-bfd5-4cb6-b785-ed3591fd7dd3/download/alertsnf20201116-22.csv', file: 'alerts_16nov.csv', path: '01_rail/AU_Sydney_Opal/05_disruptions_trackwork/2020'}
+          - {id: sydney_od_aug, url: 'https://opendata.transport.nsw.gov.au/data/dataset/f3ea9e21-9fbf-45da-84cf-54e95cd7b841/resource/b51284ff-688d-4fd1-a9e8-a1b2668bbde5/download/origin_destination_24aug.csv', file: 'origin_destination_24aug.csv', path: '01_rail/AU_Sydney_Opal/04_demand_od/2020'}
+          - {id: sydney_od_nov, url: 'https://opendata.transport.nsw.gov.au/data/dataset/f3ea9e21-9fbf-45da-84cf-54e95cd7b841/resource/357ee035-21e2-40b2-95c9-f7ad2e87f3c5/download/origin_destination_16nov.csv', file: 'origin_destination_16nov.csv', path: '01_rail/AU_Sydney_Opal/04_demand_od/2020'}
+    steps:
+      - name: 直接获取并持久化
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          BASE='${{ matrix.file }}'; STEM="${BASE%.*}"; EXT="${BASE##*.}"
+          case '${{ matrix.path }}' in *snapshots*|*snapshot*) F="${STEM}_$(date -u +%Y%m%dT%H%M%SZ)_run${GITHUB_RUN_ID}.${EXT}" ;; *) F="$BASE" ;; esac
+          P="$RUNNER_TEMP/$F"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 7200 '${{ matrix.url }}' -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST='${{ matrix.path }}'/$F
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","dataset_id":"%s","source_url":"%s","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s","retrieved_at_utc":"%s"}\n' '${{ matrix.id }}' '${{ matrix.url }}' "$F" "$S" "$H" "$GITHUB_RUN_ID" "$(date -u +%FT%TZ)" > "$RUNNER_TEMP/$F.manifest.json"
+          rclone copyto "$RUNNER_TEMP/$F.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

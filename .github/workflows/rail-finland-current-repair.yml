@@ -1,0 +1,59 @@
+name: Rail Finland Current Repair
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-finland-current-repair.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {id: fi_gtfs_passenger, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger.zip', file: 'gtfs-passenger.zip'}
+          - {id: fi_gtfs_passenger_stops, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger-stops.zip', file: 'gtfs-passenger-stops.zip'}
+          - {id: fi_gtfs_all, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-all.zip', file: 'gtfs-all.zip'}
+    steps:
+      - name: Fetch compressed Digitraffic GTFS and persist directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+
+          F='${{ matrix.file }}'
+          P="$RUNNER_TEMP/$F"
+          curl --compressed -H 'Digitraffic-User: RailDataLake/ArchiveBot-1.0' \
+            -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 7200 \
+            '${{ matrix.url }}' -o "$P"
+
+          S=$(stat -c '%s' "$P")
+          H=$(sha256sum "$P" | awk '{print $1}')
+          test "$S" -gt 0
+          DEST="01_rail/FI_digitraffic/01_schedule/current/$F"
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size')
+          test "$RS" = "$S"
+
+          printf '{"state":"ACQUIRED","dataset_id":"%s","source_url":"%s","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s","retrieved_at_utc":"%s","http_requirement":"compressed"}\n' \
+            '${{ matrix.id }}' '${{ matrix.url }}' "$F" "$S" "$H" "$GITHUB_RUN_ID" "$(date -u +%FT%TZ)" \
+            > "$RUNNER_TEMP/$F.manifest.json"
+          rclone copyto "$RUNNER_TEMP/$F.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          rm -f "$P" "$RUNNER_TEMP/$F.manifest.json"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

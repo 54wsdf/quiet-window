@@ -1,0 +1,83 @@
+name: OpenCity MTA OD strict resume 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-strict-resume-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencity-mta-od-strict-resume-20260902
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OD_ROOT_ID: 1OZN2Nn1qHdVak8Q1yKQxUV07Znjmlk_Z
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Configure canonical Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'GDRIVE_RCLONE_CONFIG_B64 missing'; exit 3; }
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"
+          echo "remote=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Resume 28vm-gjqr without re-downloading preserved official-source parts
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          python opencity_exec/mta_od_resume_strict_id_20260902.py \
+            --config "$CFG" \
+            --remote "$R" \
+            --root-id "$OD_ROOT_ID"
+
+      - name: Verify closure markers on canonical Drive
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          rclone lsf "$R:" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --files-only | sort > "$RUNNER_TEMP/root-files.txt"
+          grep -Fx 'ACQUISITION_CLOSED_20260902.json' "$RUNNER_TEMP/root-files.txt"
+          grep -Fx 'SHA256SUMS.txt' "$RUNNER_TEMP/root-files.txt"
+          test "$(grep -c '^MANIFEST_28vm-gjqr_.*\.json$' "$RUNNER_TEMP/root-files.txt")" -ge 1
+          PART_COUNT="$(rclone lsf "$R:parts" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --files-only --include '28vm-gjqr.part-*.csv' | wc -l | tr -d ' ')"
+          test "$PART_COUNT" -eq 727
+          echo "MTA OD ACQUIRED: 727 parts"
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then
+            shred -u "$CFG" 2>/dev/null || rm -f "$CFG"
+          fi

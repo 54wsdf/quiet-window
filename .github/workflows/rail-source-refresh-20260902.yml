@@ -86,6 +86,20 @@ jobs:
           if [[ $rc -ne 0 ]]; then
             printf '{"runner_state":"FAILED","exit_code":%s}\n' "$rc" > "$OUTPUT_DIR/runner_failure.json"
           fi
+
+          if jq -e '.cta.enabled == true' "$REQUEST_FILE" >/dev/null \
+             && [[ -f "$OUTPUT_DIR/cta/raw/google_transit.zip" ]] \
+             && [[ -f "$OUTPUT_DIR/cta/raw/cta_station_entries_query.json" ]] \
+             && [[ -f "$OUTPUT_DIR/cta/processed/cta_station_route_scheduled_departures.csv" ]]; then
+            echo 'Applying CTA numeric station-id crosswalk and local station-route allocation.'
+            python scripts/fetchers/cta_station_route_repair.py \
+              --request "$REQUEST_FILE" \
+              --output-dir "$OUTPUT_DIR"
+            repair_rc=$?
+            if [[ $repair_rc -ne 0 ]]; then
+              printf '{"cta_repair_state":"FAILED","exit_code":%s}\n' "$repair_rc" > "$OUTPUT_DIR/cta_repair_failure.json"
+            fi
+          fi
           exit 0
 
       - name: Persist and verify enabled task folders

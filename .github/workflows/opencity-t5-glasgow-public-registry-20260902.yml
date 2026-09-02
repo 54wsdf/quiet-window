@@ -1,0 +1,113 @@
+name: OpenCity T5 Glasgow public registry 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t5-glasgow-public-registry-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OUTPUT_FOLDER_ID: '1P9i_MhdO0PQI4a1_-fNGCgf_Qmp8zx3u'
+
+jobs:
+  acquire-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Configure Drive and acquire exact Zenodo source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip
+          mkdir -p "$HOME/.config/rclone" /tmp/t5glasgow/src /tmp/t5glasgow/unpacked
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"; test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+          URL='https://zenodo.org/records/14537113/files/traffic_flow_data.zip?download=1'
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 1800 "$URL" -o /tmp/t5glasgow/src/traffic_flow_data.zip
+          echo 'fe7bcce6abc8b69046cbff28cf466991  /tmp/t5glasgow/src/traffic_flow_data.zip' | md5sum -c -
+          unzip -t /tmp/t5glasgow/src/traffic_flow_data.zip >/dev/null
+          unzip -q /tmp/t5glasgow/src/traffic_flow_data.zip -d /tmp/t5glasgow/unpacked
+
+      - name: Audit whether source satisfies T5 signal-control input contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv,hashlib,json,os,re
+          from pathlib import Path
+          root=Path('/tmp/t5glasgow/unpacked'); src=Path('/tmp/t5glasgow/src/traffic_flow_data.zip')
+          files=sorted(p for p in root.rglob('*') if p.is_file())
+          names=[str(p.relative_to(root)) for p in files]
+          csv_headers={}
+          for p in files:
+              if p.suffix.lower()=='.csv':
+                  try:
+                      with p.open(encoding='utf-8-sig',newline='') as f:
+                          r=csv.reader(f); csv_headers[str(p.relative_to(root))]=next(r,[])
+                  except Exception as e:
+                      csv_headers[str(p.relative_to(root))]=['<read-error>',str(e)]
+          tokens=['signal','timing','cycle','split','offset','phase','green','red','amber','queue','delay','controller','atspm','scoot_plan']
+          token_hits={t:[n for n in names if t in n.lower()] for t in tokens}
+          header_hits={t:[] for t in tokens}
+          for fn,h in csv_headers.items():
+              lower=[str(x).lower() for x in h]
+              for t in tokens:
+                  if any(t in x for x in lower): header_hits[t].append({'file':fn,'header':h})
+          h=hashlib.sha256(src.read_bytes()).hexdigest()
+          # Expected publication structure: status.csv, locations.csv, and per-sensor date/time/flow files.
+          distinct_headers={tuple(v) for v in csv_headers.values()}
+          has_timing_fields=any(header_hits[t] for t in ['signal','timing','cycle','split','offset','phase','green','red','amber','controller','atspm','scoot_plan'])
+          has_queue_delay_fields=any(header_hits[t] for t in ['queue','delay'])
+          verdict='INPUT_CONTRACT_NOT_SATISFIED' if not has_timing_fields else 'TIMING_FIELDS_PRESENT_REVIEW_REQUIRED'
+          result={
+            'state':'ACQUIRED_AND_AUDITED',
+            'task':'T5 signal-control recovery',
+            'evidence_class':'public_data registry / official public source',
+            'registry_source':'Glasgow urban traffic control dataset',
+            'publication':'High-resolution traffic flow data from the urban traffic control system in Glasgow',
+            'zenodo_doi':'10.5281/zenodo.14537113',
+            'source_url':'https://zenodo.org/records/14537113/files/traffic_flow_data.zip?download=1',
+            'license_evidence':'publication article states CC BY 4.0; dataset source frozen from Zenodo',
+            'source_bytes':src.stat().st_size,
+            'source_md5':'fe7bcce6abc8b69046cbff28cf466991',
+            'source_sha256':h,
+            'file_count':len(files),
+            'csv_file_count':sum(p.suffix.lower()=='.csv' for p in files),
+            'sample_files':names[:20],
+            'distinct_csv_headers':[list(x) for x in sorted(distinct_headers)],
+            'filename_token_hits':token_hits,
+            'header_token_hits':header_hits,
+            'has_signal_timing_fields':has_timing_fields,
+            'has_queue_or_delay_fields':has_queue_delay_fields,
+            't5_required_outputs':['cycle','split','offset','queue','delay'],
+            'verdict':verdict,
+            'scientific_interpretation':'The registry-linked Glasgow release is a high-resolution traffic-flow sensor dataset. It can support demand/flow context but, absent signal timing/control-event fields, cannot by itself recover and score cycle, split and offset as required by T5. Queue/delay truth is also not directly supplied.',
+          }
+          Path('/tmp/t5glasgow/src/SCHEMA_AUDIT.json').write_text(json.dumps(result,indent=2)+'\n')
+          Path('/tmp/t5glasgow/src/SOURCE_URLS.txt').write_text(result['source_url']+'\nhttps://pmc.ncbi.nlm.nih.gov/articles/PMC11821839/\nhttps://doi.org/10.5281/zenodo.14537113\n')
+          Path('/tmp/t5glasgow/src/SHA256SUMS.txt').write_text(f"{h}  traffic_flow_data.zip\n")
+          print(json.dumps(result,indent=2))
+          if verdict!='INPUT_CONTRACT_NOT_SATISFIED':
+              raise SystemExit('unexpected signal timing fields found; manual review required')
+          PY
+
+      - name: Persist source and audit to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/t5glasgow/src "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 2 --checkers 4
+          rclone check /tmp/t5glasgow/src "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --one-way --size-only
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true

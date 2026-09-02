@@ -1,0 +1,64 @@
+name: OpenCity T8 hourly range probe 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t8-hourly-range-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  HOURLY_PARTS_FOLDER_ID: 1w3kQeV8FvxAdKr_4vvQL6tT6EIoOk8-K
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure Drive
+        id: drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          echo "cfg=$CFG" >> "$GITHUB_OUTPUT"; echo "r=$R" >> "$GITHUB_OUTPUT"
+      - name: Read only boundary rows from selected archived parts
+        shell: bash
+        env:
+          CFG: ${{ steps.drive.outputs.cfg }}
+          R: ${{ steps.drive.outputs.r }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/p"
+          for i in 300 330 350 370 390 400 410 420 430 438; do
+            f="5wq4-mkjj.part-$(printf '%05d' "$i").csv"
+            rclone copyto "$R:$f" "$RUNNER_TEMP/p/$f" --config "$CFG" --drive-root-folder-id "$HOURLY_PARTS_FOLDER_ID" --retries 3 --low-level-retries 5
+          done
+          python - "$RUNNER_TEMP/p" <<'PY'
+          import csv,json,sys
+          from pathlib import Path
+          out=[]
+          for p in sorted(Path(sys.argv[1]).glob('*.csv')):
+              with p.open(encoding='utf-8-sig',newline='') as f:
+                  r=csv.DictReader(f); first=next(r); last=first; n=1
+                  for row in r: last=row; n+=1
+              out.append({'file':p.name,'rows':n,'first_timestamp':first.get('transit_timestamp'),'last_timestamp':last.get('transit_timestamp'),'first_station':first.get('station_complex_id'),'last_station':last.get('station_complex_id')})
+          print('__RESULT_BEGIN__');print(json.dumps(out,indent=2));print('__RESULT_END__')
+          PY
+      - name: Cleanup credential
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.drive.outputs.cfg }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

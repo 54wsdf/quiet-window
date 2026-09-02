@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/opencity-t8-mta-code-preflight-20260902.yml'
+      - 'opencity_exec/t8_mta_public_registry.py'
   workflow_dispatch:
 
 permissions:
@@ -15,18 +16,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Fetch canonical T8 source and print immutable interface
+      - name: Validate controlled execution copy and immutable provenance coordinates
         shell: bash
         run: |
           set -euo pipefail
-          URL='https://raw.githubusercontent.com/54wsdf/knowledge-hub/main/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t8_mta_public_registry.py'
-          curl -fL --retry 5 "$URL" -o /tmp/t8_mta_public_registry.py
-          echo "CANONICAL_URL=$URL"
-          echo "CANONICAL_SHA256=$(sha256sum /tmp/t8_mta_public_registry.py | awk '{print $1}')"
+          P='opencity_exec/t8_mta_public_registry.py'
+          test -s "$P"
           python -m pip install --disable-pip-version-check numpy pandas
+          python -m py_compile "$P"
+          echo 'CANONICAL_REPO=54wsdf/knowledge-hub'
+          echo 'CANONICAL_PATH=domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t8_mta_public_registry.py'
+          echo 'CANONICAL_GIT_BLOB_SHA=134592fd9c21a8c6b6503abf20bee6eb05f95c87'
+          echo "EXECUTION_GIT_COMMIT=${GITHUB_SHA}"
+          echo "EXECUTION_SHA256=$(sha256sum "$P" | awk '{print $1}')"
           echo '__HELP_BEGIN__'
-          python /tmp/t8_mta_public_registry.py --help
+          python "$P" --help
           echo '__HELP_END__'

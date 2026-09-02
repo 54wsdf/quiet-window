@@ -1,0 +1,122 @@
+name: OpenCity T8 MTA public registry 20260902
+
+on:
+  workflow_run:
+    workflows: ['OpenCity MTA OD Drive union salvage 20260902']
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OD_CANONICAL_FOLDER_ID: '1KhB316vUHPTEtwdWPN4138TttTW67jGO'
+  GTFS_FOLDER_ID: '1SmeetN8imBec57abIDIhQzKdZuI9H6Vc'
+  PROCESSED_FOLDER_ID: '1jiPkHogAx1VFMt_hIA66Z5AZ35Q_ZM7U'
+  OUTPUT_FOLDER_ID: '10HKhSwdi1mrwKV74G_2t9mp4knBRQ4q4'
+
+jobs:
+  run:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+
+      - name: Configure Drive and runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check pandas numpy requests
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+
+      - name: Require closed canonical OD and frozen GTFS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/t8/input /tmp/t8/processed /tmp/t8/output
+          rclone copyto "$R:ACQUISITION_CLOSED.json" /tmp/t8/input/OD_ACQUISITION_CLOSED.json --drive-root-folder-id "$OD_CANONICAL_FOLDER_ID" --retries 8 --low-level-retries 20
+          jq -e '.status == "ACQUIRED" and .chunk_count == 1453 and .version.row_count == 72639113 and .version.rowsUpdatedAt == 1787243523 and .order == ":id"' /tmp/t8/input/OD_ACQUISITION_CLOSED.json >/dev/null
+          rclone copyto "$R:mta_subway_gtfs_supplemented_20260902.zip" /tmp/t8/input/mta_subway_gtfs_supplemented_20260902.zip --drive-root-folder-id "$GTFS_FOLDER_ID" --retries 8 --low-level-retries 20
+          echo '659c021f2e3f55f48dfc2ba0ed10e8f46c49323b285a08bd2f84d30f658a5068  /tmp/t8/input/mta_subway_gtfs_supplemented_20260902.zip' | sha256sum -c -
+
+      - name: Prepare exact June 2026 official-source slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/opencity/t8_prepare_mta_slices.py \
+            --gtfs /tmp/t8/input/mta_subway_gtfs_supplemented_20260902.zip \
+            --output /tmp/t8/processed \
+            --route-id 7 --start 2026-06-01 --end-exclusive 2026-07-01 --year 2026 --month 6
+          jq -e '.state == "PREPARED" and .period.year == 2026 and .period.month == 6 and .route_station_count >= 10 and .source_versions.hourly.rowsUpdatedAt == 1787757107 and .source_versions.od.rowsUpdatedAt == 1787243523' /tmp/t8/processed/PREP_MANIFEST.json >/dev/null
+          cp /tmp/t8/input/OD_ACQUISITION_CLOSED.json /tmp/t8/processed/OD_ACQUISITION_CLOSED.json
+          (cd /tmp/t8/processed && sha256sum * > DERIVED_SHA256SUMS.txt)
+
+      - name: Persist processed slices before execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/t8/processed "$R:" --drive-root-folder-id "$PROCESSED_FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check /tmp/t8/processed "$R:" --drive-root-folder-id "$PROCESSED_FOLDER_ID" --one-way --size-only
+
+      - name: Run schedule-proportional-loading baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/opencity/t8_mta_public_registry.py \
+            --hourly /tmp/t8/processed/mta_hourly_2026-06_aggregated.csv \
+            --od /tmp/t8/processed/mta_od_2026-06_route7_denominator_preserving.csv \
+            --gtfs /tmp/t8/input/mta_subway_gtfs_supplemented_20260902.zip \
+            --output /tmp/t8/output \
+            --route-id 7 --start-date 2026-06-01 --days 30 --capacity-per-train 1000 --mapping-tolerance-m 200
+          jq -e '.task == "T8 transit supply-demand-capacity fusion" and .period_days == 30 and .baseline.name == "schedule_proportional_loading" and .formal_scoring.status == "PUBLIC_REHEARSAL_ONLY"' /tmp/t8/output/summary.json >/dev/null
+
+      - name: Pin execution provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          CORE_SHA="$(sha256sum scripts/opencity/t8_mta_public_registry.py | awk '{print $1}')"
+          PREP_SHA="$(sha256sum scripts/opencity/t8_prepare_mta_slices.py | awk '{print $1}')"
+          PREP_MANIFEST_SHA="$(sha256sum /tmp/t8/processed/PREP_MANIFEST.json | awk '{print $1}')"
+          python - "$CORE_SHA" "$PREP_SHA" "$PREP_MANIFEST_SHA" "$GITHUB_RUN_ID" "$GITHUB_SHA" > /tmp/t8/output/EXECUTION_MANIFEST.json <<'PY'
+          import json,sys
+          core,prep,pm,run,commit=sys.argv[1:]
+          print(json.dumps({
+            'state':'COMPLETED',
+            'evidence_class':'public_data registry / official public source rehearsal',
+            'executor_repo':'54wsdf/quiet-window',
+            'github_run_id':run,
+            'executor_commit':commit,
+            'canonical_science_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t8_mta_public_registry.py',
+            'execution_science_code_sha256':core,
+            'slice_preparation_code_sha256':prep,
+            'prep_manifest_sha256':pm,
+            'official_source_versions':{'od_rowsUpdatedAt':1787243523,'hourly_rowsUpdatedAt':1787757107,'gtfs_sha256':'659c021f2e3f55f48dfc2ba0ed10e8f46c49323b285a08bd2f84d30f658a5068'},
+            'processed_drive_folder_id':'1jiPkHogAx1VFMt_hIA66Z5AZ35Q_ZM7U',
+            'output_drive_folder_id':'10HKhSwdi1mrwKV74G_2t9mp4knBRQ4q4',
+            'declared_assumption':{'capacity_per_train':1000.0},
+            'formal_truth_boundary':'No organizer-held APC segment-load, independent waiting-time, or crowding-label truth is fabricated.'
+          },indent=2))
+          PY
+          (cd /tmp/t8/output && sha256sum * > OUTPUT_SHA256SUMS.txt)
+
+      - name: Persist T8 outputs and verify remote sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/t8/output "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check /tmp/t8/output "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --one-way --size-only
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true

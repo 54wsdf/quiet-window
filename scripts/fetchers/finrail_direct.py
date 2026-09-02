@@ -50,10 +50,24 @@ def sha(p):
     return h.hexdigest()
 def run(c): subprocess.run(c,check=True)
 def out(c): return subprocess.check_output(c,text=True)
+def visible_remote_size(d,cfg,remote):
+    last='not visible'
+    for n in range(10):
+        r=subprocess.run(['rclone','lsjson',f'{remote}:{d}','--config',cfg,'--files-only'],text=True,capture_output=True)
+        if r.returncode==0:
+            try:
+                rows=json.loads(r.stdout)
+                if rows and isinstance(rows[0].get('Size'),int): return int(rows[0]['Size'])
+            except Exception as exc:
+                last=str(exc)
+        else:
+            last=(r.stderr or r.stdout or f'exit {r.returncode}').strip()
+        if n<9: time.sleep(min(30,2+n*3))
+    raise RuntimeError(f'remote object not visible after upload: {d}: {last}')
 def put(p,d,cfg,remote):
     run(['rclone','copyto',str(p),f'{remote}:{d}','--config',cfg,'--retries','8','--low-level-retries','20','--transfers','1','--checkers','4','--stats','60s','--stats-one-line'])
-    rs=int(json.loads(out(['rclone','lsjson',f'{remote}:{d}','--config',cfg,'--files-only']))[0]['Size'])
-    if rs!=p.stat().st_size: raise RuntimeError('remote size mismatch')
+    rs=visible_remote_size(d,cfg,remote)
+    if rs!=p.stat().st_size: raise RuntimeError(f'remote size mismatch {rs} != {p.stat().st_size}')
 def fetch(s,url,p):
     for n in range(8):
         try:
@@ -71,7 +85,7 @@ def fetch(s,url,p):
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--kind',choices=ROOTS,required=True); ap.add_argument('--year',type=int,required=True); ap.add_argument('--month',type=int,required=True); ap.add_argument('--config',required=True); ap.add_argument('--remote',required=True); args=ap.parse_args()
-    s=requests.Session(); s.headers['User-Agent']='quiet-window-public-data-worker/2.0'; base=ROOTS[args.kind]; keys,mode=list_objects(s,base)
+    s=requests.Session(); s.headers.update({'User-Agent':'quiet-window-public-data-worker/2.1','Digitraffic-User':'RailDataLake/ArchiveBot-1.0'}); base=ROOTS[args.kind]; keys,mode=list_objects(s,base)
     selected=[]
     for key in keys:
         dp=date_parts(key)

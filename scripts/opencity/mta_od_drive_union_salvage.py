@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlencode
@@ -29,7 +28,6 @@ KNOWN_SOURCE_FOLDER_IDS = [
     "19QZJ8tnOpwonvcZH4IvS2h-93XxkxE4j",
 ]
 CANONICAL_FOLDER_ID = "1KhB316vUHPTEtwdWPN4138TttTW67jGO"
-ACQ_ROOT_FOLDER_ID = "11-QAIWNF54-xtRl7TeCsQaPwQMPh6Io2"
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -57,10 +55,9 @@ def rclone_lsjson(remote, folder_id):
 
 def discover_source_ids(remote):
     ids = set(KNOWN_SOURCE_FOLDER_IDS)
-    for x in rclone_lsjson(remote, ACQ_ROOT_FOLDER_ID):
-        if x.get("IsDir") and x.get("Name") == SOURCE_FOLDER_NAME and x.get("ID"):
-            ids.add(x["ID"])
-    # Verify every ID is readable; a disappeared/mistyped known race folder is a hard evidence failure.
+    extras = os.environ.get("MTA_OD_EXTRA_SOURCE_FOLDER_IDS", "").strip()
+    if extras:
+        ids.update(x.strip() for x in extras.split(",") if x.strip())
     verified = []
     for fid in sorted(ids):
         try:
@@ -69,7 +66,7 @@ def discover_source_ids(remote):
         except Exception as e:
             raise RuntimeError(f"source folder id is not readable: {fid}: {e}")
     if not verified:
-        raise RuntimeError("no MTA OD source folders discovered")
+        raise RuntimeError("no MTA OD source folders available")
     return verified
 
 

@@ -1,0 +1,115 @@
+name: OpenCity T1 OpenRoads + OSM Scotland acquire 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t1-openroads-osm-scotland-acquire-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  openroads:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq unzip
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+      - name: Acquire current OS Open Roads GeoPackage from unauthenticated OpenData API
+        shell: bash
+        env:
+          FOLDER_ID: '1LrsppubjW6BwLE0Nr0amZrRh0gAv2QsO'
+        run: |
+          set -euo pipefail
+          if rclone lsjson "$R:ACQUISITION_MANIFEST.json" --drive-root-folder-id "$FOLDER_ID" --files-only 2>/dev/null | jq -e 'length>0' >/dev/null 2>&1; then
+            echo 'SKIP: OS Open Roads manifest already present'; exit 0
+          fi
+          W=/tmp/openroads; mkdir -p "$W"
+          curl -fL --retry 5 'https://api.os.uk/downloads/v1/products/OpenRoads' -o "$W/product.json"
+          curl -fL --retry 5 'https://api.os.uk/downloads/v1/products/OpenRoads/downloads' -o "$W/downloads.json"
+          python - <<'PY'
+          import json
+          p=json.load(open('/tmp/openroads/product.json')); d=json.load(open('/tmp/openroads/downloads.json'))
+          rows=[x for x in d if x.get('format')=='GeoPackage' and x.get('area')=='GB']
+          if len(rows)!=1: raise SystemExit(f'expected one GB GeoPackage download, got {rows}')
+          open('/tmp/openroads/url.txt','w').write(rows[0]['url'])
+          open('/tmp/openroads/filename.txt','w').write(rows[0]['fileName'])
+          open('/tmp/openroads/expected_md5.txt','w').write(rows[0]['md5'].lower())
+          print('version',p.get('version'),'file',rows[0]['fileName'],'size',rows[0].get('size'),'md5',rows[0].get('md5'))
+          PY
+          URL="$(cat "$W/url.txt")"; FN="$(cat "$W/filename.txt")"; EMD5="$(cat "$W/expected_md5.txt")"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 5400 "$URL" -o "$W/$FN"
+          unzip -t "$W/$FN" >/dev/null
+          GOT_MD5="$(md5sum "$W/$FN" | awk '{print $1}')"; test "$GOT_MD5" = "$EMD5"
+          SHA="$(sha256sum "$W/$FN" | awk '{print $1}')"; BYTES="$(stat -c '%s' "$W/$FN")"
+          python - "$FN" "$SHA" "$BYTES" "$GOT_MD5" > "$W/ACQUISITION_MANIFEST.json" <<'PY'
+          import datetime,json,sys
+          fn,sha,nbytes,md5=sys.argv[1:]
+          p=json.load(open('/tmp/openroads/product.json')); d=json.load(open('/tmp/openroads/downloads.json'))
+          row=next(x for x in d if x.get('format')=='GeoPackage' and x.get('area')=='GB')
+          print(json.dumps({'state':'ACQUIRED','evidence_class':'public_data registry / official public source','provider':'Ordnance Survey','dataset':'OS Open Roads','product_id':p.get('id'),'product_version':p.get('version'),'provider_product_metadata':p,'provider_download_record':row,'source_api_product':'https://api.os.uk/downloads/v1/products/OpenRoads','source_api_downloads':'https://api.os.uk/downloads/v1/products/OpenRoads/downloads','source_download_url':row['url'],'retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'file':fn,'bytes':int(nbytes),'provider_md5':md5,'sha256':sha,'authentication':'none','license':'Open Government Licence'},indent=2))
+          PY
+          printf '%s  %s\n' "$SHA" "$FN" > "$W/SHA256SUMS.txt"
+          rclone copy "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --exclude 'url.txt' --exclude 'filename.txt' --exclude 'expected_md5.txt' --retries 8 --low-level-retries 20 --transfers 2 --checkers 4
+          rclone check "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --one-way --size-only --exclude 'url.txt' --exclude 'filename.txt' --exclude 'expected_md5.txt'
+          echo "ACQUIRED OS Open Roads version=$(jq -r .product_version "$W/ACQUISITION_MANIFEST.json") sha256=$SHA bytes=$BYTES"
+
+  osm_scotland:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+      - name: Acquire Scotland OSM Geofabrik snapshot
+        shell: bash
+        env:
+          FOLDER_ID: '11__NCGmNOEKHWaCuOxfuCkyGo5qbB5uj'
+        run: |
+          set -euo pipefail
+          if rclone lsjson "$R:ACQUISITION_MANIFEST.json" --drive-root-folder-id "$FOLDER_ID" --files-only 2>/dev/null | jq -e 'length>0' >/dev/null 2>&1; then
+            echo 'SKIP: OSM Scotland manifest already present'; exit 0
+          fi
+          W=/tmp/osm_scotland; mkdir -p "$W"
+          URL='https://download.geofabrik.de/europe/great-britain/scotland-latest.osm.pbf'
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 5400 "$URL" -o "$W/scotland-latest.osm.pbf"
+          curl -fL --retry 5 "$URL.md5" -o "$W/provider.md5"
+          curl -fsSI -L "$URL" > "$W/HEADERS.txt" || true
+          EMD5="$(awk '{print tolower($1); exit}' "$W/provider.md5")"; GOT_MD5="$(md5sum "$W/scotland-latest.osm.pbf" | awk '{print $1}')"; test "$GOT_MD5" = "$EMD5"
+          SHA="$(sha256sum "$W/scotland-latest.osm.pbf" | awk '{print $1}')"; BYTES="$(stat -c '%s' "$W/scotland-latest.osm.pbf")"
+          MOD="$(awk 'BEGIN{IGNORECASE=1}/^last-modified:/{sub(/^[^:]+:[[:space:]]*/,""); sub(/\r$/,""); print; exit}' "$W/HEADERS.txt")"
+          python - "$URL" "$SHA" "$BYTES" "$GOT_MD5" "$MOD" > "$W/ACQUISITION_MANIFEST.json" <<'PY'
+          import datetime,json,sys
+          url,sha,nbytes,md5,lastmod=sys.argv[1:]
+          print(json.dumps({'state':'ACQUIRED','evidence_class':'public_data registry / official public source','provider':'Geofabrik / OpenStreetMap','dataset':'Scotland latest OSM PBF','source_url':url,'provider_md5_url':url+'.md5','retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'provider_last_modified':lastmod or None,'file':'scotland-latest.osm.pbf','bytes':int(nbytes),'provider_md5':md5,'sha256':sha,'authentication':'none','license':'OpenStreetMap ODbL'},indent=2))
+          PY
+          printf '%s  scotland-latest.osm.pbf\n' "$SHA" > "$W/SHA256SUMS.txt"
+          rclone copy "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 2 --checkers 4
+          rclone check "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --one-way --size-only
+          echo "ACQUIRED Scotland OSM sha256=$SHA bytes=$BYTES"

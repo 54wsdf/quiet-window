@@ -1,0 +1,99 @@
+name: OpenCity MTA hourly ordered continuity 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-hourly-ordered-continuity-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  ROOT_ID: 1zLgoEsB_ZFwZxqoeTjJQ-Jo42ZrxycQR
+  DATASET_ID: 5wq4-mkjj
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure Drive
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"; echo "remote=$R" >> "$GITHUB_OUTPUT"
+      - name: Reproduce first and final chunks exactly
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/hourly_diag"; mkdir -p "$OUT"
+          rclone copyto "$R:parts/5wq4-mkjj.part-00000.csv" "$OUT/archive_first.csv" --config "$CFG" --drive-root-folder-id "$ROOT_ID"
+          rclone copyto "$R:parts/5wq4-mkjj.part-00438.csv" "$OUT/archive_last.csv" --config "$CFG" --drive-root-folder-id "$ROOT_ID"
+          python - "$OUT" <<'PY'
+          import csv,datetime as dt,hashlib,io,json,sys,time
+          from pathlib import Path
+          import requests
+          out=Path(sys.argv[1]); ds='5wq4-mkjj'; base=f'https://data.ny.gov/resource/{ds}.csv'
+          s=requests.Session(); s.headers['User-Agent']='OpenCity-MTA-hourly-continuity/20260902'
+          def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def rows(p):
+              with open(p,encoding='utf-8-sig',newline='') as f: return max(0,sum(1 for _ in f)-1)
+          def fetch(offset,limit,path):
+              for n in range(6):
+                  try:
+                      with s.get(base,params={'$limit':str(limit),'$offset':str(offset),'$order':':id'},stream=True,timeout=(30,1800)) as r:
+                          r.raise_for_status()
+                          with open(path,'wb') as f:
+                              for b in r.iter_content(8*1024*1024):
+                                  if b: f.write(b)
+                      return
+                  except Exception:
+                      Path(path).unlink(missing_ok=True)
+                      if n==5: raise
+                      time.sleep(2**n)
+          fetch(0,100000,out/'live_first.csv'); fetch(43800000,35841,out/'live_last.csv')
+          cr=s.get(f'https://data.ny.gov/resource/{ds}.json',params={'$select':'count(*)'},timeout=90); cr.raise_for_status(); count=int(cr.json()[0]['count'])
+          mr=s.get(f'https://data.ny.gov/api/views/{ds}',timeout=90); mr.raise_for_status(); meta=mr.json()
+          result={
+            'state':'CONTINUITY_VERIFIED' if sha(out/'archive_first.csv')==sha(out/'live_first.csv') and sha(out/'archive_last.csv')==sha(out/'live_last.csv') and count==43835841 else 'CONTINUITY_FAILED',
+            'dataset_id':ds,'order_contract':':id','provider_row_count':count,'expected_archive_row_count':43835841,
+            'provider_metadata':{'name':meta.get('name'),'rowsUpdatedAt':meta.get('rowsUpdatedAt'),'dataUpdatedAt':meta.get('dataUpdatedAt'),'metadataUpdatedAt':meta.get('metadataUpdatedAt')},
+            'archive_first':{'rows':rows(out/'archive_first.csv'),'sha256':sha(out/'archive_first.csv')},
+            'live_first':{'rows':rows(out/'live_first.csv'),'sha256':sha(out/'live_first.csv')},
+            'archive_last':{'rows':rows(out/'archive_last.csv'),'sha256':sha(out/'archive_last.csv')},
+            'live_last':{'rows':rows(out/'live_last.csv'),'sha256':sha(out/'live_last.csv')},
+            'expected_first_sha256':'e5977e671184df86d9767fb304735e7955e889f22e21f0b04f40eabc14f80241',
+            'expected_last_sha256':'55e72163560959eef28f84e24b7482dd34fa66a9b418de6c26126f1b2aa300ce',
+            'diagnostic_at_utc':dt.datetime.now(dt.timezone.utc).isoformat()
+          }
+          result['first_exact']=result['archive_first']['sha256']==result['live_first']['sha256']==result['expected_first_sha256']
+          result['last_exact']=result['archive_last']['sha256']==result['live_last']['sha256']==result['expected_last_sha256']
+          if not (result['first_exact'] and result['last_exact'] and count==43835841): result['state']='CONTINUITY_FAILED'
+          (out/'CONTINUITY_DIAGNOSTIC_20260902.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          if result['state']!='CONTINUITY_VERIFIED': raise SystemExit(4)
+          PY
+          rclone copyto "$OUT/CONTINUITY_DIAGNOSTIC_20260902.json" "$R:CONTINUITY_DIAGNOSTIC_20260902.json" --config "$CFG" --drive-root-folder-id "$ROOT_ID" --retries 5 --low-level-retries 10
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

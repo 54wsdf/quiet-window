@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, hashlib, html.parser, json, os, re, subprocess, tempfile
+import argparse, hashlib, html.parser, json, os, re, subprocess, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -21,7 +21,7 @@ def run(cmd): subprocess.run(cmd, check=True)
 def output(cmd): return subprocess.check_output(cmd, text=True)
 
 def listing(kind:str)->list[dict]:
-    text=output(['curl','-fsSL','--retry','5','--retry-all-errors','-A','curl/8.5.0',INDEX[kind]])
+    text=output(['curl','--compressed','-fsSL','--retry','5','--retry-all-errors','-A','curl/8.5.0',INDEX[kind]])
     p=Links(); p.feed(text); rows=[]; seen=set()
     for href in p.hrefs:
         if '.zip' not in href.lower(): continue
@@ -58,11 +58,25 @@ def sha256(path:Path)->str:
         for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
     return h.hexdigest()
 
+def remote_size(dest:str, config:str, remote:str)->int:
+    last='not visible'
+    for n in range(10):
+        p=subprocess.run(['rclone','lsjson',f'{remote}:{dest}','--config',config,'--files-only'],text=True,capture_output=True)
+        if p.returncode==0:
+            try:
+                rows=json.loads(p.stdout)
+                if rows and isinstance(rows[0].get('Size'),int): return int(rows[0]['Size'])
+            except Exception as exc:
+                last=str(exc)
+        else:
+            last=(p.stderr or p.stdout or f'exit {p.returncode}').strip()
+        if n<9: time.sleep(min(30,2+n*3))
+    raise RuntimeError(f'remote object not visible after upload: {dest}: {last}')
 def rclone_put(local:Path, dest:str, config:str, remote:str):
     run(['rclone','copyto',str(local),f'{remote}:{dest}','--config',config,'--retries','8','--low-level-retries','20','--transfers','1','--checkers','4','--stats','60s','--stats-one-line'])
-    remote_size=int(json.loads(output(['rclone','lsjson',f'{remote}:{dest}','--config',config,'--files-only']))[0]['Size'])
+    rs=remote_size(dest,config,remote)
     local_size=local.stat().st_size
-    if remote_size!=local_size: raise RuntimeError(f'remote size mismatch {local_size} != {remote_size}')
+    if rs!=local_size: raise RuntimeError(f'remote size mismatch {local_size} != {rs}')
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--kind',choices=['actual','gtfs'],required=True); ap.add_argument('--year',type=int,required=True); ap.add_argument('--config',required=True); ap.add_argument('--remote',required=True); args=ap.parse_args()
@@ -76,7 +90,7 @@ def main():
         td=Path(td)
         for i,item in enumerate(selected,1):
             local=td/item['name']
-            run(['curl','-fL','--retry','8','--retry-all-errors','--connect-timeout','30','--max-time','7200',item['url'],'-o',str(local)])
+            run(['curl','--compressed','-fL','--retry','8','--retry-all-errors','--connect-timeout','30','--max-time','7200',item['url'],'-o',str(local)])
             size=local.stat().st_size
             if size<=0: raise RuntimeError('zero-byte payload')
             digest=sha256(local)

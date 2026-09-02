@@ -1,0 +1,33 @@
+name: Rail Beijing 2023
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-beijing-2023.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Mendeley public files 直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/mendeley_public_direct.py --dataset 'zhfhrrvbhy' --version 1 --dataset-id 'beijing_metro_ridership_built_environment_2023' --drive-path '01_rail/CN_Beijing_Metro/04_demand_od/2023_station_multisource' --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

@@ -1,0 +1,58 @@
+name: OpenCity T8 GTFS period probe 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t8-gtfs-period-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  GTFS_FOLDER_ID: '1SmeetN8imBec57abIDIhQzKdZuI9H6Vc'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Configure Drive and inspect service dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          rclone copyto "$R:mta_subway_gtfs_supplemented_20260902.zip" /tmp/mta.zip --drive-root-folder-id "$GTFS_FOLDER_ID" --retries 5 --low-level-retries 10
+          echo '659c021f2e3f55f48dfc2ba0ed10e8f46c49323b285a08bd2f84d30f658a5068  /tmp/mta.zip' | sha256sum -c -
+          python - <<'PY'
+          import csv, io, json, zipfile
+          from collections import Counter
+          with zipfile.ZipFile('/tmp/mta.zip') as z:
+              def rows(name):
+                  if name not in z.namelist(): return []
+                  return list(csv.DictReader(io.TextIOWrapper(z.open(name), encoding='utf-8-sig')))
+              cal=rows('calendar.txt'); cd=rows('calendar_dates.txt'); fi=rows('feed_info.txt'); routes=rows('routes.txt')
+          starts=[x.get('start_date','') for x in cal if x.get('start_date')]
+          ends=[x.get('end_date','') for x in cal if x.get('end_date')]
+          dates=[x.get('date','') for x in cd if x.get('date')]
+          route7=[x for x in routes if x.get('route_id')=='7' or x.get('route_short_name')=='7']
+          out={
+            'calendar_rows':len(cal),'calendar_start_min':min(starts) if starts else None,'calendar_start_max':max(starts) if starts else None,
+            'calendar_end_min':min(ends) if ends else None,'calendar_end_max':max(ends) if ends else None,
+            'calendar_dates_rows':len(cd),'calendar_dates_min':min(dates) if dates else None,'calendar_dates_max':max(dates) if dates else None,
+            'feed_info':fi,'route7':route7,
+          }
+          print('__RESULT_BEGIN__'); print(json.dumps(out,indent=2)); print('__RESULT_END__')
+          PY
+      - name: Cleanup
+        if: always()
+        run: rm -f "$HOME/.config/rclone/rclone.conf" /tmp/mta.zip 2>/dev/null || true

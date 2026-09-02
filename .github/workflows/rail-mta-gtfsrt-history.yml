@@ -1,0 +1,37 @@
+name: Rail MTA GTFSRT History
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-mta-gtfsrt-history.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rail-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        group: [subway, lirr, mnr]
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: 逐日 Parquet 直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/gtfsrt_archive_direct.py --group '${{ matrix.group }}' --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

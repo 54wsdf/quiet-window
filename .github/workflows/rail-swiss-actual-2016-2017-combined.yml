@@ -1,0 +1,55 @@
+name: Rail Swiss Actual 2016-2017 Combined
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-swiss-actual-2016-2017-combined.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Download official combined partial archive and persist to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+
+          URL='https://archive.opentransportdata.swiss/istdaten/2016+2017/16+17-unvollstaendig.zip'
+          F='16+17-unvollstaendig.zip'
+          P="$RUNNER_TEMP/$F"
+          DEST="01_rail/CH_swiss/02_actual_operations/2016_2017_partial/$F"
+          curl --compressed -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 7200 "$URL" -o "$P"
+          S=$(stat -c '%s' "$P")
+          H=$(sha256sum "$P" | awk '{print $1}')
+          test "$S" -gt 1000000
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+
+          RS=0
+          for i in $(seq 1 10); do
+            RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only 2>/dev/null | jq -r '.[0].Size // 0') || RS=0
+            test "$RS" = "$S" && break
+            sleep $((i*2))
+          done
+          test "$RS" = "$S"
+
+          M="$RUNNER_TEMP/$F.manifest.json"
+          printf '{"schema":"quiet-window-acquisition-manifest-v1","state":"ACQUIRED_PARTIAL_SOURCE","source":"Open Transport Data Switzerland archive","dataset":"actual_data","coverage":"2016+2017 combined","coverage_note":"Official source archive is explicitly labelled unvollstaendig (incomplete); preserve this limitation.","source_url":"%s","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s","retrieved_at_utc":"%s"}\n' \
+            "$URL" "$F" "$S" "$H" "$GITHUB_RUN_ID" "$(date -u +%FT%TZ)" > "$M"
+          rclone copyto "$M" "$R:$DEST.manifest.json" --config "$CFG" --retries 8 --low-level-retries 20
+          rm -f "$P" "$M"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

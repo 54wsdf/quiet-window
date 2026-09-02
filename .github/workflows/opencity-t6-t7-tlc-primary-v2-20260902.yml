@@ -1,0 +1,117 @@
+name: OpenCity T6 T7 TLC primary v2 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t6-t7-tlc-primary-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  TLC_FOLDER_ID: '1Yc_GJg6yV4dEGmZejGK6NMr-i-QK91u4'
+  LODES_FOLDER_ID: '1_SvJ2yXmkchx4u9OV8AOMaQ03u3lquWD'
+  OUTPUT_FOLDER_ID: '11irFhYLg2yf3KEt85aQAqmltZ_Vw8baA'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime and configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone unzip
+          python -m pip install --disable-pip-version-check pandas numpy scipy pyarrow geopandas shapely pyogrio
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+
+      - name: Materialize the already-archived official inputs and verify exact source bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          D=/tmp/t6t7src; mkdir -p "$D"
+          rclone copyto "$R:yellow_tripdata_2026-05.parquet" "$D/yellow_tripdata_2026-05.parquet" --drive-root-folder-id "$TLC_FOLDER_ID"
+          rclone copyto "$R:taxi_zones.zip" "$D/taxi_zones.zip" --drive-root-folder-id "$TLC_FOLDER_ID"
+          rclone copyto "$R:TLC_TAXI_ZONES_ACQUISITION_MANIFEST_20260902.json" "$D/TLC_TAXI_ZONES_ACQUISITION_MANIFEST_20260902.json" --drive-root-folder-id "$TLC_FOLDER_ID"
+          rclone copyto "$R:ny_rac_S000_JT00_2023.csv.gz" "$D/ny_rac_S000_JT00_2023.csv.gz" --drive-root-folder-id "$LODES_FOLDER_ID"
+          rclone copyto "$R:ny_wac_S000_JT00_2023.csv.gz" "$D/ny_wac_S000_JT00_2023.csv.gz" --drive-root-folder-id "$LODES_FOLDER_ID"
+          rclone copyto "$R:ny_xwalk.csv.gz" "$D/ny_xwalk.csv.gz" --drive-root-folder-id "$LODES_FOLDER_ID"
+          cat > "$D/KNOWN_SHA256.txt" <<'EOF'
+          9aa5a1609e2bf07d9051b7d530de05b1019e12a560ecb2c59c137c8b3a8b6750  yellow_tripdata_2026-05.parquet
+          f6d711917bb4340f8f644d5366c51665489eb2d426dd1a4a55677721ae5adf17  taxi_zones.zip
+          c5963453bcff37f5a4872be7c73fc986bda1a2b193bfbe7a2c371fab09f416d1  ny_rac_S000_JT00_2023.csv.gz
+          0274b2c3eabac9272c83674666e63d28690619a8111faf08531ecc54226d08c0  ny_wac_S000_JT00_2023.csv.gz
+          b8041bc3e4b536c861e9b1e4f77e125adc129d772febf932ab16e1fedcfa6259  ny_xwalk.csv.gz
+          EOF
+          (cd "$D" && sha256sum -c KNOWN_SHA256.txt)
+          unzip -t "$D/taxi_zones.zip" >/dev/null
+
+      - name: Run C6-safe TLC-primary T6/T7 rehearsal
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/t6t7out; mkdir -p "$OUT"
+          python scripts/opencity/t6_t7_tlc_primary_nestedzip_wrapper.py \
+            --tlc /tmp/t6t7src/yellow_tripdata_2026-05.parquet \
+            --zones /tmp/t6t7src/taxi_zones.zip \
+            --rac /tmp/t6t7src/ny_rac_S000_JT00_2023.csv.gz \
+            --wac /tmp/t6t7src/ny_wac_S000_JT00_2023.csv.gz \
+            --xwalk /tmp/t6t7src/ny_xwalk.csv.gz \
+            --out "$OUT"
+          cp /tmp/t6t7src/TLC_TAXI_ZONES_ACQUISITION_MANIFEST_20260902.json "$OUT/"
+
+      - name: Acceptance checks and execution provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,pandas as pd
+          s=json.load(open('/tmp/t6t7out/summary.json'))
+          assert s['T6']['zone_count']==200
+          assert s['T6']['truth_days']==31
+          assert s['T6']['model_uses_scored_region_od_observation'] is False
+          assert s['T6']['formal_status']=='PRIMARY_TRUTH_REHEARSAL_CLOSED_WITH_SCOPE_GAPS'
+          assert s['T7']['formal_status']=='SPARSE_OD_SUBPROBLEM_CLOSED'
+          m=pd.DataFrame(s['T7']['metrics'])
+          assert set(m['observation_rate'].round(2))=={0.05,0.10,0.20}
+          assert s['source_sha256']['tlc_parquet']=='9aa5a1609e2bf07d9051b7d530de05b1019e12a560ecb2c59c137c8b3a8b6750'
+          assert s['source_sha256']['taxi_zones_zip']=='f6d711917bb4340f8f644d5366c51665489eb2d426dd1a4a55677721ae5adf17'
+          assert s['source_sha256']['lodes_rac']=='c5963453bcff37f5a4872be7c73fc986bda1a2b193bfbe7a2c371fab09f416d1'
+          assert s['source_sha256']['lodes_wac']=='0274b2c3eabac9272c83674666e63d28690619a8111faf08531ecc54226d08c0'
+          assert s['source_sha256']['lodes_xwalk']=='b8041bc3e4b536c861e9b1e4f77e125adc129d772febf932ab16e1fedcfa6259'
+          PY
+          CORE_SHA="$(sha256sum scripts/opencity/t6_t7_tlc_primary_public_registry.py | awk '{print $1}')"
+          WRAP_SHA="$(sha256sum scripts/opencity/t6_t7_tlc_primary_nestedzip_wrapper.py | awk '{print $1}')"
+          python - "$CORE_SHA" "$WRAP_SHA" "$GITHUB_RUN_ID" > /tmp/t6t7out/EXECUTION_MANIFEST.json <<'PY'
+          import json,sys
+          core,wrapper,run=sys.argv[1:]
+          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'execution_core_sha256':core,'execution_io_wrapper_sha256':wrapper,'canonical_core_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t6_t7_tlc_primary_public_registry.py','canonical_io_wrapper':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t6_t7_tlc_primary_nestedzip_wrapper.py','output_drive_folder_id':'11irFhYLg2yf3KEt85aQAqmltZ_Vw8baA'},indent=2))
+          PY
+          (cd /tmp/t6t7out && sha256sum * > OUTPUT_SHA256SUMS.txt)
+
+      - name: Persist to unique OpenCity output folder and verify remote sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/t6t7out "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check /tmp/t6t7out "$R:" --drive-root-folder-id "$OUTPUT_FOLDER_ID" --one-way --size-only
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/rclone/rclone.conf" 2>/dev/null || true

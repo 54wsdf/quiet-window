@@ -1,0 +1,102 @@
+name: OpenCity WebTRIS 20x30 T3 T4 rerun 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-webtris-20x30-t3-t4-rerun-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  ROOT: transport_challenges/OpenCity_Traffic_Challenge_2026
+
+jobs:
+  rerun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Configure canonical Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'GDRIVE_RCLONE_CONFIG_B64 missing'; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check numpy pandas
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"
+          echo "remote=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Copy frozen WebTRIS acquisition and verify manifest exists
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          SRC="$ROOT/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day"
+          IN="$RUNNER_TEMP/webtris_20site_30day"
+          mkdir -p "$IN"
+          rclone copy "$R:$SRC" "$IN" --config "$CFG" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          test -s "$IN/ACQUISITION_MANIFEST.json"
+          test "$(find "$IN" -maxdepth 1 -name 'site_*_*.json' | wc -l)" -ge 20
+
+      - name: Execute canonical-copy T3/T4 rerun
+        shell: bash
+        run: |
+          set -euo pipefail
+          IN="$RUNNER_TEMP/webtris_20site_30day"
+          OUT="$RUNNER_TEMP/t3_t4_webtris_20x30"
+          python opencity_exec/t3_t4_webtris_20site_30day_public_registry.py --input-dir "$IN" --output "$OUT"
+          test -s "$OUT/summary.json"
+          jq -e '.site_count >= 20 and .min_days_per_site >= 30 and .input_hash_mismatches == 0' "$OUT/summary.json" >/dev/null
+          SCRIPT_SHA="$(sha256sum opencity_exec/t3_t4_webtris_20site_30day_public_registry.py | awk '{print $1}')"
+          cat > "$OUT/EXECUTION_MANIFEST.json" <<EOF
+          {
+            "state": "COMPLETED",
+            "evidence_class": "public_data registry / official public source",
+            "executor_repo": "54wsdf/quiet-window",
+            "github_run_id": "${GITHUB_RUN_ID}",
+            "executor_commit": "${GITHUB_SHA}",
+            "canonical_code_path": "54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t3_t4_webtris_20site_30day_public_registry.py",
+            "execution_copy_sha256": "${SCRIPT_SHA}",
+            "input_drive_path": "$ROOT/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day",
+            "output_drive_path": "$ROOT/04_outputs/OpenCity_T3_T4_WebTRIS_20x30_public_registry_rerun_20260902"
+          }
+          EOF
+          (cd "$OUT" && sha256sum README.md summary.json t3_site_metrics.csv t4_loso_site_metrics.csv t4_loso_regime_metrics.csv INPUT_SHA256.txt EXECUTION_MANIFEST.json > OUTPUT_SHA256.txt)
+
+      - name: Persist rerun outputs to canonical Drive
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/t3_t4_webtris_20x30"
+          DEST="$ROOT/04_outputs/OpenCity_T3_T4_WebTRIS_20x30_public_registry_rerun_20260902"
+          rclone copy "$OUT" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check "$OUT" "$R:$DEST" --config "$CFG" --one-way --size-only
+          echo "COMPLETED -> $DEST"
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

@@ -20,7 +20,7 @@ jobs:
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       REQUEST_FILE: .github/requests/rail-source-refresh-20260902.json
-      OUTPUT_DIR: ${{ runner.temp }}/rail-source-refresh
+      OUTPUT_DIR: /tmp/rail-source-refresh
 
     steps:
       - name: Checkout execution tools

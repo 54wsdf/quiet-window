@@ -1,0 +1,26 @@
+name: Actions Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runner-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check standard runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash --version | head -n 1
+          git --version
+          python3 --version
+          node --version
+          gh --version | head -n 1
+          docker --version
+          jq --version
+          curl --version | head -n 1

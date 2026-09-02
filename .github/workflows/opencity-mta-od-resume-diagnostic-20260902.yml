@@ -1,0 +1,167 @@
+name: OpenCity MTA OD resume diagnostic 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-resume-diagnostic-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OD_ROOT_ID: 1OZN2Nn1qHdVak8Q1yKQxUV07Znjmlk_Z
+  DATASET_ID: 28vm-gjqr
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Configure read/write Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'GDRIVE_RCLONE_CONFIG_B64 missing'; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"
+          echo "remote=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Inventory existing multipart chain and probe source contract
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/od_diag"
+          mkdir -p "$OUT"
+
+          rclone lsjson "$R:parts" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --files-only > "$OUT/parts_lsjson.json"
+
+          python - "$OUT" <<'PY'
+          import csv, datetime as dt, hashlib, io, json, os, re, subprocess, sys
+          from pathlib import Path
+          import requests
+
+          out=Path(sys.argv[1]); ds=os.environ['DATASET_ID']; root=os.environ['OD_ROOT_ID']
+          cfg=os.environ['CFG']; remote=os.environ['R']
+          listing=json.loads((out/'parts_lsjson.json').read_text())
+          pat=re.compile(rf'^{re.escape(ds)}\.part-(\d{{5}})\.csv$')
+          parts=[]
+          for x in listing:
+              name=x.get('Name') or x.get('Path') or ''
+              m=pat.match(name)
+              if m:
+                  parts.append({'index':int(m.group(1)),'name':name,'bytes':int(x.get('Size') or 0),'modtime':x.get('ModTime')})
+          parts.sort(key=lambda x:x['index'])
+          if not parts: raise SystemExit('No matching multipart files found')
+          idx=[x['index'] for x in parts]
+          missing=[i for i in range(min(idx),max(idx)+1) if i not in set(idx)]
+          dup_count=len(idx)-len(set(idx))
+
+          def copy_remote(name, local):
+              subprocess.run(['rclone','copyto',f'{remote}:parts/{name}',str(local),'--config',cfg,'--drive-root-folder-id',root,'--retries','5','--low-level-retries','10'],check=True)
+          first=parts[0]; last=parts[-1]
+          first_path=out/'first.csv'; last_path=out/'last.csv'
+          copy_remote(first['name'],first_path)
+          if last['name']==first['name']:
+              last_path.write_bytes(first_path.read_bytes())
+          else:
+              copy_remote(last['name'],last_path)
+
+          def inspect_csv(p):
+              h=hashlib.sha256(); data=p.read_bytes(); h.update(data)
+              text=io.TextIOWrapper(io.BytesIO(data),encoding='utf-8-sig',newline='')
+              r=csv.reader(text); rows=list(r)
+              if not rows: return {'bytes':len(data),'sha256':h.hexdigest(),'header':[],'data_rows':0,'first_data_row':None,'last_data_row':None}
+              return {'bytes':len(data),'sha256':h.hexdigest(),'header':rows[0],'data_rows':max(0,len(rows)-1),'first_data_row':rows[1] if len(rows)>1 else None,'last_data_row':rows[-1] if len(rows)>1 else None}
+          fi=inspect_csv(first_path); la=inspect_csv(last_path)
+
+          sess=requests.Session(); sess.headers['User-Agent']='OpenCity-MTA-OD-resume-diagnostic/20260902'
+          meta_url=f'https://data.ny.gov/api/views/{ds}'
+          meta_r=sess.get(meta_url,timeout=90); meta_r.raise_for_status(); meta=meta_r.json()
+          count_url=f'https://data.ny.gov/resource/{ds}.json'
+          count_r=sess.get(count_url,params={'$select':'count(*)'},timeout=90); count_r.raise_for_status(); count_j=count_r.json()
+          count_val=None
+          if count_j:
+              v=next(iter(count_j[0].values()))
+              count_val=int(v)
+
+          # Infer the archived chunk size only from the first stored part. No write/resume is attempted here.
+          chunk=fi['data_rows']
+          expected_offset=last['index']*chunk if chunk>0 and first['index']==0 else None
+          source_probe=None
+          exact_match=None
+          if expected_offset is not None and expected_offset < count_val:
+              pr=sess.get(f'https://data.ny.gov/resource/{ds}.csv',params={'$limit':1,'$offset':expected_offset},timeout=90)
+              pr.raise_for_status()
+              rr=list(csv.reader(io.StringIO(pr.text)))
+              source_probe={'offset':expected_offset,'header':rr[0] if rr else None,'first_data_row':rr[1] if len(rr)>1 else None}
+              exact_match=(source_probe['header']==la['header'] and source_probe['first_data_row']==la['first_data_row'])
+
+          # Also compare current source row zero against archived part zero to detect source reordering/version drift.
+          pr0=sess.get(f'https://data.ny.gov/resource/{ds}.csv',params={'$limit':1,'$offset':0},timeout=90)
+          pr0.raise_for_status(); rr0=list(csv.reader(io.StringIO(pr0.text)))
+          source0={'header':rr0[0] if rr0 else None,'first_data_row':rr0[1] if len(rr0)>1 else None}
+          zero_match=(source0['header']==fi['header'] and source0['first_data_row']==fi['first_data_row'])
+
+          result={
+            'state':'DIAGNOSTIC_COMPLETE',
+            'dataset_id':ds,
+            'diagnostic_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'drive_od_root_id':root,
+            'existing_part_count':len(parts),
+            'min_part_index':min(idx),'max_part_index':max(idx),'duplicate_index_count':dup_count,
+            'missing_indices':missing,
+            'first_part':{**first,**fi},
+            'last_part':{**last,**la},
+            'inferred_chunk_rows_from_part_00000':chunk if first['index']==0 else None,
+            'provider_current_row_count':count_val,
+            'provider_metadata':{
+              'name':meta.get('name'),'id':meta.get('id'),'rowsUpdatedAt':meta.get('rowsUpdatedAt'),
+              'dataUpdatedAt':meta.get('dataUpdatedAt'),'metadataUpdatedAt':meta.get('metadataUpdatedAt'),
+              'rowsUpdatedBy':meta.get('rowsUpdatedBy'),'publicationDate':meta.get('publicationDate')
+            },
+            'current_source_row0_matches_archived_part0':zero_match,
+            'last_part_expected_offset_under_zero_based_fixed_chunk_contract':expected_offset,
+            'current_source_row_at_expected_offset_matches_archived_last_part_first_row':exact_match,
+            'source_probe_at_expected_offset':source_probe,
+            'resume_safety':{
+              'contiguous_existing_indices': len(missing)==0 and dup_count==0,
+              'fixed_chunk_contract_supported_by_first_part': chunk>0 and first['index']==0,
+              'current_source_default_order_matches_archive_at_zero': zero_match,
+              'current_source_default_order_matches_archive_at_last_offset': exact_match,
+              'safe_to_append_with_same_unordered_offset_contract': bool(len(missing)==0 and dup_count==0 and zero_match and exact_match)
+            },
+            'note':'No source part was written or redownloaded except first/last files copied locally for diagnosis. A resume is blocked unless ordering/version continuity is demonstrated.'
+          }
+          (out/'RESUME_DIAGNOSTIC_20260902.json').write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
+          print(json.dumps(result,indent=2))
+          PY
+
+          rclone copyto "$OUT/RESUME_DIAGNOSTIC_20260902.json" "$R:RESUME_DIAGNOSTIC_20260902.json" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --retries 5 --low-level-retries 10
+          rclone lsjson "$R:RESUME_DIAGNOSTIC_20260902.json" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --files-only
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

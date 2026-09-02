@@ -88,7 +88,7 @@ jobs:
           fi
           exit 0
 
-      - name: Persist and verify task folders
+      - name: Persist and verify enabled task folders
         if: steps.storage.outputs.ready == 'true'
         continue-on-error: true
         shell: bash
@@ -182,12 +182,15 @@ jobs:
             fi
           }
 
-          MBTA_DEST="$(jq -r '.mbta.drive_path' "$REQUEST_FILE")"
-          CTA_DEST="$(jq -r '.cta.drive_path' "$REQUEST_FILE")"
           SUMMARY_DEST="$(jq -r '.summary_drive_path' "$REQUEST_FILE")"
-
-          transfer_task mbta "$MBTA_DEST"
-          transfer_task cta "$CTA_DEST"
+          if jq -e '.mbta.enabled == true' "$REQUEST_FILE" >/dev/null; then
+            MBTA_DEST="$(jq -r '.mbta.drive_path' "$REQUEST_FILE")"
+            transfer_task mbta "$MBTA_DEST"
+          fi
+          if jq -e '.cta.enabled == true' "$REQUEST_FILE" >/dev/null; then
+            CTA_DEST="$(jq -r '.cta.drive_path' "$REQUEST_FILE")"
+            transfer_task cta "$CTA_DEST"
+          fi
 
           python - "$STORAGE_SUMMARY" "$GITHUB_RUN_ID" "$GITHUB_SHA" <<'PY'
           import json, sys

@@ -1,0 +1,64 @@
+name: Rail Finland Current Retry
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-finland-current-retry.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  gtfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {id: fi_gtfs_passenger, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger.zip', file: 'gtfs-passenger.zip'}
+          - {id: fi_gtfs_passenger_stops, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger-stops.zip', file: 'gtfs-passenger-stops.zip'}
+          - {id: fi_gtfs_all, url: 'https://rata.digitraffic.fi/api/v1/trains/gtfs-all.zip', file: 'gtfs-all.zip'}
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Python requests 下载并直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          P="$RUNNER_TEMP/${{ matrix.file }}"
+          URL='${{ matrix.url }}' OUT="$P" python - <<'PY'
+          import os, time, requests
+          u=os.environ['URL']; p=os.environ['OUT']
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 quiet-window-public-data-worker/2.0','Accept':'*/*'})
+          for n in range(8):
+              try:
+                  with s.get(u,stream=True,timeout=(30,3600)) as r:
+                      r.raise_for_status()
+                      with open(p,'wb') as f:
+                          for b in r.iter_content(8*1024*1024):
+                              if b: f.write(b)
+                  if os.path.getsize(p)<=0: raise RuntimeError('zero bytes')
+                  break
+              except Exception:
+                  try: os.remove(p)
+                  except FileNotFoundError: pass
+                  if n==7: raise
+                  time.sleep(min(120,2**n))
+          PY
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}')
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; DEST="01_rail/FI_digitraffic/01_schedule/current/${{ matrix.file }}"
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","dataset_id":"%s","source_url":"%s","bytes":%s,"sha256":"%s","run_id":"%s"}\n' '${{ matrix.id }}' '${{ matrix.url }}' "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/${{ matrix.file }}.manifest.json"
+          rclone copyto "$RUNNER_TEMP/${{ matrix.file }}.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

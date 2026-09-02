@@ -1,5 +1,5 @@
 {
-  "run_id": "rail-source-refresh-20260902-cta-mirror",
+  "run_id": "rail-source-refresh-20260902-cta-idfirst",
   "summary_drive_path": "transport_data_lake/01_rail/99_manifests/rail_source_refresh_20260902",
   "mbta": {
     "enabled": false,
@@ -29,6 +29,6 @@
     "demand_end": "2026-06-30",
     "service_date": "2026-08-19",
     "terms_url": "https://www.transitchicago.com/developers/gtfs/",
-    "drive_path": "transport_data_lake/01_rail/cta/01_schedule/station_route_service_local_20260902"
+    "drive_path": "transport_data_lake/01_rail/cta/01_schedule/station_route_service_idfirst_20260902"
   }
 }

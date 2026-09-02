@@ -1,0 +1,73 @@
+name: Rail Research Assets
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-research-assets.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  records:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {provider: figshare, record: '28844942', id: metroflow_shanghai, path: '01_rail/CN_Shanghai_MetroFlow/04_demand_od'}
+          - {provider: zenodo, record: '3145404', id: hangzhou_metro_2019, path: '01_rail/CN_Hangzhou_Metro/04_demand_od/2019'}
+          - {provider: zenodo, record: '21775303', id: tdp_nw_2026, path: '05_simulation_benchmarks/rail/TDP_NW_2026'}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: API 枚举并全部直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/research_record_direct.py --provider '${{ matrix.provider }}' --record-id '${{ matrix.record }}' --dataset-id '${{ matrix.id }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"
+
+  snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - {id: openlintim, url: 'https://gitlab.com/lintim/openlintim/-/archive/master/openlintim-master.zip', file: openlintim-master.zip}
+          - {id: ctors, url: 'https://github.com/AlgTUDelft/cTORS/archive/refs/heads/master.zip', file: cTORS-master.zip}
+          - {id: robust_rail, url: 'https://github.com/Robust-Rail-NL/robust-rail-solver/archive/refs/heads/main.zip', file: robust-rail-solver-main.zip}
+          - {id: cp2025_dispatch, url: 'https://github.com/ShortestPathLab/train_dispatching_benchmark/archive/refs/heads/main.zip', file: train_dispatching_benchmark-main.zip}
+          - {id: flatland_ecml2026, url: 'https://github.com/flatland-association/ecml2026-starterkit/archive/refs/heads/main.zip', file: ecml2026-starterkit-main.zip}
+          - {id: matsim_berlin, url: 'https://github.com/matsim-scenarios/matsim-berlin/archive/refs/heads/main.zip', file: matsim-berlin-main.zip}
+    steps:
+      - name: 仓库快照直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; P="$RUNNER_TEMP/${{ matrix.file }}"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 7200 '${{ matrix.url }}' -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST="05_simulation_benchmarks/rail/${{ matrix.id }}/${{ matrix.file }}"
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","dataset_id":"%s","source_url":"%s","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s"}\n' '${{ matrix.id }}' '${{ matrix.url }}' '${{ matrix.file }}' "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/${{ matrix.file }}.manifest.json"
+          rclone copyto "$RUNNER_TEMP/${{ matrix.file }}.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

@@ -1,0 +1,36 @@
+# Local environment / credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*service-account*.json
+rclone.conf
+.rclone.conf
+
+# Downloaded or generated payloads
+out/
+data/
+downloads/
+artifacts/
+staging/
+tmp/
+temp/
+*.part
+*.partial
+*.crdownload
+
+# Local manifests generated during runs
+RUN_MANIFEST*.json
+SHA256SUMS*.txt
+
+# Python / Node / tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.DS_Store
+Thumbs.db

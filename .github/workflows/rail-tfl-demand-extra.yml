@@ -1,0 +1,48 @@
+name: Rail TfL Demand Extra
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-tfl-demand-extra.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {prefix: 'Annual Station Counts/', id: 'tfl_annual_station_counts', path: '01_rail/UK_London_TfL/04_demand_od/annual_station_counts'}
+          - {prefix: 'Network Demand/', id: 'tfl_network_demand', path: '01_rail/UK_London_TfL/04_demand_od/network_demand'}
+          - {prefix: 'RODS/', id: 'tfl_rods', path: '01_rail/UK_London_TfL/04_demand_od/rods'}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Mirror TfL demand prefix directly to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+          python scripts/fetchers/tfl_s3_prefix_mirror.py \
+            --prefix '${{ matrix.prefix }}' \
+            --dataset-id '${{ matrix.id }}' \
+            --drive-path '${{ matrix.path }}' \
+            --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

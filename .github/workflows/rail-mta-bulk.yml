@@ -1,0 +1,54 @@
+name: Rail MTA Bulk
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-mta-bulk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  socrata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - {id: g8es-h7gb, name: 'Subway schedules 2026', path: '01_rail/US_NY_MTA/01_schedule/subway_schedules_2026'}
+          - {id: jsu2-fbtj, name: 'Subway OD 2024', path: '01_rail/US_NY_MTA/04_demand_od/subway_od_2024'}
+          - {id: 28vm-gjqr, name: 'Subway OD beginning 2026', path: '01_rail/US_NY_MTA/04_demand_od/subway_od_2026'}
+          - {id: 5wq4-mkjj, name: 'Subway hourly ridership beginning 2025', path: '01_rail/US_NY_MTA/04_demand_od/subway_hourly_ridership_2025'}
+          - {id: r7qk-6tcy, name: 'Customer journey metrics', path: '01_rail/US_NY_MTA/08_performance_reliability/customer_journey_metrics'}
+          - {id: sp9g-mzjh, name: 'Subway end-to-end running times 2019+', path: '01_rail/US_NY_MTA/02_actual_operations/end_to_end_running_times'}
+          - {id: 7kct-peq7, name: 'Service alerts 2020+', path: '01_rail/US_NY_MTA/05_disruptions_trackwork/service_alerts'}
+          - {id: jt9p-47ua, name: 'Metro-North service delivered 2019+', path: '01_rail/US_NY_MTA/02_actual_operations/mnr_service_delivered'}
+          - {id: 83hw-i6xw, name: 'Metro-North OTP 2020+', path: '01_rail/US_NY_MTA/08_performance_reliability/mnr_otp'}
+          - {id: sguy-yhj4, name: 'Metro-North service reliability 2020+', path: '01_rail/US_NY_MTA/08_performance_reliability/mnr_service_reliability'}
+          - {id: 73th-g5ad, name: 'LIRR trip occupancy 2022+', path: '01_rail/US_NY_MTA/04_demand_od/lirr_trip_occupancy'}
+          - {id: 6kq9-5ikh, name: 'LIRR OTP 2015+', path: '01_rail/US_NY_MTA/08_performance_reliability/lirr_otp'}
+          - {id: e32g-kbe9, name: 'LIRR delays 2010+', path: '01_rail/US_NY_MTA/02_actual_operations/lirr_delays'}
+          - {id: wkbk-y3dt, name: 'LIRR delay verification 2010+', path: '01_rail/US_NY_MTA/02_actual_operations/lirr_delay_verification'}
+          - {id: tgiq-jafi, name: 'Metro-North delays 2012+', path: '01_rail/US_NY_MTA/02_actual_operations/mnr_delays'}
+          - {id: crxu-7hda, name: 'Metro-North delay verification 2012+', path: '01_rail/US_NY_MTA/02_actual_operations/mnr_delay_verification'}
+          - {id: sv2g-g4mz, name: 'Regional transit ridership 2021+', path: '01_rail/US_NY_MTA/04_demand_od/regional_ridership'}
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: 准备环境并分页直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/socrata_direct.py --dataset-id '${{ matrix.id }}' --name '${{ matrix.name }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R" --chunk-rows 100000
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

@@ -1,0 +1,100 @@
+name: OpenCity MTA OD ordered continuity diagnostic 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-ordered-continuity-diagnostic-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OD_ROOT_ID: 1OZN2Nn1qHdVak8Q1yKQxUV07Znjmlk_Z
+  DATASET_ID: 28vm-gjqr
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"; echo "remote=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Compare archived part 00000 and 00561 with live $order=:id chunks
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/diag"; mkdir -p "$OUT"
+          rclone copyto "$R:parts/28vm-gjqr.part-00000.csv" "$OUT/archive_00000.csv" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID"
+          rclone copyto "$R:parts/28vm-gjqr.part-00561.csv" "$OUT/archive_00561.csv" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID"
+          python - "$OUT" <<'PY'
+          import csv,datetime as dt,hashlib,io,json,sys,time
+          from pathlib import Path
+          import requests
+          out=Path(sys.argv[1]); ds='28vm-gjqr'; base=f'https://data.ny.gov/resource/{ds}.csv'
+          s=requests.Session(); s.headers['User-Agent']='OpenCity-MTA-OD-ordered-continuity/20260902'
+          def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def rows(p):
+              with open(p,encoding='utf-8-sig',newline='') as f: return max(0,sum(1 for _ in f)-1)
+          def fetch(offset,limit,path):
+              params={'$limit':str(limit),'$offset':str(offset),'$order':':id'}
+              for n in range(6):
+                  try:
+                      with s.get(base,params=params,stream=True,timeout=(30,1800)) as r:
+                          r.raise_for_status()
+                          with open(path,'wb') as f:
+                              for b in r.iter_content(8*1024*1024):
+                                  if b: f.write(b)
+                      return
+                  except Exception:
+                      Path(path).unlink(missing_ok=True)
+                      if n==5: raise
+                      time.sleep(2**n)
+          a0=out/'archive_00000.csv'; a561=out/'archive_00561.csv'
+          l0=out/'live_ordered_00000.csv'; l561=out/'live_ordered_00561.csv'
+          fetch(0,100000,l0); fetch(56100000,100000,l561)
+          c=s.get(f'https://data.ny.gov/resource/{ds}.json',params={'$select':'count(*)'},timeout=90); c.raise_for_status(); total=int(c.json()[0]['count'])
+          m=s.get(f'https://data.ny.gov/api/views/{ds}',timeout=90); m.raise_for_status(); meta=m.json()
+          # Probe the exact first row of the next chunk under the same ordered contract.
+          n=s.get(base,params={'$limit':'1','$offset':'56200000','$order':':id'},timeout=90); n.raise_for_status(); nr=list(csv.reader(io.StringIO(n.text)))
+          result={
+            'state':'ORDERED_CONTINUITY_DIAGNOSTIC_COMPLETE','dataset_id':ds,'order_contract':':id','chunk_rows':100000,
+            'diagnostic_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),'provider_current_row_count':total,
+            'provider_metadata':{'rowsUpdatedAt':meta.get('rowsUpdatedAt'),'dataUpdatedAt':meta.get('dataUpdatedAt'),'metadataUpdatedAt':meta.get('metadataUpdatedAt')},
+            'archive_part_00000':{'rows':rows(a0),'sha256':sha(a0)},'live_ordered_part_00000':{'rows':rows(l0),'sha256':sha(l0)},
+            'archive_part_00561':{'rows':rows(a561),'sha256':sha(a561)},'live_ordered_part_00561':{'rows':rows(l561),'sha256':sha(l561)},
+            'part_00000_exact_sha_match':sha(a0)==sha(l0),'part_00561_exact_sha_match':sha(a561)==sha(l561),
+            'next_offset':56200000,'next_ordered_first_row':nr[1] if len(nr)>1 else None,
+          }
+          result['safe_to_resume_old_chain_with_order_id']=bool(result['part_00000_exact_sha_match'] and result['part_00561_exact_sha_match'] and rows(a0)==100000 and rows(a561)==100000 and total>56200000)
+          result['interpretation']='This supersedes the earlier default-order diagnostic for resume safety because the original generic Socrata fetcher attempts $order=:id first and only falls back on HTTP error.'
+          (out/'RESUME_DIAGNOSTIC_ORDERED_20260902.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+          rclone copyto "$OUT/RESUME_DIAGNOSTIC_ORDERED_20260902.json" "$R:RESUME_DIAGNOSTIC_ORDERED_20260902.json" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --retries 5 --low-level-retries 10
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

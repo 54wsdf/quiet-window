@@ -16,47 +16,70 @@ DISCOVERY_PARENT = (
     "01_public_reference_data/public_data_registry_acquisition_20260902"
 )
 
+# Folder objects observed from the original eight-runner rclone destination race.
+# These are transport locations only; the canonical consolidated object remains
+# mod.CANONICAL_FOLDER_ID. Keep all readable objects in the union so downloaded
+# source bytes are reused before any provider refill is attempted.
+OBSERVED_RACE_FOLDER_IDS = [
+    "1DEamJPCebt6rIhhW3Qpivxh_DG4cTMut",
+    "1E359BirG1whXGaRgCYEGhoSslaReMEe5",
+    "12jzAigIsi5q5OUUuz0MlMuhUFpimtYzu",
+    "1mFq1mCUDB-RRpG2VoSFt8syxWGGDoOjI",
+    "130kSsP6Zfe0naibmgYloRUv5BP0Z8849",
+]
+
 
 def discover_source_ids(remote):
-    p = mod.run([
-        "rclone", "lsjson", f"{remote}:{DISCOVERY_PARENT}",
-        "--dirs-only", "--max-depth", "1",
-    ])
-    entries = json.loads(p.stdout or b"[]")
-    matched = []
-    for x in entries:
-        if x.get("IsDir") and x.get("Name") == mod.SOURCE_FOLDER_NAME and x.get("ID"):
-            matched.append(x["ID"])
+    candidates = set(OBSERVED_RACE_FOLDER_IDS)
+    candidates.update(getattr(mod, "KNOWN_SOURCE_FOLDER_IDS", []))
+
+    try:
+        p = mod.run([
+            "rclone", "lsjson", f"{remote}:{DISCOVERY_PARENT}",
+            "--dirs-only", "--max-depth", "1",
+        ])
+        entries = json.loads(p.stdout or b"[]")
+        for x in entries:
+            if x.get("IsDir") and x.get("Name") == mod.SOURCE_FOLDER_NAME and x.get("ID"):
+                candidates.add(x["ID"])
+    except Exception as exc:
+        print(json.dumps({"path_discovery_warning": str(exc)}, indent=2), flush=True)
+
     extras = os.environ.get("MTA_OD_EXTRA_SOURCE_FOLDER_IDS", "").strip()
     if extras:
-        matched.extend(x.strip() for x in extras.split(",") if x.strip())
-    ids = sorted(set(matched))
-    if not ids:
-        raise RuntimeError(
-            f"no readable {mod.SOURCE_FOLDER_NAME!r} folders discovered under {DISCOVERY_PARENT}"
-        )
+        candidates.update(x.strip() for x in extras.split(",") if x.strip())
+
     verified = []
-    for fid in ids:
-        mod.rclone_lsjson(remote, fid)
-        verified.append(fid)
+    unreadable = []
+    for fid in sorted(candidates):
+        try:
+            mod.rclone_lsjson(remote, fid)
+            verified.append(fid)
+        except Exception as exc:
+            unreadable.append({"folder_id": fid, "error": str(exc)[-500:]})
+
+    if not verified:
+        raise RuntimeError("no readable MTA OD race/source folder objects remain")
+
     print(json.dumps({
         "drive_discovery_parent": DISCOVERY_PARENT,
         "source_folder_name": mod.SOURCE_FOLDER_NAME,
         "source_folder_ids": verified,
         "source_folder_count": len(verified),
+        "unreadable_candidate_folder_ids": unreadable,
     }, indent=2), flush=True)
     return verified
 
 
 def provider_snapshot_without_count_query(session):
-    """Validate the frozen Socrata data version without an expensive count(*) call.
+    """Validate the frozen data revision without repeated count(*) queries.
 
-    The producer run already froze EXPECTED_ROWS=72,639,113 and the :id chunk
-    contract. Refill safety therefore needs to prove that the live dataset is still
-    the same data revision before querying a missing chunk. rowsUpdatedAt and
-    viewLastModified come from the lightweight metadata endpoint and are both
-    pinned to the acquisition snapshot. This avoids repeated count(*) timeouts
-    while preserving a hard version gate.
+    `rowsUpdatedAt` is the Socrata data-row revision marker. `viewLastModified`
+    can change when metadata/view configuration changes without altering rows,
+    so it is recorded but is deliberately not a data-integrity gate. The total
+    row count and 50k/:id chunk contract were already frozen by producer run
+    33615833576. A missing chunk is refetched only while rowsUpdatedAt remains
+    exactly equal to that producer revision.
     """
     last = None
     for attempt in range(8):
@@ -69,18 +92,17 @@ def provider_snapshot_without_count_query(session):
             return {
                 "rowsUpdatedAt": rows_updated,
                 "viewLastModified": view_modified,
+                "expected_viewLastModified_at_original_pin": mod.EXPECTED_VIEW_LAST_MODIFIED,
+                "viewLastModified_is_nonbinding_metadata": True,
                 "row_count": mod.EXPECTED_ROWS,
                 "row_count_evidence": "frozen producer contract; live count(*) intentionally skipped",
-                "matches_required_version": (
-                    rows_updated == mod.EXPECTED_ROWS_UPDATED_AT
-                    and view_modified == mod.EXPECTED_VIEW_LAST_MODIFIED
-                ),
+                "matches_required_version": rows_updated == mod.EXPECTED_ROWS_UPDATED_AT,
             }
         except Exception as exc:
             last = exc
             if attempt < 7:
                 time.sleep(min(2 ** attempt, 30))
-    raise RuntimeError(f"metadata version probe failed after retries: {last}")
+    raise RuntimeError(f"metadata row-revision probe failed after retries: {last}")
 
 
 mod.discover_source_ids = discover_source_ids

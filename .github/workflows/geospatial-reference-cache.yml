@@ -1,0 +1,64 @@
+name: Geospatial Reference Cache
+
+on:
+  push:
+    paths:
+      - '.github/workflows/geospatial-reference-cache.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  hpms-ca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DEST: ResearchData/transport_public/registry_reference_20260902/hpms_california_2018
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Fetch complete official feature service
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install -q requests
+          mkdir -p "$HOME/.config/rclone" out
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          cat > /tmp/hpms.py <<'PY'
+          import json,hashlib,time,requests
+          from pathlib import Path
+          out=Path('out')
+          base='https://geo.dot.gov/server/rest/services/Hosted/California_2018_PR/FeatureServer'
+          s=requests.Session(); s.headers['User-Agent']='public-transport-reference-cache/1.0'
+          meta=s.get(base,params={'f':'json'},timeout=120); meta.raise_for_status(); sj=meta.json()
+          (out/'service_metadata.json').write_bytes(meta.content)
+          layers=sj.get('layers') or []
+          if not layers: raise SystemExit('no layers exposed by service')
+          summary=[]
+          for layer in layers:
+              lid=layer['id']; lname=layer.get('name',f'layer_{lid}')
+              lurl=f'{base}/{lid}'
+              lm=s.get(lurl,params={'f':'json'},timeout=120); lm.raise_for_status(); (out/f'layer_{lid}_metadata.json').write_bytes(lm.content)
+              ids_resp=s.get(lurl+'/query',params={'where':'1=1','returnIdsOnly':'true','f':'json'},timeout=180); ids_resp.raise_for_status(); idsj=ids_resp.json()
+              ids=idsj.get('objectIds') or []
+              feats=[]
+              for i in range(0,len(ids),500):
+                  chunk=ids[i:i+500]
+                  rr=s.get(lurl+'/query',params={'objectIds':','.join(map(str,chunk)),'outFields':'*','returnGeometry':'true','outSR':'4326','f':'geojson'},timeout=180)
+                  rr.raise_for_status(); jj=rr.json(); feats.extend(jj.get('features') or [])
+                  time.sleep(.03)
+              geo={'type':'FeatureCollection','name':lname,'source':lurl,'features':feats}
+              fn=out/f'california_2018_hpms_layer_{lid}.geojson'; fn.write_text(json.dumps(geo,separators=(',',':')),encoding='utf-8')
+              summary.append({'layer_id':lid,'name':lname,'object_ids':len(ids),'features_written':len(feats),'file':fn.name})
+              if len(feats)!=len(ids): raise SystemExit(f'layer {lid}: {len(feats)} != {len(ids)}')
+          (out/'ACQUISITION_SUMMARY.json').write_text(json.dumps({'source':base,'layers':summary},indent=2),encoding='utf-8')
+          with (out/'SHA256SUMS.txt').open('w') as h:
+              for f in sorted(out.iterdir()):
+                  if f.is_file() and f.name!='SHA256SUMS.txt': h.write(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n')
+          PY
+          python /tmp/hpms.py
+          rclone mkdir "gdrive:$DEST"
+          rclone copy out "gdrive:$DEST" --ignore-existing --transfers 2 --checkers 4 --retries 5 --low-level-retries 10

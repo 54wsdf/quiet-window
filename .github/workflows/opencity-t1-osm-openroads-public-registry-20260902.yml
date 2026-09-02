@@ -42,8 +42,8 @@ jobs:
           D=/tmp/t1src; mkdir -p "$D/openroads"
           rclone copyto "$R:scotland-latest.osm.pbf" "$D/scotland-latest.osm.pbf" --drive-root-folder-id "$OSM_FOLDER_ID" --retries 8 --low-level-retries 20
           rclone copyto "$R:oproad_gpkg_gb.zip" "$D/oproad_gpkg_gb.zip" --drive-root-folder-id "$OPENROADS_FOLDER_ID" --retries 8 --low-level-retries 20
-          echo 'aa41b545007da110375d0c46e258ad035c75e8bb97339b71d891c04cc0378f91  /tmp/t1src/scotland-latest.osm.pbf' | sha256sum -c -
-          echo '908c0edabfa5301571456197cce95b2a8ce15046960a988141722c69e36f202b  /tmp/t1src/oproad_gpkg_gb.zip' | sha256sum -c -
+          echo 'aa41b545199522d6097838313038523b54611ce3eeebbc025fce219cb8824695  /tmp/t1src/scotland-latest.osm.pbf' | sha256sum -c -
+          echo '908c0eda3a1b13ebba9f1bad3e5fd43ae0d1c83d823057ead8e4f86bdb0510ba  /tmp/t1src/oproad_gpkg_gb.zip' | sha256sum -c -
           unzip -q "$D/oproad_gpkg_gb.zip" -d "$D/openroads"
           GPKG="$(find "$D/openroads" -type f -iname '*.gpkg' | head -1)"; test -n "$GPKG"
           cp "$GPKG" "$D/openroads.gpkg"
@@ -64,7 +64,7 @@ jobs:
           assert s['scale']['openroads_links_in_window'] >= 200
           assert s['audit']['public_reference_links'] == 200
           assert s['routing']['truth_connected_od_pairs_scored'] == 500
-          assert s['source_sha256']['osm_scotland_pbf']=='aa41b545007da110375d0c46e258ad035c75e8bb97339b71d891c04cc0378f91'
+          assert s['source_sha256']['osm_scotland_pbf']=='aa41b545199522d6097838313038523b54611ce3eeebbc025fce219cb8824695'
           assert s['status']=='PUBLIC_OSM_OPENROADS_TOPOLOGY_REHEARSAL_CLOSED'
           print(json.dumps(s,indent=2))
           PY
@@ -73,7 +73,7 @@ jobs:
           python - "$CORE_SHA" "$GPKG_SHA" "$GITHUB_RUN_ID" "$GITHUB_SHA" > /tmp/t1out/EXECUTION_MANIFEST.json <<'PY'
           import json,sys
           core,gpkg,run,commit=sys.argv[1:]
-          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'executor_commit':commit,'canonical_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t1_osm_openroads_public_registry.py','execution_code_sha256':core,'source_archives':{'osm_pbf_sha256':'aa41b545007da110375d0c46e258ad035c75e8bb97339b71d891c04cc0378f91','os_open_roads_zip_sha256':'908c0edabfa5301571456197cce95b2a8ce15046960a988141722c69e36f202b','os_open_roads_extracted_gpkg_sha256':gpkg},'output_drive_folder_id':'1b2gRoxUxWN5U_oD9l1_8L6oJ9mlIn5GE'},indent=2))
+          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'executor_commit':commit,'canonical_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t1_osm_openroads_public_registry.py','execution_code_sha256':core,'source_archives':{'osm_pbf_sha256':'aa41b545199522d6097838313038523b54611ce3eeebbc025fce219cb8824695','os_open_roads_zip_sha256':'908c0eda3a1b13ebba9f1bad3e5fd43ae0d1c83d823057ead8e4f86bdb0510ba','os_open_roads_extracted_gpkg_sha256':gpkg},'output_drive_folder_id':'1b2gRoxUxWN5U_oD9l1_8L6oJ9mlIn5GE'},indent=2))
           PY
           (cd /tmp/t1out && sha256sum * > OUTPUT_SHA256SUMS.txt)
       - name: Persist results and verify remote sizes

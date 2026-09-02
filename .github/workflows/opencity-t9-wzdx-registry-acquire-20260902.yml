@@ -1,0 +1,75 @@
+name: OpenCity T9 WZDx feed registry acquire 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-t9-wzdx-registry-acquire-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  FOLDER_ID: '11RiRAuoJH-ug_N67gT6O1anM4WvTXqUH'
+  DATASET_ID: '69qe-yiui'
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Configure Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$R"; echo "R=$R" >> "$GITHUB_ENV"
+      - name: Acquire USDOT WZDx Feed Registry from public Socrata export endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rclone lsjson "$R:ACQUISITION_MANIFEST.json" --drive-root-folder-id "$FOLDER_ID" --files-only 2>/dev/null | jq -e 'length>0' >/dev/null 2>&1; then
+            echo 'SKIP: WZDx registry manifest already present'; exit 0
+          fi
+          W=/tmp/wzdx; mkdir -p "$W"
+          META="https://data.transportation.gov/api/views/$DATASET_ID"
+          CSV="https://data.transportation.gov/api/v3/views/$DATASET_ID/export.csv?accessType=DOWNLOAD"
+          JSON="https://data.transportation.gov/api/v3/views/$DATASET_ID/query.json?accessType=DOWNLOAD"
+          GEO="https://data.transportation.gov/resource/$DATASET_ID.geojson?$limit=50000"
+          curl -fL --retry 8 --retry-all-errors "$META" -o "$W/dataset_metadata.json"
+          curl -fL --retry 8 --retry-all-errors "$CSV" -o "$W/wzdx_feed_registry.csv"
+          curl -fL --retry 8 --retry-all-errors "$JSON" -o "$W/wzdx_feed_registry.json"
+          curl -fL --retry 8 --retry-all-errors "$GEO" -o "$W/wzdx_feed_registry.geojson"
+          test -s "$W/wzdx_feed_registry.csv"
+          python - <<'PY'
+          import csv,json,hashlib,datetime
+          from pathlib import Path
+          W=Path('/tmp/wzdx')
+          meta=json.load(open(W/'dataset_metadata.json'))
+          with open(W/'wzdx_feed_registry.csv',encoding='utf-8-sig',newline='') as f:
+              rows=list(csv.DictReader(f))
+          if not rows: raise SystemExit('empty WZDx registry CSV')
+          files=[]
+          for p in sorted(W.iterdir()):
+              if p.is_file():
+                  b=p.read_bytes(); files.append({'file':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          # Retain feed-URL accessibility as registry metadata, but do not follow feeds that require their own API keys.
+          url_cols=[c for c in rows[0] if 'url' in c.lower() or 'endpoint' in c.lower() or 'feed' in c.lower()]
+          manifest={'state':'ACQUIRED','evidence_class':'public_data registry / official public source support','provider':'U.S. Department of Transportation / ITS JPO','dataset':'Work Zone Data Feed Registry','dataset_id':'69qe-yiui','source_metadata_url':'https://data.transportation.gov/api/views/69qe-yiui','source_csv_url':'https://data.transportation.gov/api/v3/views/69qe-yiui/export.csv?accessType=DOWNLOAD','retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'registry_rows':len(rows),'columns':list(rows[0]),'url_like_columns':url_cols,'provider_metadata':{'name':meta.get('name'),'rowsUpdatedAt':meta.get('rowsUpdatedAt'),'dataUpdatedAt':meta.get('dataUpdatedAt'),'metadataUpdatedAt':meta.get('metadataUpdatedAt')},'authentication':'none for the registry itself; individual listed feeds may require provider-specific API keys and are not automatically followed','files':files}
+          (W/'ACQUISITION_MANIFEST.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          with open(W/'SHA256SUMS.txt','w') as f:
+              for x in files: f.write(f"{x['sha256']}  {x['file']}\n")
+          print(json.dumps({'rows':len(rows),'columns':list(rows[0]),'url_like_columns':url_cols},indent=2))
+          PY
+          rclone copy "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check "$W" "$R:" --drive-root-folder-id "$FOLDER_ID" --one-way --size-only
+          echo 'ACQUIRED USDOT WZDx registry'

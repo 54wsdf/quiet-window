@@ -14,7 +14,7 @@ env:
   GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
   OSM_FOLDER_ID: '11__NCGmNOEKHWaCuOxfuCkyGo5qbB5uj'
   OPENROADS_FOLDER_ID: '1LrsppubjW6BwLE0Nr0amZrRh0gAv2QsO'
-  OUTPUT_FOLDER_ID: '1n8kkgfkjMLPgTswNYMN3L7orBpLwhUnk'
+  OUTPUT_FOLDER_ID: '1xeeSQYiB4To8sMasXsv0_1tZf07T_YqQ'
 
 jobs:
   run:
@@ -73,7 +73,7 @@ jobs:
           python - "$CORE_SHA" "$GPKG_SHA" "$GITHUB_RUN_ID" "$GITHUB_SHA" > /tmp/t1out/EXECUTION_MANIFEST.json <<'PY'
           import json,sys
           core,gpkg,run,commit=sys.argv[1:]
-          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'executor_commit':commit,'canonical_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t1_osm_openroads_public_registry.py','execution_code_sha256':core,'source_archives':{'osm_pbf_sha256':'aa41b545199522d6097838313038523b54611ce3eeebbc025fce219cb8824695','os_open_roads_zip_sha256':'908c0eda3a1b13ebba9f1bad3e5fd43ae0d1c83d823057ead8e4f86bdb0510ba','os_open_roads_extracted_gpkg_sha256':gpkg},'output_drive_folder_id':'1n8kkgfkjMLPgTswNYMN3L7orBpLwhUnk'},indent=2))
+          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'executor_commit':commit,'canonical_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t1_osm_openroads_public_registry.py','execution_code_sha256':core,'source_archives':{'osm_pbf_sha256':'aa41b545199522d6097838313038523b54611ce3eeebbc025fce219cb8824695','os_open_roads_zip_sha256':'908c0eda3a1b13ebba9f1bad3e5fd43ae0d1c83d823057ead8e4f86bdb0510ba','os_open_roads_extracted_gpkg_sha256':gpkg},'output_drive_folder_id':'1xeeSQYiB4To8sMasXsv0_1tZf07T_YqQ'},indent=2))
           PY
           (cd /tmp/t1out && sha256sum * > OUTPUT_SHA256SUMS.txt)
       - name: Persist results and verify remote sizes

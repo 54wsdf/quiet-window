@@ -11,7 +11,7 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       DEST: ResearchData/transport_public/registry_reference_20260902/webtris_2024_03
@@ -26,7 +26,7 @@ jobs:
           python -m pip install -q requests
           mkdir -p "$HOME/.config/rclone" out
           printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
-      - name: Fetch verified historical window
+      - name: Fetch 20 complete sensor histories
         run: |
           cat > /tmp/fetch.py <<'PY'
           import json,time,hashlib,requests
@@ -48,19 +48,29 @@ jobs:
                   if x.get(k) not in (None,''):
                       ids.append(str(x[k])); break
           ids=['2']+[x for x in ids if x!='2']
+          windows=[('04032024','10032024'),('11032024','17032024'),('18032024','24032024'),('25032024','31032024'),('01042024','02042024')]
           selected=[]; failures=[]
-          for site in ids[:1000]:
+          for site in ids[:1200]:
               if len(selected)>=20: break
-              try:
-                  rr=s.get(base+'/reports/daily',params={'sites':site,'start_date':'04032024','end_date':'02042024'},timeout=90)
-                  rr.raise_for_status(); jj=rr.json(); dat=jj.get('Rows') or jj.get('rows') or []
-                  if len(dat)>=500:
-                      fn=f'webtris_site_{site}_2024-03-04_04-02.json'; (out/fn).write_bytes(rr.content)
-                      selected.append({'site_id':site,'rows':len(dat),'file':fn,'first':dat[0] if dat else None})
-              except Exception as e: failures.append({'site_id':site,'error':str(e)[:180]})
+              combined=[]; header=None; ok=True; weekly=[]
+              for start,end in windows:
+                  try:
+                      rr=s.get(base+'/reports/daily',params={'sites':site,'start_date':start,'end_date':end},timeout=90)
+                      rr.raise_for_status(); jj=rr.json(); dat=jj.get('Rows') or jj.get('rows') or []
+                      weekly.append({'start':start,'end':end,'rows':len(dat)})
+                      if not dat: ok=False; break
+                      combined.extend(dat); header=header or (jj.get('Header') or jj.get('header') or {})
+                  except Exception as e:
+                      failures.append({'site_id':site,'window':start+'-'+end,'error':str(e)[:180]}); ok=False; break
+                  time.sleep(.02)
+              if ok and len(combined)>=2500:
+                  fn=f'webtris_site_{site}_2024-03-04_04-02.json'
+                  payload={'Header':{'row_count':len(combined),'start_date':'04032024','end_date':'02042024','source_windows':weekly,'original_header':header},'Rows':combined}
+                  (out/fn).write_text(json.dumps(payload,separators=(',',':')),encoding='utf-8')
+                  selected.append({'site_id':site,'rows':len(combined),'file':fn,'windows':weekly})
               time.sleep(.02)
-          (out/'selection.json').write_text(json.dumps({'period':'2024-03-04..2024-04-02','selected':[{'site_id':x['site_id'],'rows':x['rows'],'file':x['file']} for x in selected],'failures':failures[:100]},indent=2),encoding='utf-8')
-          if len(selected)<20: raise SystemExit(f'only {len(selected)} sites met >=500 rows')
+          (out/'selection.json').write_text(json.dumps({'period':'2024-03-04..2024-04-02','selection_requirement':'5 complete API windows and >=2500 15-min rows','selected':selected,'failures':failures[:200]},indent=2),encoding='utf-8')
+          if len(selected)<20: raise SystemExit(f'only {len(selected)} sites have complete 30-day histories')
           with (out/'SHA256SUMS.txt').open('w') as h:
               for f in sorted(out.iterdir()):
                   if f.is_file() and f.name!='SHA256SUMS.txt': h.write(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n')

@@ -1,0 +1,55 @@
+name: Rail Swiss Actual 2016-2017 Repair
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-swiss-actual-2016-2017-repair.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        year: [2016, 2017]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure direct Drive remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+          echo "RCLONE_CFG=$CFG" >> "$GITHUB_ENV"
+          echo "RCLONE_REMOTE=$R" >> "$GITHUB_ENV"
+      - name: Audit and backfill Swiss actual archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetchers/swiss_archive_direct.py \
+            --kind actual \
+            --year '${{ matrix.year }}' \
+            --config "$RCLONE_CFG" \
+            --remote "$RCLONE_REMOTE"
+      - name: Remove credential material
+        if: always()
+        shell: bash
+        run: |
+          shred -u "$RCLONE_CFG" 2>/dev/null || rm -f "$RCLONE_CFG"

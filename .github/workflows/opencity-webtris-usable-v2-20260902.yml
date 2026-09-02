@@ -1,0 +1,151 @@
+name: OpenCity WebTRIS usable 20x30 v2 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-webtris-usable-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DEST: transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data/public_data_registry_acquisition_20260902/webtris_20site_30day_v2_usable_M1
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'GDRIVE_RCLONE_CONFIG_B64 missing'; exit 3; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"; echo "remote=$R" >> "$GITHUB_OUTPUT"
+      - name: Select 20 usable 30-day M1 detectors and freeze exact bytes
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          if rclone lsjson "$R:$DEST/ACQUISITION_MANIFEST.json" --config "$CFG" --files-only 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1; then
+            echo 'SKIP: v2 acquisition manifest already exists'; exit 0
+          fi
+          OUT="$RUNNER_TEMP/webtris_v2"; mkdir -p "$OUT"
+          python - "$OUT" <<'PY'
+          import concurrent.futures as cf
+          import datetime,hashlib,json,re,sys,time
+          from pathlib import Path
+          import requests
+
+          out=Path(sys.argv[1]); base='https://webtris.nationalhighways.co.uk/api/v1.0'
+          ua='OpenCity-public-data-rehearsal-usable-v2/20260902'
+          s=requests.Session(); s.headers['User-Agent']=ua
+          r=s.get(base+'/sites',timeout=120); r.raise_for_status(); inventory_bytes=r.content; (out/'sites.json').write_bytes(inventory_bytes)
+          inv=r.json(); rows=inv.get('sites') or inv.get('Sites') or inv.get('Rows') or inv.get('rows') or []
+
+          def road_token(row):
+              text=' '.join(str(row.get(k,'')) for k in ('Description','description','Name','name'))
+              m=re.search(r'(?<![A-Z0-9])(M\d+[A-Z]?|A\d+[A-Z]?)(?![A-Z0-9])',text.upper().replace('(','').replace(')',''))
+              return m.group(1) if m else None
+          def sid(row):
+              for k in ('Id','ID','id','Site Id','site_id'):
+                  if str(row.get(k,'')).strip(): return str(row[k]).strip()
+              return None
+          def active(row): return str(row.get('Status',row.get('status',''))).lower()=='active'
+          candidates=[]
+          for row in rows:
+              x=sid(row)
+              if x and active(row) and road_token(row)=='M1': candidates.append((int(x),x,row))
+          candidates.sort()
+          if len(candidates)<20: raise SystemExit(f'Only {len(candidates)} active M1 candidates in inventory')
+
+          start,end='01072025','30072025'
+          def numeric(v):
+              try:
+                  if v is None or str(v).strip()=='' or str(v).lower() in {'nan','null','none'}: return None
+                  return float(v)
+              except Exception: return None
+          def probe(item):
+              _,site,row=item
+              ss=requests.Session(); ss.headers['User-Agent']=ua
+              try:
+                  rr=ss.get(base+'/reports/daily',params={'sites':site,'start_date':start,'end_date':end,'page':1,'page_size':5000},timeout=150)
+                  if rr.status_code==204: return {'site_id':site,'ok':False,'reason':'HTTP_204'}
+                  rr.raise_for_status(); j=rr.json(); data=j.get('Rows') or j.get('rows') or []
+                  usable=[]; dates=set()
+                  for q in data:
+                      sp=numeric(q.get('Avg mph')); vo=numeric(q.get('Total Volume'))
+                      if sp is not None and vo is not None:
+                          usable.append(q)
+                          dt=str(q.get('Report Date',''))[:10]
+                          if dt: dates.add(dt)
+                  ok=len(dates)>=30 and len(usable)>=2700
+                  if not ok:
+                      return {'site_id':site,'ok':False,'reason':'insufficient_usable_speed_volume','raw_rows':len(data),'usable_rows':len(usable),'usable_days':len(dates),'road':'M1'}
+                  header=j.get('Header') or j.get('header') or {}
+                  payload=json.dumps({'Header':header,'Rows':data},separators=(',',':')).encode()
+                  return {'site_id':site,'ok':True,'raw_rows':len(data),'usable_rows':len(usable),'usable_days':len(dates),'payload':payload,'inventory':row,'road':'M1'}
+              except Exception as e:
+                  return {'site_id':site,'ok':False,'reason':'request_error','error':str(e)[:300]}
+
+          selected=[]; failures=[]
+          # Probe in modest batches, stopping once 20 qualifying M1 sites are known.
+          pos=0
+          while pos < len(candidates) and len(selected)<20:
+              batch=candidates[pos:pos+24]; pos+=len(batch)
+              with cf.ThreadPoolExecutor(max_workers=8) as ex:
+                  results=list(ex.map(probe,batch))
+              for q in results:
+                  if q.get('ok') and len(selected)<20: selected.append(q)
+                  elif not q.get('ok'): failures.append(q)
+          if len(selected)<20:
+              raise SystemExit(f'Only {len(selected)} M1 sites satisfy 30 usable days and >=2700 usable rows; probed={pos}')
+
+          meta=[]
+          for q in selected:
+              fn=f"site_{q['site_id']}_{start}_{end}.json"; p=out/fn; p.write_bytes(q.pop('payload'))
+              meta.append({'site_id':q['site_id'],'road':'M1','raw_rows':q['raw_rows'],'usable_rows':q['usable_rows'],'usable_days':q['usable_days'],'start_date':start,'end_date':end,'file':fn,'inventory':q['inventory']})
+          (out/'selected_sites.json').write_text(json.dumps(meta,indent=2),encoding='utf-8')
+          (out/'probe_failures.json').write_text(json.dumps(failures,indent=2),encoding='utf-8')
+          hashes=[]; total=0
+          for p in sorted(out.iterdir()):
+              if p.is_file():
+                  b=p.read_bytes(); total+=len(b); hashes.append({'file':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          manifest={
+              'state':'ACQUIRED','source':'National Highways WebTRIS API v1.0','source_url':base,
+              'retrieved_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'version':'usable-v2-M1-20260902','period':{'start_date':start,'end_date':end},
+              'selection_rule':'Active inventory sites whose exact road token is M1; ascending site ID; retain first 20 with all 30 calendar days represented among rows having numeric Avg mph and Total Volume and >=2700 such usable rows.',
+              'selected_site_count':len(meta),'road_token':'M1','minimum_usable_rows_per_site':2700,
+              'selected_sites':[{'site_id':x['site_id'],'usable_rows':x['usable_rows'],'usable_days':x['usable_days'],'file':x['file']} for x in meta],
+              'files':hashes,'total_bytes_before_manifest':total,'executor_repo':'54wsdf/quiet-window','github_run_id':str(__import__('os').environ.get('GITHUB_RUN_ID',''))
+          }
+          (out/'ACQUISITION_MANIFEST.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+          with (out/'SHA256SUMS.txt').open('w') as f:
+              for x in hashes: f.write(f"{x['sha256']}  {x['file']}\n")
+          print(json.dumps({'selected':[(x['site_id'],x['usable_rows'],x['usable_days']) for x in meta],'failures':len(failures),'probed':pos},indent=2))
+          PY
+          rclone copy "$OUT" "$R:$DEST" --config "$CFG" --ignore-existing --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+          rclone check "$OUT" "$R:$DEST" --config "$CFG" --one-way --size-only
+          echo "ACQUIRED usable WebTRIS M1 20x30 -> $DEST"
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

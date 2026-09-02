@@ -1,0 +1,272 @@
+name: OpenCity MTA OD consolidate canonical 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-consolidate-canonical-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_RUN_ID: '33615833576'
+  DATASET_ID: '28vm-gjqr'
+  SOURCE_FOLDER_NAME: 'mta_od_2026_quiet_window_reacquire'
+  CANONICAL_FOLDER_ID: '1UAn15QXCJ0NCtXbHS1LMQIJ8EzggkLpL'
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Configure Drive transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+          # Force token refresh before Python reads the rclone token JSON.
+          rclone about "$REMOTE_NAME:" >/dev/null
+
+      - name: Wait for the already-running shard producer to stop writing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os,time,requests
+          run=os.environ['SOURCE_RUN_ID']
+          url=f'https://api.github.com/repos/54wsdf/quiet-window/actions/runs/{run}'
+          h={'Authorization':f"Bearer {os.environ['GH_TOKEN']}",'Accept':'application/vnd.github+json'}
+          for _ in range(330):
+              r=requests.get(url,headers=h,timeout=60); r.raise_for_status(); j=r.json()
+              print('source_run',j.get('status'),j.get('conclusion'))
+              if j.get('status')=='completed':
+                  break
+              time.sleep(60)
+          else:
+              raise SystemExit('source shard producer did not stop within consolidation window')
+          PY
+
+      - name: Discover duplicate folders, validate all shard manifests, and server-side move unique chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Refresh once more after the potentially long producer wait.
+          rclone about "$REMOTE_NAME:" >/dev/null
+          python - <<'PY'
+          import configparser,hashlib,io,json,math,os,re,time
+          from pathlib import Path
+          import requests
+
+          dataset=os.environ['DATASET_ID']
+          folder_name=os.environ['SOURCE_FOLDER_NAME']
+          canonical=os.environ['CANONICAL_FOLDER_ID']
+          conf=Path.home()/'.config/rclone/rclone.conf'
+
+          def access_token():
+              cp=configparser.RawConfigParser(); cp.read(conf)
+              sec=cp.sections()[0]
+              tok=json.loads(cp.get(sec,'token'))
+              return tok['access_token']
+
+          token=access_token()
+          H={'Authorization':f'Bearer {token}'}
+          api='https://www.googleapis.com/drive/v3/files'
+
+          def refresh_headers():
+              global token,H
+              os.system(f'rclone about "{os.environ["REMOTE_NAME"]}:" >/dev/null')
+              token=access_token(); H={'Authorization':f'Bearer {token}'}
+
+          def qfiles(q, fields='nextPageToken,files(id,name,mimeType,size,md5Checksum,parents,createdTime,modifiedTime)'):
+              out=[]; page=None
+              while True:
+                  params={'q':q,'pageSize':1000,'fields':fields,'supportsAllDrives':'true','includeItemsFromAllDrives':'true'}
+                  if page: params['pageToken']=page
+                  r=requests.get(api,headers=H,params=params,timeout=120)
+                  if r.status_code==401:
+                      refresh_headers(); r=requests.get(api,headers=H,params=params,timeout=120)
+                  r.raise_for_status(); j=r.json(); out.extend(j.get('files',[])); page=j.get('nextPageToken')
+                  if not page: return out
+
+          folders=qfiles(f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false")
+          if not folders:
+              raise SystemExit('no reacquisition folders found')
+          print('source_folder_ids', [x['id'] for x in folders])
+
+          contents={}
+          by_name={}
+          for f in folders:
+              items=qfiles(f"'{f['id']}' in parents and trashed=false")
+              contents[f['id']]=items
+              for x in items:
+                  x=dict(x); x['source_folder_id']=f['id']; by_name.setdefault(x['name'],[]).append(x)
+
+          def media(file_id):
+              r=requests.get(f'{api}/{file_id}',headers=H,params={'alt':'media','supportsAllDrives':'true'},timeout=300)
+              if r.status_code==401:
+                  refresh_headers(); r=requests.get(f'{api}/{file_id}',headers=H,params={'alt':'media','supportsAllDrives':'true'},timeout=300)
+              r.raise_for_status(); return r.content
+
+          manifests={}; manifest_files={}; duplicate_manifest_records=[]
+          for shard in range(8):
+              name=f'manifest-shard-{shard}.json'
+              cand=by_name.get(name,[])
+              if not cand:
+                  raise SystemExit(f'missing {name} across discovered folders')
+              decoded=[]
+              for c in cand:
+                  b=media(c['id']); decoded.append((c,b,json.loads(b)))
+              first=decoded[0][2]
+              canon_bytes=json.dumps(first,sort_keys=True,separators=(',',':')).encode()
+              for c,b,j in decoded[1:]:
+                  if json.dumps(j,sort_keys=True,separators=(',',':')).encode()!=canon_bytes:
+                      raise SystemExit(f'divergent duplicate {name}')
+                  duplicate_manifest_records.append({'name':name,'file_id':c['id'],'source_folder_id':c['source_folder_id']})
+              if int(first.get('shard',-1))!=shard or first.get('dataset')!=dataset:
+                  raise SystemExit(f'invalid {name}')
+              manifests[shard]=first; manifest_files[shard]=decoded[0][0]
+
+          totals={int(m['total_rows']) for m in manifests.values()}; chunksizes={int(m['chunk_size']) for m in manifests.values()}; expected_sets={int(m['expected_chunks']) for m in manifests.values()}
+          if len(totals)!=1 or len(chunksizes)!=1 or len(expected_sets)!=1:
+              raise SystemExit(f'inconsistent shard contracts totals={totals} chunksizes={chunksizes} expected={expected_sets}')
+          total=totals.pop(); chunk_size=chunksizes.pop(); expected=expected_sets.pop()
+          if expected != math.ceil(total/chunk_size):
+              raise SystemExit('expected chunk count inconsistent with total/chunk size')
+
+          entries={}; duplicate_indices=[]
+          for shard,m in manifests.items():
+              for e in m.get('files',[]):
+                  idx=int(e['index'])
+                  if idx in entries:
+                      raise SystemExit(f'chunk index {idx} appears in multiple shard manifests')
+                  if idx % 8 != shard:
+                      raise SystemExit(f'chunk index {idx} violates shard modulo contract {shard}')
+                  entries[idx]=dict(e,shard=shard)
+          required=set(range(expected)); actual=set(entries)
+          missing=sorted(required-actual); extra=sorted(actual-required)
+          if missing or extra:
+              raise SystemExit(f'manifest union incomplete: missing={missing[:20]} extra={extra[:20]} n={len(actual)}/{expected}')
+          row_sum=sum(int(e['rows']) for e in entries.values())
+          if row_sum!=total:
+              raise SystemExit(f'row sum mismatch {row_sum} != {total}')
+
+          selected={}; duplicate_file_records=[]
+          for idx,e in entries.items():
+              name=e['file']; cand=by_name.get(name,[])
+              size_expected=int(e['bytes'])
+              sized=[c for c in cand if int(c.get('size') or -1)==size_expected]
+              if not sized:
+                  raise SystemExit(f'persisted chunk missing/size mismatch idx={idx} name={name} expected_bytes={size_expected} candidates={[(c.get("id"),c.get("size")) for c in cand]}')
+              if len(sized)==1:
+                  chosen=sized[0]
+              else:
+                  exact=[]
+                  for c in sized:
+                      b=media(c['id']); h=hashlib.sha256(b).hexdigest()
+                      if h==e['sha256']: exact.append(c)
+                  if not exact:
+                      raise SystemExit(f'no exact SHA-256 candidate among duplicate persisted chunks idx={idx}')
+                  chosen=exact[0]
+                  duplicate_indices.append(idx)
+                  for c in exact[1:]:
+                      duplicate_file_records.append({'index':idx,'name':name,'file_id':c['id'],'source_folder_id':c['source_folder_id'],'sha256_verified':True})
+              selected[idx]=chosen
+
+          # Check source bytes for a deterministic sample plus every ambiguous duplicate. Full SHA-256 comes from uploader manifests;
+          # Drive size/ID is checked for every file. Sampled remote-byte rehash adds an independent persistence check without re-downloading the entire corpus.
+          sample_idx=sorted(set([0,1,2,7,8,expected//4,expected//2,(3*expected)//4,expected-2,expected-1] + duplicate_indices))
+          sample_checks=[]
+          for idx in sample_idx:
+              c=selected[idx]; b=media(c['id']); got=hashlib.sha256(b).hexdigest(); exp=entries[idx]['sha256']
+              sample_checks.append({'index':idx,'file_id':c['id'],'bytes':len(b),'sha256':got,'expected_sha256':exp,'exact':got==exp})
+              if got!=exp: raise SystemExit(f'remote byte SHA mismatch at sampled chunk {idx}')
+
+          # Move selected unique chunk files server-side into the pre-created canonical folder.
+          moved=[]
+          for n,idx in enumerate(sorted(selected)):
+              c=selected[idx]
+              parents=c.get('parents') or [c['source_folder_id']]
+              if canonical in parents:
+                  moved.append({'index':idx,'file_id':c['id'],'from':c['source_folder_id'],'already_canonical':True}); continue
+              params={'addParents':canonical,'removeParents':','.join(parents),'fields':'id,name,parents,size,md5Checksum','supportsAllDrives':'true'}
+              r=requests.patch(f"{api}/{c['id']}",headers={**H,'Content-Type':'application/json'},params=params,json={},timeout=120)
+              if r.status_code==401:
+                  refresh_headers(); r=requests.patch(f"{api}/{c['id']}",headers={**H,'Content-Type':'application/json'},params=params,json={},timeout=120)
+              r.raise_for_status(); moved.append({'index':idx,'file_id':c['id'],'from':c['source_folder_id'],'already_canonical':False})
+              if (n+1)%200==0: print('moved',n+1,'of',expected)
+
+          # Move one validated manifest per shard too; leave exact duplicate manifests where they were for provenance.
+          for shard,c in manifest_files.items():
+              parents=c.get('parents') or [c['source_folder_id']]
+              if canonical not in parents:
+                  r=requests.patch(f"{api}/{c['id']}",headers={**H,'Content-Type':'application/json'},params={'addParents':canonical,'removeParents':','.join(parents),'fields':'id,name,parents','supportsAllDrives':'true'},json={},timeout=120)
+                  r.raise_for_status()
+
+          # Verify canonical parent contains every selected file by ID and exact expected names/count.
+          canon_items=qfiles(f"'{canonical}' in parents and trashed=false")
+          canon_by_name={x['name']:x for x in canon_items}
+          absent=[entries[i]['file'] for i in range(expected) if entries[i]['file'] not in canon_by_name]
+          if absent:
+              raise SystemExit(f'canonical folder missing {len(absent)} chunks after move, sample={absent[:10]}')
+
+          ordered=[entries[i] for i in range(expected)]
+          sha_lines=''.join(f"{e['sha256']}  {e['file']}\n" for e in ordered)
+          aggregate_sha=hashlib.sha256(''.join(f"{e['index']}:{e['rows']}:{e['bytes']}:{e['sha256']}\n" for e in ordered).encode()).hexdigest()
+          provider=requests.get(f'https://data.ny.gov/api/views/{dataset}',timeout=120).json()
+          final={
+              'state':'ACQUIRED','dataset_id':dataset,'source':'https://data.ny.gov/resource/28vm-gjqr','source_order_contract':':id',
+              'provider_name':provider.get('name'),'provider_rowsUpdatedAt':provider.get('rowsUpdatedAt'),'provider_dataUpdatedAt':provider.get('dataUpdatedAt'),'provider_metadataUpdatedAt':provider.get('metadataUpdatedAt'),
+              'total_rows':total,'chunk_size':chunk_size,'expected_chunks':expected,'actual_chunks':expected,'row_sum_from_manifests':row_sum,
+              'canonical_drive_folder_id':canonical,'source_run_id':os.environ['SOURCE_RUN_ID'],'source_folder_race_ids':[x['id'] for x in folders],
+              'shard_manifest_count':8,'chunk_sha256_count':len(ordered),'aggregate_index_rows_bytes_sha256':aggregate_sha,
+              'remote_sha256_recheck':{'mode':'deterministic sample plus all ambiguous duplicates','checked_count':len(sample_checks),'checks':sample_checks},
+              'duplicate_chunk_indices_exactly_resolved':duplicate_indices,'leftover_exact_duplicate_files':duplicate_file_records,'duplicate_manifest_records':duplicate_manifest_records,
+              'files':ordered,
+              'provenance_note':'All chunk SHA-256 values are uploader-computed before successful rclone persistence and preserved in the eight shard manifests. Every persisted Drive file ID/size was matched to its manifest entry; a deterministic remote-byte sample and every ambiguous duplicate were independently rehashed after persistence. Selected unique files were moved server-side into the pre-created canonical folder without redownloading official source data.'
+          }
+          audit={'source_folders':folders,'source_folder_file_counts':{k:len(v) for k,v in contents.items()},'moved_count':len(moved),'canonical_item_count_after_move':len(canon_items),'sample_checks':sample_checks,'duplicates':duplicate_file_records}
+
+          work=Path('/tmp/odfinal'); work.mkdir(exist_ok=True)
+          (work/'ACQUIRED_MANIFEST.json').write_text(json.dumps(final,indent=2)+'\n')
+          (work/'SHA256SUMS.txt').write_text(sha_lines)
+          (work/'CONSOLIDATION_AUDIT.json').write_text(json.dumps(audit,indent=2)+'\n')
+          (work/'SOURCE_VERSION.json').write_text(json.dumps({'dataset_id':dataset,'name':provider.get('name'),'rowsUpdatedAt':provider.get('rowsUpdatedAt'),'dataUpdatedAt':provider.get('dataUpdatedAt'),'metadataUpdatedAt':provider.get('metadataUpdatedAt'),'retrieved_for_manifest_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())},indent=2)+'\n')
+
+          def upload(path,name,mime='application/json'):
+              meta={'name':name,'parents':[canonical]}
+              files={'metadata':('metadata',json.dumps(meta),'application/json; charset=UTF-8'),'file':(name,Path(path).read_bytes(),mime)}
+              r=requests.post('https://www.googleapis.com/upload/drive/v3/files',headers=H,params={'uploadType':'multipart','fields':'id,name,size,md5Checksum,parents','supportsAllDrives':'true'},files=files,timeout=180)
+              if r.status_code==401:
+                  refresh_headers(); r=requests.post('https://www.googleapis.com/upload/drive/v3/files',headers=H,params={'uploadType':'multipart','fields':'id,name,size,md5Checksum,parents','supportsAllDrives':'true'},files=files,timeout=180)
+              r.raise_for_status(); return r.json()
+          uploaded=[upload(work/'ACQUIRED_MANIFEST.json','ACQUIRED_MANIFEST.json'),upload(work/'SHA256SUMS.txt','SHA256SUMS.txt','text/plain'),upload(work/'CONSOLIDATION_AUDIT.json','CONSOLIDATION_AUDIT.json'),upload(work/'SOURCE_VERSION.json','SOURCE_VERSION.json')]
+          (work/'UPLOAD_RESULT.json').write_text(json.dumps(uploaded,indent=2)+'\n')
+          print(json.dumps({'state':'ACQUIRED','total_rows':total,'chunks':expected,'canonical_folder_id':canonical,'aggregate_sha256':aggregate_sha,'source_folders':[x['id'] for x in folders],'remote_rehash_checks':len(sample_checks)},indent=2))
+          PY
+
+      - name: Upload small completion audit as workflow artifact if quota permits
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-mta-od-consolidation-audit-${{ github.run_id }}
+          path: /tmp/odfinal/
+          if-no-files-found: ignore
+          retention-days: 3

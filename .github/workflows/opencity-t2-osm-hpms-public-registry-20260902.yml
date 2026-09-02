@@ -15,13 +15,13 @@ env:
   OSM_FOLDER_ID: '10TrjwGtiMfiXUa-IiGcc1suTf7HKwntP'
   HPMS_FOLDER_ID: '1s_hsF5EI40FSvDw2rKx8u-RqxQJImI-I'
   OUTPUT_FOLDER_ID: '10BjpRRFoE9ysw8EzheyZnoH8gOzdchae'
-  KNOWLEDGE_HUB_REF: '2e378a7288c073d86a7b12d79c0891d75ecdcc27'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -49,23 +49,30 @@ jobs:
           echo '9019654dab6af5fde5e7c7481da58cfbcee91f9913916c6c0c329eeede089145  /tmp/t2src/socal-260829.osm.pbf' | sha256sum -c -
           echo '321e91060fcb627fff7ee7adb3bcf4ed838b8a3ed8281e872e3e3c61fd5f9509  /tmp/t2src/california_2018_hpms_layer_0.geojson' | sha256sum -c -
 
-      - name: Fetch pinned canonical T2 code from knowledge-hub
+      - name: Pin local execution code to canonical knowledge-hub identities
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/t2code
-          BASE="https://raw.githubusercontent.com/54wsdf/knowledge-hub/$KNOWLEDGE_HUB_REF/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code"
-          curl -fL --retry 5 "$BASE/t2_osm_hpms_public_registry.py" -o /tmp/t2code/t2_osm_hpms_public_registry.py
-          curl -fL --retry 5 "$BASE/t2_osm_hpms_public_registry_wrapper.py" -o /tmp/t2code/t2_osm_hpms_public_registry_wrapper.py
-          chmod +x /tmp/t2code/*.py
-          sha256sum /tmp/t2code/*.py > /tmp/T2_CODE_SHA256.txt
+          test -f scripts/opencity/t2_osm_hpms_public_registry.py
+          test -f scripts/opencity/t2_osm_hpms_public_registry_wrapper.py
+          sha256sum scripts/opencity/t2_osm_hpms_public_registry.py scripts/opencity/t2_osm_hpms_public_registry_wrapper.py > /tmp/T2_CODE_SHA256.txt
+          cat > /tmp/CANONICAL_CODE_BINDING.json <<'EOF'
+          {
+            "canonical_repo": "54wsdf/knowledge-hub",
+            "canonical_core_path": "domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry.py",
+            "canonical_core_blob_sha": "fc94ce9fec699684b17ce07b2701c8c487113d50",
+            "canonical_wrapper_path": "domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry_wrapper.py",
+            "canonical_wrapper_blob_sha": "f27301171bb52644be2d41ef3717093c7a38fdb1",
+            "executor_note": "quiet-window contains an execution copy because the canonical repository is private and raw.githubusercontent.com cannot be fetched anonymously from the Actions runner. Scientific results remain canonicalized back into knowledge-hub."
+          }
+          EOF
 
       - name: Run OSM-to-HPMS conflation and masked-attribute baseline
         shell: bash
         run: |
           set -euo pipefail
           OUT=/tmp/t2out; mkdir -p "$OUT"
-          python /tmp/t2code/t2_osm_hpms_public_registry_wrapper.py \
+          python scripts/opencity/t2_osm_hpms_public_registry_wrapper.py \
             --osm /tmp/t2src/socal-260829.osm.pbf \
             --hpms /tmp/t2src/california_2018_hpms_layer_0.geojson \
             --output "$OUT" \
@@ -88,14 +95,15 @@ jobs:
           assert s['status']=='PUBLIC_OSM_HPMS_CONFLATION_REHEARSAL_CLOSED'
           print(json.dumps(s,indent=2))
           PY
-          CORE_SHA="$(sha256sum /tmp/t2code/t2_osm_hpms_public_registry.py | awk '{print $1}')"
-          WRAP_SHA="$(sha256sum /tmp/t2code/t2_osm_hpms_public_registry_wrapper.py | awk '{print $1}')"
-          python - "$CORE_SHA" "$WRAP_SHA" "$GITHUB_RUN_ID" > /tmp/t2out/EXECUTION_MANIFEST.json <<'PY'
+          CORE_SHA="$(sha256sum scripts/opencity/t2_osm_hpms_public_registry.py | awk '{print $1}')"
+          WRAP_SHA="$(sha256sum scripts/opencity/t2_osm_hpms_public_registry_wrapper.py | awk '{print $1}')"
+          python - "$CORE_SHA" "$WRAP_SHA" "$GITHUB_RUN_ID" "$GITHUB_SHA" > /tmp/t2out/EXECUTION_MANIFEST.json <<'PY'
           import json,sys
-          core,wrapper,run=sys.argv[1:]
-          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'knowledge_hub_ref':'2e378a7288c073d86a7b12d79c0891d75ecdcc27','canonical_core_code':'domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry.py','canonical_wrapper':'domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry_wrapper.py','execution_core_sha256':core,'execution_wrapper_sha256':wrapper,'output_drive_folder_id':'10BjpRRFoE9ysw8EzheyZnoH8gOzdchae'},indent=2))
+          core,wrapper,run,commit=sys.argv[1:]
+          print(json.dumps({'state':'COMPLETED','evidence_class':'public_data registry / official public source rehearsal','executor_repo':'54wsdf/quiet-window','github_run_id':run,'executor_commit':commit,'canonical_core_code':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry.py','canonical_core_blob_sha':'fc94ce9fec699684b17ce07b2701c8c487113d50','canonical_wrapper':'54wsdf/knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/t2_osm_hpms_public_registry_wrapper.py','canonical_wrapper_blob_sha':'f27301171bb52644be2d41ef3717093c7a38fdb1','execution_core_sha256':core,'execution_wrapper_sha256':wrapper,'output_drive_folder_id':'10BjpRRFoE9ysw8EzheyZnoH8gOzdchae'},indent=2))
           PY
           cp /tmp/T2_CODE_SHA256.txt /tmp/t2out/CODE_SHA256SUMS.txt
+          cp /tmp/CANONICAL_CODE_BINDING.json /tmp/t2out/CANONICAL_CODE_BINDING.json
           (cd /tmp/t2out && sha256sum * > OUTPUT_SHA256SUMS.txt)
 
       - name: Persist results and verify remote sizes

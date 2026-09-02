@@ -1,0 +1,86 @@
+name: Rail Belgium Infrabel History
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-belgium-infrabel-history.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        year: [2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+    steps:
+      - name: Discover monthly raw files and persist directly to Drive
+        shell: bash
+        env:
+          YEAR: ${{ matrix.year }}
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$R"
+
+          API='https://opendata.infrabel.be/api/explore/v2.1/catalog/datasets/stiptheid-gegevens-maandelijksebestanden/records'
+          curl --compressed -fL --retry 8 --retry-all-errors "$API?limit=100&offset=0" -o "$RUNNER_TEMP/p0.json"
+          curl --compressed -fL --retry 8 --retry-all-errors "$API?limit=100&offset=100" -o "$RUNNER_TEMP/p1.json"
+          jq -s -r --arg y "$YEAR" \
+            '.[] | .results[] | select(.mois | startswith($y + "-")) | [.mois,.link_to_data] | @tsv' \
+            "$RUNNER_TEMP/p0.json" "$RUNNER_TEMP/p1.json" | sort -u > "$RUNNER_TEMP/records.tsv"
+
+          COUNT=$(wc -l < "$RUNNER_TEMP/records.tsv")
+          echo "year=$YEAR discovered=$COUNT"
+          test "$COUNT" -gt 0 || { echo "No Infrabel records for $YEAR"; exit 0; }
+
+          MAN="$RUNNER_TEMP/MANIFEST_BE_Infrabel_${YEAR}_${GITHUB_RUN_ID}.jsonl"
+          : > "$MAN"
+          while IFS=$'\t' read -r MONTH URL; do
+            test -n "$MONTH" && test -n "$URL"
+            FN=$(basename "${URL%%\?*}")
+            test -n "$FN"
+            DEST="01_rail/BE_Infrabel/02_actual_operations/$YEAR/${MONTH#*-}/$FN"
+            MDEST="$DEST.manifest.json"
+
+            if rclone lsjson "$R:$DEST" --config "$CFG" --files-only > "$RUNNER_TEMP/remote.json" 2>/dev/null \
+               && test "$(jq -r '.[0].Size // 0' "$RUNNER_TEMP/remote.json")" -gt 0 \
+               && rclone lsjson "$R:$MDEST" --config "$CFG" --files-only >/dev/null 2>&1; then
+              printf '{"state":"SKIPPED_REMOTE_COMPLETE","month":"%s","source_url":"%s","remote":"%s"}\n' "$MONTH" "$URL" "$DEST" >> "$MAN"
+              echo "SKIP $MONTH"
+              continue
+            fi
+
+            P="$RUNNER_TEMP/$FN"
+            curl --compressed -fL --retry 10 --retry-all-errors --connect-timeout 30 --max-time 10800 "$URL" -o "$P"
+            S=$(stat -c '%s' "$P")
+            H=$(sha256sum "$P" | awk '{print $1}')
+            test "$S" -gt 0
+            rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --drive-chunk-size 128M --stats 60s --stats-one-line
+            RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size')
+            test "$RS" = "$S"
+
+            META="$RUNNER_TEMP/$FN.manifest.json"
+            printf '{"state":"ACQUIRED","dataset_id":"be_infrabel_raw_punctuality","month":"%s","source_url":"%s","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s","retrieved_at_utc":"%s","license":"CC0"}\n' \
+              "$MONTH" "$URL" "$FN" "$S" "$H" "$GITHUB_RUN_ID" "$(date -u +%FT%TZ)" > "$META"
+            rclone copyto "$META" "$R:$MDEST" --config "$CFG" --retries 8 --low-level-retries 20
+            printf '{"state":"ACQUIRED","month":"%s","source_url":"%s","remote":"%s","bytes":%s,"sha256":"%s"}\n' "$MONTH" "$URL" "$DEST" "$S" "$H" >> "$MAN"
+            rm -f "$P" "$META"
+            echo "DONE $MONTH bytes=$S"
+          done < "$RUNNER_TEMP/records.tsv"
+
+          rclone copyto "$MAN" "$R:01_rail/BE_Infrabel/_manifests/$YEAR/MANIFEST_${GITHUB_RUN_ID}.jsonl" --config "$CFG" --retries 8 --low-level-retries 20
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

@@ -1,0 +1,111 @@
+name: OpenCity MTA OD order contract probe 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-order-contract-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OD_ROOT_ID: 1OZN2Nn1qHdVak8Q1yKQxUV07Znjmlk_Z
+  DATASET_ID: 28vm-gjqr
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Configure Drive transport
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          echo "config=$CFG" >> "$GITHUB_OUTPUT"; echo "remote=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Probe candidate deterministic source orders against archived boundaries
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+          R: ${{ steps.storage.outputs.remote }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/order_probe"; mkdir -p "$OUT"
+          rclone copyto "$R:parts/28vm-gjqr.part-00000.csv" "$OUT/p0.csv" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --retries 5 --low-level-retries 10
+          rclone copyto "$R:parts/28vm-gjqr.part-00561.csv" "$OUT/p561.csv" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --retries 5 --low-level-retries 10
+          python - "$OUT" <<'PY'
+          import csv,datetime as dt,io,json,os,sys
+          from pathlib import Path
+          import requests
+          out=Path(sys.argv[1]); ds=os.environ['DATASET_ID']
+          def bounds(p):
+              with p.open(encoding='utf-8-sig',newline='') as f:
+                  rows=list(csv.reader(f))
+              return {'header':rows[0],'first':rows[1],'last':rows[-1],'n':len(rows)-1}
+          b0=bounds(out/'p0.csv'); b561=bounds(out/'p561.csv')
+          assert b0['n']==100000 and b561['n']==100000
+          targets={0:b0['first'],99999:b0['last'],56100000:b561['first'],56199999:b561['last']}
+          header=b0['header']
+          orders=[
+            None,
+            ':id',
+            'timestamp,origin_station_complex_id,destination_station_complex_id',
+            'timestamp,origin_station_complex_id,destination_station_complex_id,estimated_average_ridership',
+            'timestamp,hour_of_day,origin_station_complex_id,destination_station_complex_id',
+            'year,month,timestamp,origin_station_complex_id,destination_station_complex_id',
+            'timestamp,origin_station_complex_name,destination_station_complex_name,origin_station_complex_id,destination_station_complex_id'
+          ]
+          s=requests.Session(); s.headers['User-Agent']='OpenCity-MTA-OD-order-contract-probe/20260902'
+          base=f'https://data.ny.gov/resource/{ds}.csv'
+          results=[]
+          for order in orders:
+              rec={'order':order or '<default>','matches':{},'rows':{},'errors':{}}
+              for off,want in targets.items():
+                  params={'$limit':1,'$offset':off}
+                  if order: params['$order']=order
+                  try:
+                      r=s.get(base,params=params,timeout=180); r.raise_for_status()
+                      got=list(csv.reader(io.StringIO(r.text)))
+                      gh=got[0] if got else None; gr=got[1] if len(got)>1 else None
+                      rec['matches'][str(off)]=bool(gh==header and gr==want)
+                      rec['rows'][str(off)]=gr
+                  except Exception as e:
+                      rec['matches'][str(off)]=False; rec['errors'][str(off)]=repr(e)
+              rec['all_four_exact']=all(rec['matches'].values())
+              results.append(rec)
+          report={
+            'state':'ORDER_CONTRACT_PROBE_COMPLETE',
+            'dataset_id':ds,
+            'checked_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'archived_boundaries':{'0':targets[0],'99999':targets[99999],'56100000':targets[56100000],'56199999':targets[56199999]},
+            'candidate_results':results,
+            'exact_contract_candidates':[x['order'] for x in results if x['all_four_exact']],
+            'interpretation':'A candidate must reproduce header and exact archived row at all four boundary offsets before it can be used to resume without rewriting the stable prefix.'
+          }
+          (out/'ORDER_CONTRACT_PROBE_20260902.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
+          print(json.dumps(report,indent=2))
+          PY
+          rclone copyto "$OUT/ORDER_CONTRACT_PROBE_20260902.json" "$R:ORDER_CONTRACT_PROBE_20260902.json" --config "$CFG" --drive-root-folder-id "$OD_ROOT_ID" --retries 5 --low-level-retries 10
+
+      - name: Cleanup credential material
+        if: always()
+        shell: bash
+        env:
+          CFG: ${{ steps.storage.outputs.config }}
+        run: |
+          if [[ -n "${CFG:-}" && -f "$CFG" ]]; then shred -u "$CFG" 2>/dev/null || rm -f "$CFG"; fi

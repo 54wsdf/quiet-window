@@ -37,9 +37,9 @@ jobs:
           )
           with urllib.request.urlopen(req, timeout=60) as r:
               j=json.load(r)
-          shards=[x for x in j.get('jobs',[]) if 'MTA OD download shard' in x.get('name','')]
+          shards=[x for x in j.get('jobs',[]) if x.get('name','').startswith('mta-od-shards (')]
           if len(shards)!=8:
-              raise SystemExit(f'producer shard job count {len(shards)} != 8')
+              raise SystemExit(f'producer shard job count {len(shards)} != 8: {[x.get("name") for x in j.get("jobs",[])]}')
           bad=[(x.get('name'),x.get('status'),x.get('conclusion')) for x in shards if x.get('conclusion')!='success']
           if bad:
               raise SystemExit(f'producer shards not all successful: {bad}')

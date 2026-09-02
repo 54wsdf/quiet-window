@@ -1,0 +1,78 @@
+name: Direct Drive Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/direct-drive-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - name: 检查 Secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo '缺少 GDRIVE_RCLONE_CONFIG_B64' >&2
+            exit 3
+          fi
+          echo 'Secret 已注入。'
+
+      - name: 安装 rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 2
+
+      - name: 恢复临时配置
+        id: cfg
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          echo 'rclone 配置恢复成功。'
+
+      - name: 写入并核验极小测试文件
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.cfg.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.cfg.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          FILE="$RUNNER_TEMP/quiet-window-smoke.txt"
+          printf 'quiet-window direct Drive smoke test\nrun=%s\n' "$GITHUB_RUN_ID" > "$FILE"
+          LOCAL_SIZE="$(stat -c '%s' "$FILE")"
+          DEST="$REMOTE_NAME:00_catalog/worker_test/quiet-window-smoke-$GITHUB_RUN_ID.txt"
+          rclone copyto "$FILE" "$DEST" --config "$CONFIG_FILE" --retries 3 --low-level-retries 5 --transfers 1 --checkers 2
+          REMOTE_SIZE="$(rclone lsjson "$DEST" --config "$CONFIG_FILE" --files-only | jq -r '.[0].Size // empty')"
+          if [[ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
+            echo "远端核验失败 local=$LOCAL_SIZE remote=${REMOTE_SIZE:-missing}" >&2
+            exit 7
+          fi
+          echo "直写 Drive 成功，远端字节数=$REMOTE_SIZE。"
+
+      - name: 清理临时配置
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.cfg.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

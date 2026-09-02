@@ -1,0 +1,288 @@
+name: Public registry backfill 20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/public-registry-backfill-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-registry-backfill-20260902
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DRIVE_ROOT: ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data
+
+jobs:
+  static-sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure direct Drive channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          test -n "$REMOTE_NAME"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+          rclone lsd "$REMOTE_NAME:ResearchData" >/dev/null
+      - name: Reacquire official static sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gtfs /tmp/t10
+          curl -fL --retry 8 --retry-delay 3 \
+            'https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip' \
+            -o /tmp/gtfs/mta_subway_gtfs_supplemented_20260902.zip
+          printf '%s\n' 'https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip' > /tmp/gtfs/SOURCE_URLS.txt
+          (cd /tmp/gtfs && sha256sum mta_subway_gtfs_supplemented_20260902.zip > SHA256SUMS.txt)
+
+          curl -fL --retry 8 --retry-delay 3 \
+            'https://s3.eu-west-2.amazonaws.com/webdata.nationalhighways.co.uk/ha-roadworks/nh_roadworks_2026_03_08.xml' \
+            -o /tmp/t10/nh_roadworks_2026_03_08.xml
+          curl -fL --retry 8 --retry-delay 3 \
+            'https://webtris.nationalhighways.co.uk/api/v1.0/sites' \
+            -o /tmp/t10/webtris_sites_20260902.json
+          cat > /tmp/t10/SOURCE_URLS.txt <<'EOF'
+          https://s3.eu-west-2.amazonaws.com/webdata.nationalhighways.co.uk/ha-roadworks/nh_roadworks_2026_03_08.xml
+          https://webtris.nationalhighways.co.uk/api/v1.0/sites
+          EOF
+          (cd /tmp/t10 && sha256sum nh_roadworks_2026_03_08.xml webtris_sites_20260902.json > SHA256SUMS.txt)
+      - name: Persist static sources to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/gtfs "$REMOTE_NAME:${DRIVE_ROOT}/public_data_registry_acquisition_20260902/mta_nyc_gtfs_20260902" \
+            --transfers 2 --checkers 4 --retries 8 --low-level-retries 20
+          rclone copy /tmp/t10 "$REMOTE_NAME:${DRIVE_ROOT}/T6_T10_PublicSources_20260902/T10_NationalHighways_Roadworks_WebTRIS_20260902/raw_sources" \
+            --transfers 2 --checkers 4 --retries 8 --low-level-retries 20
+          echo 'static source persistence complete'
+
+  webtris-20x30:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure direct Drive channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+          rclone lsd "$REMOTE_NAME:ResearchData" >/dev/null
+      - name: Acquire 20 usable WebTRIS sites over a 30-day window
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/webtris
+          python - <<'PY'
+          import hashlib, json, time
+          from pathlib import Path
+          import requests
+
+          out = Path('/tmp/webtris')
+          base = 'https://webtris.nationalhighways.co.uk/api/v1.0'
+          s = requests.Session()
+          s.headers['User-Agent'] = 'public-registry-backfill/20260902'
+
+          r = s.get(base + '/sites', timeout=90)
+          r.raise_for_status()
+          (out / 'sites.json').write_bytes(r.content)
+          raw = r.json()
+
+          ids = []
+          def walk(x):
+              if isinstance(x, dict):
+                  for k in ('Id','ID','id','Site Id','site_id'):
+                      if k in x and str(x[k]).strip():
+                          ids.append(str(x[k]).strip())
+                          break
+                  for v in x.values(): walk(v)
+              elif isinstance(x, list):
+                  for v in x: walk(v)
+          walk(raw)
+          seen=set(); ids=[x for x in ids if not (x in seen or seen.add(x))]
+          ids=['2']+[x for x in ids if x!='2']
+
+          def report(site, start, end):
+              rows=[]; header={}; page=1
+              while True:
+                  q={'sites':site,'start_date':start,'end_date':end,'page':page,'page_size':5000}
+                  rr=s.get(base + '/reports/daily', params=q, timeout=120)
+                  rr.raise_for_status()
+                  j=rr.json()
+                  if not header: header=j.get('Header') or j.get('header') or {}
+                  batch=j.get('Rows') or j.get('rows') or []
+                  rows.extend(batch)
+                  if len(batch)<5000: break
+                  page += 1
+                  if page>30: break
+              return {'Header':header,'Rows':rows}
+
+          periods=[('04032024','02042024'),('01012023','30012023'),('01072022','30072022')]
+          selected=[]; failures=[]
+          for start,end in periods:
+              for site in ids[:1500]:
+                  if len(selected)>=20: break
+                  if any(z['site_id']==site for z in selected): continue
+                  try:
+                      j=report(site,start,end)
+                      n=len(j['Rows'])
+                      if n>=1000:
+                          fn=f'site_{site}_{start}_{end}.json'
+                          (out/fn).write_text(json.dumps(j,separators=(',',':')),encoding='utf-8')
+                          selected.append({'site_id':site,'start':start,'end':end,'rows':n,'file':fn})
+                  except Exception as e:
+                      failures.append({'site_id':site,'start':start,'end':end,'error':str(e)[:240]})
+                  time.sleep(0.03)
+              if len(selected)>=20: break
+          summary={'site_count':len(selected),'rows_total':sum(x['rows'] for x in selected),'selected':selected}
+          (out/'RUN_SUMMARY.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          (out/'fetch_failures.json').write_text(json.dumps(failures[:500],indent=2),encoding='utf-8')
+          (out/'SOURCE_URLS.txt').write_text(base+'/sites\n'+base+'/reports/daily\n',encoding='utf-8')
+          sums=[]
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='SHA256SUMS.txt':
+                  sums.append(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name)
+          (out/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n',encoding='utf-8')
+          print(json.dumps(summary))
+          PY
+      - name: Persist WebTRIS result even if partial
+        shell: bash
+        run: |
+          set -euo pipefail
+          rclone copy /tmp/webtris "$REMOTE_NAME:${DRIVE_ROOT}/public_data_registry_acquisition_20260902/webtris_20site_30day" \
+            --transfers 4 --checkers 8 --retries 8 --low-level-retries 20
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/webtris/RUN_SUMMARY.json'))
+          if d['site_count'] < 20:
+              raise SystemExit(f"only {d['site_count']} usable sites persisted")
+          PY
+
+  mta-od-shards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure direct Drive channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+          rclone lsd "$REMOTE_NAME:ResearchData" >/dev/null
+      - name: Reacquire deterministic MTA OD chunks
+        env:
+          SHARD: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TARGET="$REMOTE_NAME:${DRIVE_ROOT}/public_data_registry_acquisition_20260902/mta_od_2026_quiet_window_reacquire"
+          python - <<'PY'
+          import csv, gzip, hashlib, io, json, math, os, subprocess, time
+          from pathlib import Path
+          import requests
+
+          dataset='28vm-gjqr'; base=f'https://data.ny.gov/resource/{dataset}'
+          shard=int(os.environ['SHARD']); nshards=8; chunk=50000
+          target=os.environ['TARGET']
+          s=requests.Session(); s.headers['User-Agent']='public-registry-backfill/20260902'
+          c=s.get(base+'.json',params={'$select':'count(*)'},timeout=120); c.raise_for_status()
+          total=int(c.json()[0]['count']); nchunks=math.ceil(total/chunk)
+          manifest={'dataset':dataset,'total_rows':total,'chunk_size':chunk,'expected_chunks':nchunks,'shard':shard,'files':[]}
+          work=Path('/tmp/mtaod'); work.mkdir(exist_ok=True)
+          for idx in range(shard,nchunks,nshards):
+              offset=idx*chunk
+              fn=f'{dataset}.part-{idx:05d}.csv.gz'; p=work/fn
+              params={'$limit':chunk,'$offset':offset,'$order':':id'}
+              r=s.get(base+'.csv',params=params,timeout=240); r.raise_for_status()
+              text=r.text
+              lines=text.splitlines()
+              n=max(0,len(lines)-1)
+              with gzip.open(p,'wt',encoding='utf-8',newline='') as gz: gz.write(text)
+              h=hashlib.sha256(p.read_bytes()).hexdigest(); size=p.stat().st_size
+              subprocess.run(['rclone','copyto',str(p),f'{target}/{fn}','--retries','8','--low-level-retries','20'],check=True)
+              manifest['files'].append({'index':idx,'offset':offset,'rows':n,'file':fn,'bytes':size,'sha256':h})
+              p.unlink()
+              print(f'shard={shard} chunk={idx+1}/{nchunks} rows={n}')
+              time.sleep(0.03)
+          mp=work/f'manifest-shard-{shard}.json'
+          mp.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+          subprocess.run(['rclone','copyto',str(mp),f'{target}/{mp.name}','--retries','5'],check=True)
+          PY
+
+  mta-od-finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: mta-od-shards
+    if: always()
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure Drive and verify complete chunk set
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$HOME/.config/rclone/rclone.conf")"
+          export TARGET="$REMOTE_NAME:${DRIVE_ROOT}/public_data_registry_acquisition_20260902/mta_od_2026_quiet_window_reacquire"
+          python - <<'PY'
+          import json, math, os, subprocess
+          from pathlib import Path
+          import requests
+          dataset='28vm-gjqr'; chunk=50000
+          total=int(requests.get(f'https://data.ny.gov/resource/{dataset}.json',params={'$select':'count(*)'},timeout=120).json()[0]['count'])
+          expected=math.ceil(total/chunk)
+          target=os.environ['TARGET']
+          ls=subprocess.check_output(['rclone','lsf',target,'--files-only'],text=True).splitlines()
+          parts=sorted(x for x in ls if x.startswith(dataset+'.part-') and x.endswith('.csv.gz'))
+          state='ACQUIRED' if len(parts)==expected else 'PARTIAL'
+          d={'dataset':dataset,'source':'https://data.ny.gov/resource/28vm-gjqr','total_rows':total,'chunk_size':chunk,'expected_chunks':expected,'actual_chunks':len(parts),'state':state}
+          p=Path('/tmp/ACQUIRED_MANIFEST.json'); p.write_text(json.dumps(d,indent=2),encoding='utf-8')
+          subprocess.run(['rclone','copyto',str(p),f'{target}/ACQUIRED_MANIFEST.json','--retries','5'],check=True)
+          print(json.dumps(d))
+          if state!='ACQUIRED': raise SystemExit(2)
+          PY

@@ -1,0 +1,40 @@
+name: Rail US GTFSRT Archive
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-us-gtfsrt-archive.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+jobs:
+  systems:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {agency: septa, system: rail, label: SEPTA_Regional_Rail, path: '01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io'}
+          - {agency: metrolink, system: '', label: Metrolink, path: '01_rail/US_CA_Metrolink/03_realtime/gtfsrt_io'}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: 按日历史直传
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          python scripts/fetchers/gtfsrt_system_direct.py --agency-id '${{ matrix.agency }}' --system-id '${{ matrix.system }}' --label '${{ matrix.label }}' --drive-path '${{ matrix.path }}' --config "$CFG" --remote "$R"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

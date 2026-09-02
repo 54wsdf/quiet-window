@@ -1,0 +1,227 @@
+name: Rail Source Refresh
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/requests/rail-source-refresh-20260902.json'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-validate-store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      REQUEST_FILE: .github/requests/rail-source-refresh-20260902.json
+      OUTPUT_DIR: ${{ runner.temp }}/rail-source-refresh
+
+    steps:
+      - name: Checkout execution tools
+        uses: actions/checkout@v5
+
+      - name: Prepare Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Check durable-storage runtime
+        id: storage
+        shell: bash
+        run: |
+          set -u
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'Durable-storage runtime configuration is unavailable; no source download will start.'
+            exit 0
+          fi
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          if ! printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'Durable-storage runtime configuration could not be decoded.'
+            rm -f "$CONFIG_FILE"
+            exit 0
+          fi
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          if [[ -z "$REMOTE_NAME" ]]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'No rclone remote section was found.'
+            rm -f "$CONFIG_FILE"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          echo 'Durable-storage runtime is ready; configuration content is not logged.'
+
+      - name: Install acquisition dependencies
+        if: steps.storage.outputs.ready == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet requests pandas numpy pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          rclone version | head -n 2
+
+      - name: Fetch public sources and run technical validation
+        if: steps.storage.outputs.ready == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$OUTPUT_DIR"
+          python scripts/fetchers/rail_source_validation.py \
+            --request "$REQUEST_FILE" \
+            --output-dir "$OUTPUT_DIR"
+          rc=$?
+          if [[ $rc -ne 0 ]]; then
+            printf '{"runner_state":"FAILED","exit_code":%s}\n' "$rc" > "$OUTPUT_DIR/runner_failure.json"
+          fi
+          exit 0
+
+      - name: Persist and verify task folders
+        if: steps.storage.outputs.ready == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -u
+          mkdir -p "$OUTPUT_DIR"
+          STORAGE_SUMMARY="$OUTPUT_DIR/storage_transfer_summary.json"
+          printf '{"tasks":{}}\n' > "$STORAGE_SUMMARY"
+
+          transfer_task() {
+            task="$1"
+            dest="$2"
+            local_dir="$OUTPUT_DIR/$task"
+            local_state="MISSING"
+            if [[ -f "$OUTPUT_DIR/run_summary.json" ]]; then
+              local_state="$(jq -r --arg t "$task" '.tasks[$t].local_state // "MISSING"' "$OUTPUT_DIR/run_summary.json" 2>/dev/null || echo MISSING)"
+            fi
+            if [[ ! -d "$local_dir" ]]; then
+              state="FAILED"
+              verified=false
+            else
+              rclone copy "$local_dir" "$REMOTE_NAME:$dest" \
+                --config "$CONFIG_FILE" \
+                --retries 8 \
+                --low-level-retries 20 \
+                --transfers 2 \
+                --checkers 4 \
+                --stats 30s \
+                --stats-one-line
+              copy_rc=$?
+              if [[ $copy_rc -eq 0 ]]; then
+                rclone check "$local_dir" "$REMOTE_NAME:$dest" \
+                  --config "$CONFIG_FILE" \
+                  --size-only \
+                  --one-way \
+                  --checkers 4
+                check_rc=$?
+              else
+                check_rc=1
+              fi
+              if [[ $copy_rc -eq 0 && $check_rc -eq 0 ]]; then
+                verified=true
+                if [[ "$local_state" == "VALIDATED" ]]; then
+                  state="ACQUIRED"
+                else
+                  state="$local_state"
+                fi
+              else
+                verified=false
+                state="TRANSFER_PARTIAL"
+              fi
+            fi
+
+            python - "$STORAGE_SUMMARY" "$task" "$state" "$verified" "$dest" <<'PY'
+          import json, sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          task, state, verified, dest = sys.argv[2:]
+          data = json.loads(p.read_text(encoding='utf-8'))
+          data.setdefault('tasks', {})[task] = {
+              'state': state,
+              'remote_size_verified': verified.lower() == 'true',
+              'drive_path': dest,
+          }
+          p.write_text(json.dumps(data, indent=2), encoding='utf-8')
+          PY
+
+            status_file="$local_dir/processed/storage_status.json"
+            mkdir -p "$(dirname "$status_file")"
+            python - "$status_file" "$state" "$verified" "$dest" "$GITHUB_RUN_ID" <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          p.write_text(json.dumps({
+              'state': sys.argv[2],
+              'remote_size_verified': sys.argv[3].lower() == 'true',
+              'durable_storage_path': sys.argv[4],
+              'workflow_run_id': sys.argv[5],
+              'verified_utc': datetime.now(timezone.utc).isoformat(),
+          }, indent=2), encoding='utf-8')
+          PY
+            if [[ "$verified" == "true" ]]; then
+              rclone copyto "$status_file" "$REMOTE_NAME:$dest/processed/storage_status.json" \
+                --config "$CONFIG_FILE" \
+                --retries 5 \
+                --low-level-retries 10
+            fi
+          }
+
+          MBTA_DEST="$(jq -r '.mbta.drive_path' "$REQUEST_FILE")"
+          CTA_DEST="$(jq -r '.cta.drive_path' "$REQUEST_FILE")"
+          SUMMARY_DEST="$(jq -r '.summary_drive_path' "$REQUEST_FILE")"
+
+          transfer_task mbta "$MBTA_DEST"
+          transfer_task cta "$CTA_DEST"
+
+          python - "$STORAGE_SUMMARY" "$GITHUB_RUN_ID" "$GITHUB_SHA" <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          data = json.loads(p.read_text(encoding='utf-8'))
+          data['workflow_run_id'] = sys.argv[2]
+          data['commit_sha'] = sys.argv[3]
+          data['finished_utc'] = datetime.now(timezone.utc).isoformat()
+          p.write_text(json.dumps(data, indent=2), encoding='utf-8')
+          PY
+
+          rclone copyto "$STORAGE_SUMMARY" "$REMOTE_NAME:$SUMMARY_DEST/storage_transfer_summary.json" \
+            --config "$CONFIG_FILE" \
+            --retries 5 \
+            --low-level-retries 10
+          if [[ -f "$OUTPUT_DIR/run_summary.json" ]]; then
+            rclone copyto "$OUTPUT_DIR/run_summary.json" "$REMOTE_NAME:$SUMMARY_DEST/run_summary.json" \
+              --config "$CONFIG_FILE" \
+              --retries 5 \
+              --low-level-retries 10
+          fi
+
+          echo 'Task transfer summary:'
+          jq '{tasks, workflow_run_id}' "$STORAGE_SUMMARY"
+          exit 0
+
+      - name: Cleanup temporary storage configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

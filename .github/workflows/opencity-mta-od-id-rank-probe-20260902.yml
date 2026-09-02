@@ -1,0 +1,55 @@
+name: OpenCity MTA OD id and rank probe 20260902
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-mta-od-id-rank-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Probe id order and logical ranks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests
+          python - <<'PY'
+          import csv,io,json,requests,datetime
+          ds='28vm-gjqr'; csvurl=f'https://data.ny.gov/resource/{ds}.csv'; jsurl=f'https://data.ny.gov/resource/{ds}.json'
+          s=requests.Session(); s.headers['User-Agent']='OpenCity-MTA-OD-id-rank-probe/20260902'
+          exp0=['2026','1','Monday','1','2026-01-05T01:00:00.000','16','8 St-NYU (R,W)','40.730328','-73.992629','452','90 St-Elmhurst Av (7)','40.748408','-73.876613','0.3332','POINT (-73.992629 40.730328)','POINT (-73.876613 40.748408)']
+          exp561=['2026','6','Wednesday','10','2026-06-10T10:00:00.000','259','Kew Gardens-Union Tpke (E,F)','40.714441','-73.831008','86','Cypress Hills (J)','40.689941','-73.87255','0.3033','POINT (-73.831008 40.714441)','POINT (-73.87255 40.689941)']
+          def one(off,order):
+              r=s.get(csvurl,params={'$limit':1,'$offset':off,'$order':order},timeout=180); r.raise_for_status(); a=list(csv.reader(io.StringIO(r.text))); return a[1] if len(a)>1 else None
+          out={'checked_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'id_order':{}}
+          for off,want in [(0,exp0),(56100000,exp561)]:
+              try:
+                  got=one(off,':id'); out['id_order'][str(off)]={'exact':got==want,'got':got}
+              except Exception as e: out['id_order'][str(off)]={'exact':False,'error':repr(e)}
+          # Determine Socrata field types, then compute rank of the archived 56.1m boundary
+          meta=s.get(f'https://data.ny.gov/api/views/{ds}',timeout=120); meta.raise_for_status(); mj=meta.json()
+          types={c.get('fieldName'):c.get('dataTypeName') for c in mj.get('columns',[])}
+          out['types']={k:types.get(k) for k in ['timestamp','origin_station_complex_id','destination_station_complex_id','estimated_average_ridership']}
+          ts='2026-06-10T10:00:00.000'; o='259'; d='86'
+          def lit(field,val):
+              typ=(types.get(field) or '').lower()
+              if typ in {'number','money','checkbox'}: return val
+              return "'"+val.replace("'","''")+"'"
+          # rank for order timestamp, origin id, destination id; count rows strictly preceding archived row
+          where=(f"timestamp < '{ts}' OR (timestamp = '{ts}' AND origin_station_complex_id < {lit('origin_station_complex_id',o)}) "
+                 f"OR (timestamp = '{ts}' AND origin_station_complex_id = {lit('origin_station_complex_id',o)} AND destination_station_complex_id < {lit('destination_station_complex_id',d)})")
+          try:
+              r=s.get(jsurl,params={'$select':'count(*) as n','$where':where},timeout=180); r.raise_for_status(); out['logical_rank_561_first']={'where':where,'rank':int(r.json()[0]['n']),'target_offset':56100000}
+          except Exception as e: out['logical_rank_561_first']={'where':where,'error':repr(e),'target_offset':56100000}
+          print('__RESULT_BEGIN__'); print(json.dumps(out,indent=2)); print('__RESULT_END__')
+          PY

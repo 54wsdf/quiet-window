@@ -1,0 +1,105 @@
+name: Rail MBTA Bulk
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rail-mbta-bulk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  BASE: https://performancedata.mbta.com/lamp
+
+jobs:
+  gtfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        year: [2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+    steps:
+      - name: 直接获取年度 GTFS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          F="MBTA_GTFS_ARCHIVE_${{ matrix.year }}.db.gz"; URL="$BASE/gtfs_archive/${{ matrix.year }}/GTFS_ARCHIVE.db.gz"; P="$RUNNER_TEMP/$F"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 7200 "$URL" -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST="01_rail/US_MA_MBTA/01_schedule/history/${{ matrix.year }}/$F"
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","source":"MBTA LAMP","tier":"S","year":${{ matrix.year }},"file":"%s","bytes":%s,"sha256":"%s","run_id":"%s"}\n' "$F" "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/$F.manifest.json"
+          rclone copyto "$RUNNER_TEMP/$F.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"
+
+  rail-exports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {file: LAMP_ALL_RT_fields.parquet, layer: 03_realtime}
+          - {file: LAMP_service_id_by_date_and_route.parquet, layer: 01_schedule}
+          - {file: LAMP_static_calendar_dates.parquet, layer: 01_schedule}
+          - {file: LAMP_static_calendar.parquet, layer: 01_schedule}
+          - {file: LAMP_static_feed_info.parquet, layer: 01_schedule}
+          - {file: LAMP_static_routes.parquet, layer: 01_schedule}
+          - {file: LAMP_static_stop_times.parquet, layer: 01_schedule}
+          - {file: LAMP_static_stops.parquet, layer: 01_schedule}
+          - {file: LAMP_static_trips.parquet, layer: 01_schedule}
+    steps:
+      - name: 直接获取 LAMP rail export
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; test -n "$R"
+          F='${{ matrix.file }}'; P="$RUNNER_TEMP/$F"; URL="$BASE/tableau/rail/$F"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 --max-time 14400 "$URL" -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST="01_rail/US_MA_MBTA/${{ matrix.layer }}/LAMP_exports/$F"
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20 --stats 60s --stats-one-line
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","source":"MBTA LAMP","tier":"S","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s"}\n' "$F" "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/$F.manifest.json"
+          rclone copyto "$RUNNER_TEMP/$F.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"
+
+  extras:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {id: alerts, url: 'https://performancedata.mbta.com/lamp/tableau/alerts/LAMP_RT_ALERTS.parquet', file: LAMP_RT_ALERTS.parquet, layer: 05_disruptions_trackwork}
+          - {id: performance_index, url: 'https://performancedata.mbta.com/lamp/subway-on-time-performance-v1/index.csv', file: subway_on_time_performance_index.csv, layer: 08_performance_reliability}
+    steps:
+      - name: 直接获取补充资产
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CFG="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CFG"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"; F='${{ matrix.file }}'; P="$RUNNER_TEMP/$F"
+          curl -fL --retry 8 --retry-all-errors '${{ matrix.url }}' -o "$P"
+          S=$(stat -c '%s' "$P"); H=$(sha256sum "$P" | awk '{print $1}'); test "$S" -gt 0
+          DEST="01_rail/US_MA_MBTA/${{ matrix.layer }}/$F"
+          rclone copyto "$P" "$R:$DEST" --config "$CFG" --retries 8 --low-level-retries 20
+          RS=$(rclone lsjson "$R:$DEST" --config "$CFG" --files-only | jq -r '.[0].Size'); test "$RS" = "$S"
+          printf '{"state":"ACQUIRED","source":"MBTA LAMP","tier":"S","file":"%s","bytes":%s,"sha256":"%s","run_id":"%s"}\n' "$F" "$S" "$H" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/$F.manifest.json"
+          rclone copyto "$RUNNER_TEMP/$F.manifest.json" "$R:$DEST.manifest.json" --config "$CFG"
+          shred -u "$CFG" 2>/dev/null || rm -f "$CFG"

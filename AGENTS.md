@@ -1,68 +1,70 @@
-# Agent Instructions
+# Agent 工作纪律
 
-Scope: this entire repository.
+适用范围：本仓库全部内容。
 
-## Repository role
+## 仓库职责
 
-This repository is a public execution worker for reproducible retrieval, validation, packaging, and transport of openly accessible transportation and mobility datasets.
+本仓库是一个公开执行节点，用于对公开可访问的交通与出行数据进行可复现的获取、校验、打包、分片和传输。
 
-It is **not** the canonical research repository, not a publication repository, and not a place for unpublished research content. Keep research interpretation, paper text, internal project decisions, private-source material, and canonical research registries elsewhere.
+本仓库**不是**科研主仓库，不是论文仓库，也不是存放未公开研究内容的位置。研究解释、论文正文、内部项目决策、私有来源材料以及正式科研总账应保存在其他位置。
 
-The README is intentionally generic. Do not expand it to describe the execution role or any private research context unless the repository owner explicitly asks.
+README 有意保持泛化。除非仓库所有者明确要求，不要扩写 README，不要在 README 中说明本仓库的真实执行职责，也不要加入任何私有科研背景。
 
-Before adding or modifying acquisition workflows, read `.github/EXECUTION_POLICY.md`.
+新增或修改数据获取工作流前，必须先阅读 `.github/EXECUTION_POLICY.md`。
 
-## Primary priorities
+## 主要优先级
 
-1. Prefer rail and urban/public transit datasets.
-2. Acquire S/A-tier scientific assets even when they cover only one day, one case, or cannot yet be paired with another dataset.
-3. When multiple strong sources exist, prioritize same-system and same-period combinations across schedule, actual operations, demand/OD, disruptions, infrastructure, rolling stock, and performance.
-4. Where a year must be selected, prefer 2019 or later unless an older benchmark or historical series has clear scientific value.
-5. Dataset size is not an exclusion criterion. Split, shard, paginate, or stream instead of dropping a valuable source.
+1. 优先获取铁路、城市轨道交通和公共交通数据。
+2. S/A 级科研资产即使只覆盖一天、一个案例，或暂时无法与其他数据同期匹配，也应优先获取。
+3. 当存在多个优质来源时，优先形成同一系统、同一时期的组合，包括计划、实际运行、需求/OD、扰动、基础设施、车辆编组和运营绩效等层。
+4. 必须选择年份时，默认优先 2019 年及以后；但具有明显科研价值的历史基准或长期序列可以保留更早年份。
+5. 数据体积不是淘汰条件。优质数据过大时，应采用分页、分片、按日期切分、流式下载或其他工程手段，而不是放弃数据。
 
-## Public-repository boundary
+## 公共仓库边界
 
-Only public or explicitly authorized source material may be handled here.
+这里只允许处理公开数据，或已经明确获得授权处理的数据。
 
-Never commit or expose:
+绝对不要提交或暴露：
 
-- credentials, tokens, cookies, API keys, passwords, OAuth material, rclone configuration, or service-account material;
-- private repository contents or unpublished research artifacts;
-- personal data that is not already lawfully published for the intended use;
-- account-specific storage configuration unless the owner explicitly approves it for public disclosure.
+- 凭据、Token、Cookie、API Key、密码、OAuth 材料、rclone 配置、服务账号材料；
+- 私有仓库内容或未公开科研成果；
+- 并非已经依法公开且允许用于目标用途的个人数据；
+- 未经所有者明确允许公开的账户级存储配置。
 
-Do not bypass authentication, access controls, paywalls, application requirements, anti-bot controls, or license restrictions. If a source requires a user identity, account registration, signed agreement, or manual approval, record it as requiring owner action rather than automating around it.
+不得绕过登录、访问控制、付费墙、申请要求、反自动化措施或许可证限制。若来源需要实名身份、账号注册、签署协议或人工审批，应记录为“需要所有者操作”，不得自行绕过。
 
-## Execution discipline
+## 执行纪律
 
-- Keep workflow permissions minimal; default to `contents: read`.
-- Do not use `pull_request_target` for acquisition jobs.
-- Do not grant forked PRs access to secrets or privileged actions.
-- Prefer `workflow_dispatch` for expensive or bulk jobs.
-- Never commit downloaded payloads to Git history.
-- Use runner scratch space for raw acquisition and external persistent storage for durable copies.
-- Use deterministic sharding for large files and record enough information to reassemble them exactly.
-- Treat GitHub Artifacts as a transport buffer, not the canonical archive. Keep retention short when practical.
-- A workflow is not considered complete merely because the job is green; verify payload bytes, manifest, checksum, and durable destination state.
+- 工作流权限保持最小化，默认 `contents: read`。
+- 数据获取任务不得使用 `pull_request_target`。
+- 不允许来自 fork 的 PR 获得 Secret 或高权限操作能力。
+- 大规模、昂贵或长期运行的数据任务优先使用 `workflow_dispatch` 手动触发。
+- 下载得到的数据不得提交进 Git 历史。
+- runner 临时空间只用于获取和处理；持久副本必须进入外部长期存储。
+- 大文件采用确定性分片，并保存足够信息以无损重组。
+- GitHub Artifact 只视为临时运输缓冲，不是正式数据仓库；能够直写长期存储时应优先直写。
+- GitHub job 变绿不代表任务完成。必须核验实际字节、manifest、校验和以及最终持久化状态。
 
-## Provenance requirement
+## 数据来源与可追溯要求
 
-Every acquired logical asset must have a machine-readable manifest containing, when available:
+每个实际取得的逻辑数据资产，应尽量生成机器可读 manifest，至少记录能够取得的以下信息：
 
-- stable dataset ID;
-- provider and source URL(s);
-- retrieval timestamp in UTC;
-- license or terms URL;
-- source time coverage;
-- original filename(s);
-- byte size;
-- SHA-256 checksum(s);
-- shard/reassembly metadata if split;
-- acquisition method and workflow/run provenance;
-- final durable-storage classification/path supplied at execution time.
+- 稳定的数据集 ID；
+- 提供方与来源 URL；
+- UTC 获取时间；
+- License 或 Terms URL；
+- 数据覆盖时间；
+- 原始文件名；
+- 原始字节数；
+- SHA-256；
+- 如有分片，记录分片和重组信息；
+- 获取方式以及 workflow/run 来源；
+- 执行时提供的最终长期存储分类与路径。
 
-Prefer preserving provider-native raw files unchanged. Derived/processed data belongs in a separate processing layer, not mixed into raw acquisition output.
+优先保持提供方原始文件不变。派生数据和处理结果必须进入独立 processed 层，不得与 raw 原始数据混放。
 
-## Agent handoff
+## Agent 接管规则
 
-When resuming work, first inspect this file, `.github/EXECUTION_POLICY.md`, current workflow runs, and existing manifests. Do not assume a prior run completed successfully from its name or GitHub conclusion alone.
+恢复工作时，先阅读本文件和 `.github/EXECUTION_POLICY.md`，再检查当前 workflows、runs、manifest 和持久化状态。
+
+不要因为 workflow 名称、历史对话或 GitHub conclusion 显示 success 就假定数据已经完整取得。只有真正满足持久化完成条件的资产才能升级为 `ACQUIRED`。

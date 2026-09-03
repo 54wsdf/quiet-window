@@ -1,0 +1,136 @@
+name: Seoul P3A2B Target-Line Status Diagnosis 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3a2b-target-line-status-diagnosis-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore matched service source
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3a2b"; cd "$RUNNER_TEMP/p3a2b"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Diagnose operator-specific status semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a2b"
+          python - <<'PY'
+          import csv,io,json,re,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          TARGET={'1001','1063','1065','1004'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def parse(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def norm(s):
+              return re.sub(r'\s+',' ',unicodedata.normalize('NFKC',str(s or '')).strip())
+
+          pat=re.compile(r'subarr_(260829(\d{6}))')
+          row_counts=Counter(); states=defaultdict(Counter); fresh_states=defaultdict(Counter); trains=defaultdict(set); stations=defaultdict(set)
+          messages=defaultdict(Counter); status_text=defaultdict(Counter); transition_pairs=defaultdict(Counter); prev_by_key={}; recptn_ranges={k:[None,None] for k in TARGET}; shards=0
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if not m:continue
+                  hh=m.group(2)
+                  if '070000'<=hh<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              shards=len(infos)
+              for x,st in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      line=(row.get('subway_id') or '').strip()
+                      if line not in TARGET:continue
+                      row_counts[line]+=1
+                      state=(row.get('arvl_cd') or '').strip();states[line][state]+=1
+                      t=parse(row.get('recptn_dt'))
+                      if t:
+                          lo,hi=recptn_ranges[line]
+                          recptn_ranges[line]=[t if lo is None or t<lo else lo,t if hi is None or t>hi else hi]
+                          age=(st-t).total_seconds()
+                          if -30<=age<=120:fresh_states[line][state]+=1
+                      train=(row.get('btrain_no') or '').strip();station=(row.get('statn_id') or '').strip()
+                      if train:trains[line].add(train)
+                      if station:stations[line].add(station)
+                      bst=norm(row.get('btrain_sttus'))
+                      if bst:status_text[line][bst]+=1
+                      msg=' | '.join(x for x in (norm(row.get('arvl_msg')),norm(row.get('arvl_msg2')),norm(row.get('arvl_msg3'))) if x)
+                      if msg:messages[line][msg]+=1
+                      if t and train and station and state:
+                          key=(line,train,station);old=prev_by_key.get(key)
+                          if old is None or t>old[0]:
+                              if old and old[1]!=state:transition_pairs[line][f'{old[1]}->{state}']+=1
+                              prev_by_key[key]=(t,state)
+                  f.close()
+
+          result={
+            'schema':'mppd-n1-seoul-p3a2b-target-line-status-diagnosis-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'window':'2026-08-29 07:00-10:00','archive_shards':shards,
+            'target_lines':{}
+          }
+          for line in sorted(TARGET):
+              lo,hi=recptn_ranges[line]
+              result['target_lines'][line]={
+                'rows':row_counts[line],'unique_trains':len(trains[line]),'unique_stations':len(stations[line]),'state_counts':dict(states[line]),'fresh_state_counts':dict(fresh_states[line]),
+                'recptn_dt_min':lo.strftime('%Y%m%d%H%M%S') if lo else None,'recptn_dt_max':hi.strftime('%Y%m%d%H%M%S') if hi else None,
+                'top_btrain_status_text':dict(status_text[line].most_common(20)),'top_arrival_message_combinations':dict(messages[line].most_common(20)),'observed_state_transition_counts':dict(transition_pairs[line].most_common(50))
+              }
+          result['diagnosis_contract']='Determine whether lines 1001 and 1063 are absent entirely, present without ARVL_CD=2, or use a distinct status/message convention. No alternative departure code is accepted merely because it is frequent; a new event rule requires explicit semantic and temporal qualification.'
+          Path('seoul_p3a2b_target_line_status_diagnosis_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          concise={k:{'rows':v['rows'],'trains':v['unique_trains'],'stations':v['unique_stations'],'states':v['state_counts'],'fresh_states':v['fresh_state_counts'],'transitions':v['observed_state_transition_counts'],'status_text':v['top_btrain_status_text']} for k,v in result['target_lines'].items()}
+          print('P3A2B_CONCISE='+json.dumps(concise,ensure_ascii=False))
+          PY
+
+      - name: Store diagnosis
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a2b"
+          F=seoul_p3a2b_target_line_status_diagnosis_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P3A2B_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

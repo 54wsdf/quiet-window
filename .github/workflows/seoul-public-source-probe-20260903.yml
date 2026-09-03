@@ -40,7 +40,7 @@ jobs:
           cd "$RUNNER_TEMP"
           python - <<'PY'
           import json, re
-          from urllib.parse import urljoin
+          from urllib.parse import urljoin, urlparse
           import requests
           from bs4 import BeautifulSoup
 
@@ -62,42 +62,39 @@ jobs:
               opts=[]
               for o in s.find_all('option'):
                 opts.append({'value':o.get('value'),'text':' '.join(o.stripped_strings)[:300]})
-              selects.append({'id':s.get('id'),'name':s.get('name'),'class':s.get('class'),'options':opts[:500]})
+              selects.append({'id':s.get('id'),'name':s.get('name'),'class':s.get('class'),'options':opts[:1000]})
             forms=[]
             for f in soup.find_all('form'):
               forms.append({'id':f.get('id'),'name':f.get('name'),'method':f.get('method'),'action':urljoin(r.url,f.get('action') or '')})
             controls=[]
             for el in soup.find_all(['a','button','input']):
-              text=' '.join(el.stripped_strings)
-              val=el.get('value') or ''
+              text=' '.join(el.stripped_strings); val=el.get('value') or ''
               hay=(text+' '+val+' '+str(el.get('onclick') or '')+' '+str(el.get('href') or ''))
               if any(x in hay.lower() for x in ['download','다운로드','내려받기','20260825','kscc_dx_trnsf_path_sum']):
-                controls.append({
-                  'tag':el.name,'text':text[:300],'value':val[:300],
-                  'id':el.get('id'),'name':el.get('name'),
-                  'href':urljoin(r.url,el.get('href')) if el.get('href') else None,
-                  'onclick':(el.get('onclick') or '')[:1000],
-                })
+                controls.append({'tag':el.name,'text':text[:300],'value':val[:300],'id':el.get('id'),'name':el.get('name'),'href':urljoin(r.url,el.get('href')) if el.get('href') else None,'onclick':(el.get('onclick') or '')[:1500]})
             script_hits=[]
             for sc in soup.find_all('script'):
               txt=sc.string or sc.get_text(' ',strip=False) or ''
               if any(x in txt.lower() for x in ['download','다운로드','filedown','trafficdataviewfile']):
                 urls=sorted(set(re.findall(r"[A-Za-z0-9_./?-]+\.do(?:\?[A-Za-z0-9_=&%.-]+)?",txt)))
-                script_hits.append({'src':urljoin(r.url,sc.get('src')) if sc.get('src') else None,'do_urls':urls[:100],'snippet':re.sub(r'\s+',' ',txt)[:5000]})
+                script_hits.append({'src':urljoin(r.url,sc.get('src')) if sc.get('src') else None,'do_urls':urls[:200],'snippet':re.sub(r'\s+',' ',txt)[:12000]})
             links=[]
             for a in soup.find_all('a',href=True):
               text=' '.join(a.stripped_strings)
               if ('20260825' in text or '환승' in text or '역사마스터' in text or 'csv' in text.lower() or 'zip' in text.lower()):
-                links.append({'text':text[:500],'href':urljoin(r.url,a['href']),'onclick':(a.get('onclick') or '')[:1000]})
-            out['sources'][key]={
-              'requested_url':url,'final_url':r.url,'status_code':r.status_code,
-              'content_type':r.headers.get('content-type'),'bytes':len(r.content),
-              'forms':forms,'selects':selects,'controls':controls[:200],
-              'script_hits':script_hits[:50],'links':links[:300],
-            }
+                links.append({'text':text[:500],'href':urljoin(r.url,a['href']),'onclick':(a.get('onclick') or '')[:1500]})
+            out['sources'][key]={'requested_url':url,'final_url':r.url,'status_code':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'forms':forms,'selects':selects,'controls':controls[:500],'script_hits':script_hits[:100],'links':links[:500]}
           open('seoul_public_source_probe_20260903.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
-          # Only concise structural summary to logs; no downloaded data rows.
-          print(json.dumps({k:{'selects':len(v['selects']),'controls':len(v['controls']),'links':len(v['links']),'script_hits':len(v['script_hits'])} for k,v in out['sources'].items()},ensure_ascii=False))
+          # Resolver hints are public page metadata only. Remove query strings from ordinary hrefs; onclick and option values are needed to resolve the public UI contract.
+          safe={}
+          for k,v in out['sources'].items():
+            safe[k]={
+              'selects':[{'id':x['id'],'name':x['name'],'options':x['options'][:80]} for x in v['selects']],
+              'controls':[{'tag':x['tag'],'text':x['text'],'value':x['value'],'id':x['id'],'name':x['name'],'href_path':urlparse(x['href']).path if x['href'] else None,'onclick':x['onclick']} for x in v['controls'][:100]],
+              'do_urls':sorted({u for h in v['script_hits'] for u in h['do_urls']})[:200],
+              'links':[{'text':x['text'],'href_path':urlparse(x['href']).path,'onclick':x['onclick']} for x in v['links'][:120]],
+            }
+          print('RESOLVER_HINTS='+json.dumps(safe,ensure_ascii=False))
           PY
 
       - name: Store probe

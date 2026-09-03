@@ -1,0 +1,307 @@
+name: Seoul P1C Line-Aware Crosswalk 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1c-line-aware-crosswalk-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p1c"; cd "$RUNNER_TEMP/seoul-p1c"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" transfer.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Infer line map and build hybrid crosswalk
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1c"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, re, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+
+          def detect(raw):
+              # Require a full decode of a sizeable prefix; Korean text is included in ordinary service rows.
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
+          def hdr(s): return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def norm_text(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip()
+              s=re.sub(r'\s+','',s)
+              s=s.replace('·','').replace('ㆍ','').replace('.','')
+              return s
+          def aliases(s):
+              raw=norm_text(s)
+              if not raw:return set()
+              out={raw}
+              # base without parenthetical qualifier
+              base=re.sub(r'\([^)]*\)|\[[^]]*\]','',raw)
+              out.add(base)
+              # parenthetical contents are retained as low-level aliases: some Seoul interchange names use them as common station aliases.
+              for x in re.findall(r'\(([^)]*)\)|\[([^]]*)\]',raw):
+                  for y in x:
+                      y=norm_text(y)
+                      if len(y)>=2:out.add(y)
+              out2=set()
+              for x in out:
+                  if x.endswith('역'):x=x[:-1]
+                  if x:out2.add(x)
+              return out2
+          def primary(s):
+              a=aliases(s)
+              if not a:return ''
+              raw=norm_text(s)
+              base=re.sub(r'\([^)]*\)|\[[^]]*\]','',raw)
+              if base.endswith('역'):base=base[:-1]
+              return base or sorted(a,key=len,reverse=True)[0]
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+
+          # T-money station support + rail AFC masses.
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f,e=zr(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f)
+              dv={}; dv_alias_index=defaultdict(set)
+              for row in r:
+                  code=z4(row.get('OUT_STN_NUM'))
+                  if not code:continue
+                  rec={'code':code,'serial':(row.get('SERIAL_NUM') or '').strip(),'name':(row.get('STN_KR_NM') or '').strip(),'eng':(row.get('STN_ENG_NM') or '').strip()}
+                  dv[code]=rec
+                  for a in aliases(rec['name']):dv_alias_index[a].add(code)
+              f.close()
+              f,e=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              ride=Counter(); alight=Counter(); rail_rows=0
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  rail_rows+=1
+                  a=z4(row.get('RIDE_BSST_ID')); b=z4(row.get('ALGH_BSST_ID'))
+                  if a:ride[a]+=1
+                  if b:alight[b]+=1
+              f.close()
+
+          # Robust service station dictionary. Majority name per statn_id and observed subway_id.
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              idx=sorted(set([0,len(infos)-1]+[round(i*(len(infos)-1)/383) for i in range(384)]))
+              sid_names=defaultdict(Counter); sid_lines=defaultdict(Counter); sid_seq=defaultdict(Counter)
+              for i in idx:
+                  f,e=zr(z,infos[i].filename); rr=csv.DictReader(f); rr.fieldnames=[hdr(x) for x in (rr.fieldnames or [])]
+                  for row in rr:
+                      sid=(row.get('statn_id') or '').strip()
+                      if not sid:continue
+                      nm=(row.get('statn_nm') or '').strip(); line=(row.get('subway_id') or '').strip(); sn=(row.get('statn_sn') or '').strip()
+                      if nm:
+                          for a in aliases(nm):sid_names[sid][a]+=1
+                      if line:sid_lines[sid][line]+=1
+                      if sn:sid_seq[sid][sn]+=1
+                  f.close()
+          service={}
+          alias_to_sids=defaultdict(set); primary_to_sids=defaultdict(set)
+          for sid in sorted(set(sid_names)|set(sid_lines)):
+              names=sid_names[sid]; lines=sid_lines[sid]
+              dom_name=names.most_common(1)[0][0] if names else ''
+              dom_line=lines.most_common(1)[0][0] if lines else ''
+              service[sid]={'sid':sid,'name':dom_name,'line':dom_line,'name_counts':dict(names.most_common(10)),'line_counts':dict(lines.most_common(10)),'statn_sn':sid_seq[sid].most_common(1)[0][0] if sid_seq[sid] else ''}
+              for a in names:alias_to_sids[a].add(sid)
+              if dom_name:primary_to_sids[dom_name].add(sid)
+
+          # Transfer endpoints supply T-money code + operator line label.
+          raw=Path('transfer.csv').read_bytes(); te=detect(raw[:262144]); rr=csv.DictReader(io.StringIO(raw.decode(te,errors='replace')))
+          fields=rr.fieldnames or []
+          sf=next(k for k in fields if k=='환승시작역'); scf=next(k for k in fields if '환승시작 코드' in k); slf=next(k for k in fields if k=='환승시작 호선')
+          ef=next(k for k in fields if k=='환승종료역'); ecf=next(k for k in fields if '환승종료역 코드' in k); elf=next(k for k in fields if k=='환승종료 호선')
+          transfer_by_code=defaultdict(list); endpoint_records=[]
+          for row in rr:
+              for side,nf,cf,lf in [('start',sf,scf,slf),('end',ef,ecf,elf)]:
+                  c=z4(row.get(cf)); nm=(row.get(nf) or '').strip(); line=(row.get(lf) or '').strip()
+                  if not c:continue
+                  rec={'side':side,'code':c,'name':nm,'line_label':line}
+                  transfer_by_code[c].append(rec); endpoint_records.append(rec)
+
+          # Infer transfer line label -> service subway_id by repeated co-occurrence at same named interchange.
+          line_candidate_presence=defaultdict(Counter); line_endpoint_n=Counter(); line_name_matched_n=Counter()
+          for ep in endpoint_records:
+              label=ep['line_label']
+              if not label:continue
+              line_endpoint_n[label]+=1
+              cands=set()
+              for a in aliases(ep['name']):cands |= alias_to_sids.get(a,set())
+              if cands:
+                  line_name_matched_n[label]+=1
+                  for lid in {service[s]['line'] for s in cands if service[s]['line']}:
+                      line_candidate_presence[label][lid]+=1
+          inferred_line_map={}
+          for label,c in line_candidate_presence.items():
+              ranked=c.most_common()
+              if not ranked:continue
+              best,n=ranked[0]; denom=line_name_matched_n[label]
+              second=ranked[1][1] if len(ranked)>1 else 0
+              share=n/denom if denom else 0
+              margin=(n-second)/denom if denom else 0
+              inferred_line_map[label]={'service_subway_id':best,'support':n,'matched_endpoints':denom,'support_share':share,'margin_over_second':margin,'runner_up':ranked[1][0] if len(ranked)>1 else None,'runner_up_support':second,'accepted':bool(denom>=3 and share>=0.70 and margin>=0.15)}
+
+          # Candidate service IDs by station aliases.
+          def name_candidates(names):
+              s=set()
+              for nm in names:
+                  for a in aliases(nm):s |= alias_to_sids.get(a,set())
+              return s
+
+          # First mapping pass: A transfer-code+line; B unique normalized name.
+          mapping={}; tier_counts=Counter()
+          for code,d in dv.items():
+              names=[d['name']]+[x['name'] for x in transfer_by_code.get(code,[])]
+              cands=name_candidates(names)
+              line_labels={x['line_label'] for x in transfer_by_code.get(code,[]) if x['line_label']}
+              accepted_lids={inferred_line_map[x]['service_subway_id'] for x in line_labels if x in inferred_line_map and inferred_line_map[x]['accepted']}
+              filtered={s for s in cands if service[s]['line'] in accepted_lids} if accepted_lids else set()
+              evidence=[]; chosen=None; tier='UNRESOLVED'
+              if len(filtered)==1:
+                  chosen=next(iter(filtered)); tier='A_TRANSFER_CODE_LINE_NAME'; evidence=['transfer_code','transfer_line','service_name','service_line']
+              elif len(cands)==1:
+                  chosen=next(iter(cands)); tier='B_UNIQUE_NAME'; evidence=['unique_normalized_name']
+              mapping[code]={'code':code,'dv_name':d['name'],'candidate_service_ids':sorted(cands),'accepted_line_labels':sorted(line_labels),'accepted_service_line_ids':sorted(accepted_lids),'chosen_service_id':chosen,'tier':tier,'evidence':evidence}
+              if chosen:tier_counts[tier]+=1
+
+          # Learn OUT_STN_NUM first-two-digit prefix -> service subway_id only from A/B resolved entries.
+          prefix_counts=defaultdict(Counter)
+          for code,m in mapping.items():
+              if not m['chosen_service_id']:continue
+              lid=service[m['chosen_service_id']]['line']
+              if lid:prefix_counts[code[:2]][lid]+=1
+          prefix_model={}
+          for p,c in prefix_counts.items():
+              total=sum(c.values()); ranked=c.most_common(); best,n=ranked[0]
+              share=n/total; second=ranked[1][1] if len(ranked)>1 else 0
+              prefix_model[p]={'service_subway_id':best,'support':n,'total_resolved':total,'share':share,'runner_up':ranked[1][0] if len(ranked)>1 else None,'accepted':bool(total>=3 and share>=0.85 and (n-second)/total>=0.20)}
+
+          # Second pass C: ambiguous name resolved by empirically learned code-prefix line identity.
+          for code,m in mapping.items():
+              if m['chosen_service_id']:continue
+              pm=prefix_model.get(code[:2])
+              if not pm or not pm['accepted']:continue
+              filtered=[s for s in m['candidate_service_ids'] if service[s]['line']==pm['service_subway_id']]
+              if len(filtered)==1:
+                  m['chosen_service_id']=filtered[0]; m['tier']='C_NAME_PREFIX_LINE'; m['evidence']=['normalized_name','empirical_out_code_prefix_line']; tier_counts[m['tier']]+=1
+
+          # Third pass D: parenthetical/alias candidate with exactly one service line/name combination after transfer label even if raw name differs.
+          # Kept separate so it can be excluded in stricter gate calculations.
+          for code,m in mapping.items():
+              if m['chosen_service_id']:continue
+              cands=m['candidate_service_ids']
+              if len(cands)>1:
+                  # majority service line for this exact DV normalized alias when one line dominates repeated candidate IDs
+                  lines=Counter(service[s]['line'] for s in cands if service[s]['line'])
+                  if lines:
+                      best,n=lines.most_common(1)[0]
+                      if n==1:
+                          filt=[s for s in cands if service[s]['line']==best]
+                          if len(filt)==1:
+                              m['chosen_service_id']=filt[0]; m['tier']='D_ALIAS_SINGLETON_LINE'; m['evidence']=['alias_name','singleton_service_line_within_alias_candidates']; tier_counts[m['tier']]+=1
+
+          def coverage(mass, strict=False):
+              total=sum(mass.values()); mapped=0; tier_mass=Counter(); unresolved=[]
+              allowed={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'} if strict else None
+              for code,c in mass.items():
+                  m=mapping.get(code)
+                  ok=bool(m and m['chosen_service_id'] and (allowed is None or m['tier'] in allowed))
+                  if ok:
+                      mapped+=c; tier_mass[m['tier']]+=c
+                  elif len(unresolved)<150:
+                      unresolved.append({'code':code,'mass':c,'dv_name':dv.get(code,{}).get('name'),'candidate_n':len(m['candidate_service_ids']) if m else 0,'tier':m['tier'] if m else None})
+              return {'mass':total,'mapped_mass':mapped,'mapped_mass_share':mapped/total if total else None,'tier_mass':dict(tier_mass),'unresolved_examples':unresolved}
+
+          ride_strict=coverage(ride,True); alight_strict=coverage(alight,True); ride_all=coverage(ride,False); alight_all=coverage(alight,False)
+
+          # Transfer endpoint coverage under final mapping.
+          ep_total=len(endpoint_records); ep_mapped=0; ep_line_consistent=0
+          for ep in endpoint_records:
+              m=mapping.get(ep['code'])
+              if m and m['chosen_service_id']:
+                  ep_mapped+=1
+                  lm=inferred_line_map.get(ep['line_label'])
+                  if lm and lm['accepted'] and service[m['chosen_service_id']]['line']==lm['service_subway_id']:ep_line_consistent+=1
+
+          canonical=[]
+          for code,m in sorted(mapping.items()):
+              if m['chosen_service_id']:
+                  s=service[m['chosen_service_id']]
+                  canonical.append({'out_stn_num':code,'dv_name':m['dv_name'],'service_statn_id':m['chosen_service_id'],'service_subway_id':s['line'],'service_name':s['name'],'service_statn_sn':s['statn_sn'],'tier':m['tier'],'evidence':m['evidence']})
+
+          result={
+            'schema':'mppd-n1-seoul-p1c-line-aware-crosswalk-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'service_source_business_date':'2026-08-29','service_snapshots_sampled':len(idx),'service_station_ids':len(service),
+            'inferred_transfer_line_to_service_line':inferred_line_map,'empirical_out_code_prefix_model':prefix_model,
+            'mapping_tier_station_counts':dict(tier_counts),'canonical_entries':canonical,
+            'ride_strict':ride_strict,'alight_strict':alight_strict,'ride_all':ride_all,'alight_all':alight_all,
+            'transfer_endpoint_mapping':{'endpoint_occurrences':ep_total,'mapped':ep_mapped,'mapped_share':ep_mapped/ep_total if ep_total else None,'line_consistent':ep_line_consistent,'line_consistent_share':ep_line_consistent/ep_total if ep_total else None},
+            'qualification':{
+              'strict_tiers':['A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'],
+              'strict_ride_mass_target':0.95,'strict_alight_mass_target':0.95,
+              'strict_ride_pass':ride_strict['mapped_mass_share']>=0.95,
+              'strict_alight_pass':alight_strict['mapped_mass_share']>=0.95,
+              'crosswalk_pass':ride_strict['mapped_mass_share']>=0.95 and alight_strict['mapped_mass_share']>=0.95,
+              't5_pass':False,'t6_observed_genealogy':False
+            }
+          }
+          Path('seoul_p1c_line_aware_crosswalk_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1C_CONCISE='+json.dumps({
+            'accepted_line_map':{k:v for k,v in inferred_line_map.items() if v['accepted']},
+            'accepted_prefix_model':{k:v for k,v in prefix_model.items() if v['accepted']},
+            'tier_station_counts':dict(tier_counts),'ride_strict':{k:v for k,v in ride_strict.items() if k!='unresolved_examples'},'alight_strict':{k:v for k,v in alight_strict.items() if k!='unresolved_examples'},'ride_all':{k:v for k,v in ride_all.items() if k!='unresolved_examples'},'alight_all':{k:v for k,v in alight_all.items() if k!='unresolved_examples'},'transfer_endpoint_mapping':result['transfer_endpoint_mapping'],'qualification':result['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1c"
+          F=seoul_p1c_line_aware_crosswalk_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P1C_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

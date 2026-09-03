@@ -1,0 +1,121 @@
+name: Seoul Public Source Probe 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-public-source-probe-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul/source_probe
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare tools and storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests beautifulsoup4
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Probe public download controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import json, re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          S = requests.Session()
+          S.headers['User-Agent'] = 'quiet-window-public-data-worker/1.0'
+          sources = {
+            'tdata_card': 'https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20006',
+            'tdata_subway_status': 'https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20007',
+            'seoul_transfer': 'https://data.seoul.go.kr/dataList/OA-22521/F/1/datasetView.do',
+            'seoul_transfer_daily': 'https://data.seoul.go.kr/dataList/OA-21221/F/1/datasetView.do',
+            'seoul_station_master': 'https://data.seoul.go.kr/dataList/OA-21232/S/1/datasetView.do',
+          }
+          out = {'state':'PROBED','target_date':'20260825','sources':{}}
+          for key,url in sources.items():
+            r=S.get(url,timeout=60,allow_redirects=True); r.raise_for_status()
+            soup=BeautifulSoup(r.text,'html.parser')
+            selects=[]
+            for s in soup.find_all('select'):
+              opts=[]
+              for o in s.find_all('option'):
+                opts.append({'value':o.get('value'),'text':' '.join(o.stripped_strings)[:300]})
+              selects.append({'id':s.get('id'),'name':s.get('name'),'class':s.get('class'),'options':opts[:500]})
+            forms=[]
+            for f in soup.find_all('form'):
+              forms.append({'id':f.get('id'),'name':f.get('name'),'method':f.get('method'),'action':urljoin(r.url,f.get('action') or '')})
+            controls=[]
+            for el in soup.find_all(['a','button','input']):
+              text=' '.join(el.stripped_strings)
+              val=el.get('value') or ''
+              hay=(text+' '+val+' '+str(el.get('onclick') or '')+' '+str(el.get('href') or ''))
+              if any(x in hay.lower() for x in ['download','다운로드','내려받기','20260825','kscc_dx_trnsf_path_sum']):
+                controls.append({
+                  'tag':el.name,'text':text[:300],'value':val[:300],
+                  'id':el.get('id'),'name':el.get('name'),
+                  'href':urljoin(r.url,el.get('href')) if el.get('href') else None,
+                  'onclick':(el.get('onclick') or '')[:1000],
+                })
+            script_hits=[]
+            for sc in soup.find_all('script'):
+              txt=sc.string or sc.get_text(' ',strip=False) or ''
+              if any(x in txt.lower() for x in ['download','다운로드','filedown','trafficdataviewfile']):
+                urls=sorted(set(re.findall(r"[A-Za-z0-9_./?-]+\.do(?:\?[A-Za-z0-9_=&%.-]+)?",txt)))
+                script_hits.append({'src':urljoin(r.url,sc.get('src')) if sc.get('src') else None,'do_urls':urls[:100],'snippet':re.sub(r'\s+',' ',txt)[:5000]})
+            links=[]
+            for a in soup.find_all('a',href=True):
+              text=' '.join(a.stripped_strings)
+              if ('20260825' in text or '환승' in text or '역사마스터' in text or 'csv' in text.lower() or 'zip' in text.lower()):
+                links.append({'text':text[:500],'href':urljoin(r.url,a['href']),'onclick':(a.get('onclick') or '')[:1000]})
+            out['sources'][key]={
+              'requested_url':url,'final_url':r.url,'status_code':r.status_code,
+              'content_type':r.headers.get('content-type'),'bytes':len(r.content),
+              'forms':forms,'selects':selects,'controls':controls[:200],
+              'script_hits':script_hits[:50],'links':links[:300],
+            }
+          open('seoul_public_source_probe_20260903.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          # Only concise structural summary to logs; no downloaded data rows.
+          print(json.dumps({k:{'selects':len(v['selects']),'controls':len(v['controls']),'links':len(v['links']),'script_hits':len(v['script_hits'])} for k,v in out['sources'].items()},ensure_ascii=False))
+          PY
+
+      - name: Store probe
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/seoul_public_source_probe_20260903.json"
+          rclone copyto "$F" "$REMOTE_NAME:$ROOT_DRIVE/seoul_public_source_probe_20260903.json" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/seoul_public_source_probe_20260903.json" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          echo "probe_bytes=$L"
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

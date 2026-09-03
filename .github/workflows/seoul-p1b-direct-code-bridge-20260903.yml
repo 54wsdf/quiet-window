@@ -1,0 +1,197 @@
+name: Seoul P1B Direct Code Bridge 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1b-direct-code-bridge-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p1b"; cd "$RUNNER_TEMP/seoul-p1b"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260902/BMS_20260902.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" transfer.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Test direct service and transfer station-code contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1b"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, re, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          def dec(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(65536); f.close(); e=dec(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
+          def hdr(s): return unicodedata.normalize('NFKC',s.replace('\ufeff','')).strip().lower()
+          def name(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip()
+              s=re.sub(r'\s+','',s)
+              s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def digits(s): return ''.join(ch for ch in str(s or '') if ch.isdigit())
+          def suffix4(s):
+              d=digits(s)
+              return d[-4:].zfill(4) if d else ''
+          def code4(s):
+              d=digits(s)
+              if not d:return ''
+              return d[-4:].zfill(4) if len(d)>=4 else d.zfill(4)
+
+          # DV canonical passenger station dictionary.
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f,e=zr(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f)
+              dv={}; name_to_out=defaultdict(set)
+              for row in r:
+                  out=(row.get('OUT_STN_NUM') or '').strip().zfill(4)
+                  rec={'out_stn_num':out,'serial_num':(row.get('SERIAL_NUM') or '').strip(),'name':(row.get('STN_KR_NM') or '').strip(),'eng':(row.get('STN_ENG_NM') or '').strip()}
+                  if out:dv[out]=rec
+                  if rec['name']:name_to_out[name(rec['name'])].add(out)
+              f.close()
+              f,e=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              ride=Counter(); alight=Counter(); rail_rows=0
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  rail_rows+=1
+                  a=(row.get('RIDE_BSST_ID') or '').strip(); b=(row.get('ALGH_BSST_ID') or '').strip()
+                  if a:ride[a.zfill(4)]+=1
+                  if b:alight[b.zfill(4)]+=1
+              f.close()
+
+          # Service universe from 192 evenly spaced snapshots. IDs are ASCII-stable even when Korean text encoding differs.
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              idx=sorted(set([0,len(infos)-1]+[round(i*(len(infos)-1)/191) for i in range(192)]))
+              sid_meta=defaultdict(lambda:{'names':set(),'lines':set(),'suffix4':''})
+              for i in idx:
+                  f,e=zr(z,infos[i].filename); rr=csv.DictReader(f); rr.fieldnames=[hdr(x) for x in (rr.fieldnames or [])]
+                  for row in rr:
+                      sid=(row.get('statn_id') or '').strip(); nm=(row.get('statn_nm') or '').strip(); line=(row.get('subway_id') or row.get('subway_cd') or '').strip()
+                      if not sid:continue
+                      x=sid_meta[sid]; x['suffix4']=suffix4(sid)
+                      if nm:x['names'].add(name(nm))
+                      if line:x['lines'].add(line)
+                  f.close()
+          suffix_to_service=defaultdict(set)
+          for sid,m in sid_meta.items():
+              if m['suffix4']:suffix_to_service[m['suffix4']].add(sid)
+
+          # Direct suffix bridge statistics with optional name consistency.
+          def bridge(mass):
+              mapped=0; unamb=0; name_consistent=0; ambiguous=0; missing=[]; entries=[]
+              for out,c in mass.items():
+                  sids=suffix_to_service.get(out,set())
+                  if sids:
+                      mapped+=c
+                      if len(sids)==1:unamb+=c
+                      else:ambiguous+=c
+                      dvn=name(dv.get(out,{}).get('name',''))
+                      same=[sid for sid in sids if dvn and dvn in sid_meta[sid]['names']]
+                      if same:name_consistent+=c
+                      entries.append({'out_stn_num':out,'mass':c,'dv_name':dv.get(out,{}).get('name'),'service_ids':sorted(sids),'service_suffix_unique':len(sids)==1,'name_consistent_service_ids':sorted(same)})
+                  elif len(missing)<100:
+                      missing.append({'out_stn_num':out,'mass':c,'dv_name':dv.get(out,{}).get('name')})
+              total=sum(mass.values())
+              return {'station_ids':len(mass),'mapped_station_ids':sum(1 for k in mass if suffix_to_service.get(k)),'mass':total,'mapped_mass':mapped,'mapped_mass_share':mapped/total if total else None,'unambiguous_mass_share':unamb/total if total else None,'ambiguous_mass_share':ambiguous/total if total else None,'name_consistent_mass_share':name_consistent/total if total else None,'missing_examples':missing,'entries':entries}
+          ride_bridge=bridge(ride); alight_bridge=bridge(alight)
+
+          # Transfer code contract.
+          raw=Path('transfer.csv').read_bytes(); te=dec(raw[:65536]); rr=csv.DictReader(io.StringIO(raw.decode(te,errors='replace')))
+          fields=rr.fieldnames or []
+          start_code_field=next(k for k in fields if '환승시작 코드' in k)
+          end_code_field=next(k for k in fields if '환승종료역 코드' in k)
+          start_name_field=next(k for k in fields if k=='환승시작역')
+          end_name_field=next(k for k in fields if k=='환승종료역')
+          start_line_field=next(k for k in fields if k=='환승시작 호선')
+          end_line_field=next(k for k in fields if k=='환승종료 호선')
+          trows=[]; endpoint=Counter(); endpoint_dv=0; endpoint_service=0; endpoint_both=0; name_agree=0
+          for row in rr:
+              for side,cf,nf,lf in [('start',start_code_field,start_name_field,start_line_field),('end',end_code_field,end_name_field,end_line_field)]:
+                  c=code4(row.get(cf)); nm=(row.get(nf) or '').strip(); ln=(row.get(lf) or '').strip()
+                  if not c:continue
+                  endpoint[c]+=1
+                  dvr=dv.get(c); sids=suffix_to_service.get(c,set())
+                  if dvr:endpoint_dv+=1
+                  if sids:endpoint_service+=1
+                  if dvr and sids:endpoint_both+=1
+                  if dvr and name(dvr['name'])==name(nm):name_agree+=1
+                  trows.append({'side':side,'code4':c,'raw_code':(row.get(cf) or '').strip(),'transfer_name':nm,'transfer_line':ln,'dv_name':dvr['name'] if dvr else None,'service_ids':sorted(sids)})
+          total_end=sum(endpoint.values())
+
+          # Build high-confidence canonical line-station mapping candidates.
+          high=[]; multi=[]
+          for out,dvr in sorted(dv.items()):
+              sids=suffix_to_service.get(out,set())
+              same=[sid for sid in sids if name(dvr['name']) and name(dvr['name']) in sid_meta[sid]['names']]
+              if len(same)==1:
+                  sid=same[0]; high.append({'canonical_station_line_key':out,'out_stn_num':out,'dv_name':dvr['name'],'service_statn_id':sid,'service_lines':sorted(sid_meta[sid]['lines']),'evidence':'STATN_ID_SUFFIX4_PLUS_NORMALIZED_NAME'})
+              elif len(sids)==1:
+                  sid=next(iter(sids)); high.append({'canonical_station_line_key':out,'out_stn_num':out,'dv_name':dvr['name'],'service_statn_id':sid,'service_lines':sorted(sid_meta[sid]['lines']),'evidence':'UNIQUE_STATN_ID_SUFFIX4_NAME_NOT_CONFIRMED'})
+              elif sids:
+                  multi.append({'out_stn_num':out,'dv_name':dvr['name'],'service_ids':sorted(sids),'name_consistent_ids':sorted(same)})
+
+          out={
+            'schema':'mppd-n1-seoul-p1b-direct-code-bridge-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'service_sampling':{'snapshots':len(idx),'service_station_ids':len(sid_meta),'suffix4_keys':len(suffix_to_service)},
+            'ride_bridge':{k:v for k,v in ride_bridge.items() if k!='entries'},'alight_bridge':{k:v for k,v in alight_bridge.items() if k!='entries'},
+            'transfer_code_bridge':{'rows':len(trows)//2,'endpoint_occurrences':total_end,'unique_endpoint_codes':len(endpoint),'endpoint_dv_share':endpoint_dv/total_end if total_end else None,'endpoint_service_share':endpoint_service/total_end if total_end else None,'endpoint_three_way_share':endpoint_both/total_end if total_end else None,'endpoint_name_agreement_with_dv_share':name_agree/total_end if total_end else None},
+            'canonical_high_confidence_entries':high,'ambiguous_entries':multi,
+            'qualification':{'direct_code_bridge_candidate':True,'high_confidence_station_line_entries':len(high),'ambiguous_station_line_entries':len(multi),'ready_for_adapter':ride_bridge['mapped_mass_share']>=0.90 and alight_bridge['mapped_mass_share']>=0.90 and ride_bridge['unambiguous_mass_share']>=0.90 and alight_bridge['unambiguous_mass_share']>=0.90,'t5_pass':False,'t6_observed_genealogy':False}
+          }
+          Path('seoul_p1b_direct_code_bridge_20260903.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1B_CONCISE='+json.dumps({'service_station_ids':len(sid_meta),'suffix4_keys':len(suffix_to_service),'ride_bridge':out['ride_bridge'],'alight_bridge':out['alight_bridge'],'transfer_code_bridge':out['transfer_code_bridge'],'high_confidence_entries':len(high),'ambiguous_entries':len(multi),'qualification':out['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1b"
+          F=seoul_p1b_direct_code_bridge_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P1B_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

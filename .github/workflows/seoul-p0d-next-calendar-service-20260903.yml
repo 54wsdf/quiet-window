@@ -1,0 +1,81 @@
+name: Seoul P0D Next Calendar Service 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p0d-next-calendar-service-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p0d"; cd "$RUNNER_TEMP/seoul-p0d"
+
+      - name: Download and validate BMS 20260831
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0d"
+          FILE_ID=15465
+          F=BMS_20260831.zip
+          LANDING='https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20007'
+          curl -fL --retry 10 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+            -A 'quiet-window-public-data-worker/1.0' -e "$LANDING" "https://t-data.seoul.go.kr/dataprovide/download.do?id=$FILE_ID" -o "$F"
+          python - <<'PY'
+          import zipfile,re,json,hashlib,os
+          from collections import Counter
+          from datetime import datetime,timezone
+          f='BMS_20260831.zip'; pat=re.compile(r'subarr_(\d{12})')
+          with zipfile.ZipFile(f) as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              stamps=[pat.search(x.filename).group(1) for x in infos if pat.search(x.filename)]
+              if not infos: raise RuntimeError('empty archive')
+          h=hashlib.sha256()
+          with open(f,'rb') as r:
+              for b in iter(lambda:r.read(8*1024*1024),b''):h.update(b)
+          d={'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP','dataset_id':'KR_SEOUL_TDATA_BMS_REFERENCE_20260831','public_download_id':'15465','provider_package_label_date':'2026-08-31','expected_content_date':'2026-08-30','retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'original_filename':f,'bytes':os.path.getsize(f),'sha256':h.hexdigest(),'archive_members':len(infos),'member_stamp_min':min(stamps),'member_stamp_max':max(stamps),'member_date_counts':dict(Counter(s[:6] for s in stamps)),'github_run_id':os.getenv('GITHUB_RUN_ID')}
+          if d['member_date_counts'] != {'260830':len(infos)}: raise RuntimeError('unexpected content date distribution')
+          open(f+'.manifest.json','w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False,indent=2))
+          print('P0D='+json.dumps({'bytes':d['bytes'],'sha256':d['sha256'],'members':d['archive_members'],'min':d['member_stamp_min'],'max':d['member_stamp_max'],'dates':d['member_date_counts']},ensure_ascii=False))
+          PY
+
+      - name: Store and verify
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0d"
+          copyv(){ local s="$1" d="$2"; rclone copyto "$s" "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20; local l r; l="$(stat -c '%s' "$s")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$l" = "$r"; }
+          copyv BMS_20260831.zip service/20260831/BMS_20260831.zip
+          copyv BMS_20260831.zip.manifest.json 99_manifests/BMS_20260831.zip.manifest.json
+          echo SEOUL_P0D_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

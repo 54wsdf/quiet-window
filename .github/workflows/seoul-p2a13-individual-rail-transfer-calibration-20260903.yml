@@ -1,0 +1,234 @@
+name: Seoul P2A13 Individual Rail Transfer Calibration 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a13-individual-rail-transfer-calibration-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq sqlite3
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a13"; cd "$RUNNER_TEMP/p2a13"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p2a9_full_prefix_line_model_20260903.json" p2a9.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Reconstruct strict individual rail transfer gaps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a13"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv,io,json,math,re,sqlite3,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          RID4=re.compile(r'^\d{4}$')
+          SERVICE_TO_STATIC={'1001':'1','1002':'2','1003':'3','1004':'4','1005':'5','1006':'6','1007':'7','1008':'8','1009':'9','1063':'경의선','1065':'공항철도','1067':'경춘선','1077':'신분당선','1092':'우이신설경전철','1094':'신림선'}
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def nd(v):
+              s=''.join(x for x in str(v or '') if x.isdigit())
+              return s if len(s)==14 and s.startswith('20') else None
+          def ts(v):
+              if not v:return None
+              try:return datetime.strptime(v,'%Y%m%d%H%M%S')
+              except:return None
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s);s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def duration(v):
+              s=str(v or '').strip();m=re.fullmatch(r'(\d+):(\d{1,2})',s)
+              if m:return int(m.group(1))*60+int(m.group(2))
+              try:return float(s)
+              except:return None
+          def q(vals,p):
+              if not vals:return None
+              vals=sorted(vals);i=min(len(vals)-1,max(0,round((len(vals)-1)*p)));return vals[i]
+          def wq(pairs,p):
+              a=sorted((float(v),float(w)) for v,w in pairs if v is not None and w>0 and math.isfinite(float(v)))
+              if not a:return None
+              target=sum(w for _,w in a)*p;acc=0
+              for v,w in a:
+                  acc+=w
+                  if acc>=target:return v
+              return a[-1][0]
+
+          p2a9=json.loads(Path('p2a9.json').read_text(encoding='utf-8'))
+          prefix_service={p:r['service_subway_id'] for p,r in p2a9['accepted_prefix_model'].items()}
+
+          idname={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip();nm=(row.get('STN_KR_NM') or '').strip()
+                  if sid:idname[sid]=nm
+              f.close()
+
+          # Static physical transfer constraints and exact endpoint line evidence.
+          raw=Path('directional.csv').read_bytes();enc=detect(raw[:262144]);r=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace')))
+          static=defaultdict(list);code_votes=defaultdict(Counter)
+          for row in r:
+              a=(row.get('환승시작 코드') or '').strip();b=(row.get('환승종료역 코드') or '').strip();an=(row.get('환승시작역') or '').strip();bn=(row.get('환승종료역') or '').strip();fl=(row.get('환승시작 호선') or '').strip();tl=(row.get('환승종료 호선') or '').strip();sec=duration(row.get('소요시간'))
+              if an and bn and fl and tl and sec is not None:static[(nn(an),nn(bn),fl,tl)].append(float(sec))
+              for code,name,line in ((a,an,fl),(b,bn,tl)):
+                  if not (RID4.fullmatch(code) and line):continue
+                  dvn=idname.get(code)
+                  if dvn and nn(dvn)!=nn(name):continue
+                  code_votes[code][line]+=1
+
+          exact_line={}
+          for code,c in code_votes.items():
+              total=sum(c.values());rank=c.most_common();best,n=rank[0];second=rank[1][1] if len(rank)>1 else 0
+              if n/total>=0.80 and (n-second)/total>=0.40:exact_line[code]=best
+
+          def line_of(code):
+              if code in exact_line:return exact_line[code],'EXACT_STATIC_CODE_NAME'
+              sid=prefix_service.get(code[:2]);lab=SERVICE_TO_STATIC.get(sid) if sid else None
+              if lab:return lab,'P1C_PREFIX_SERVICE_LINE'
+              return None,None
+
+          db=sqlite3.connect('legs.sqlite');db.execute('PRAGMA journal_mode=OFF');db.execute('PRAGMA synchronous=OFF');db.execute('PRAGMA temp_store=FILE')
+          db.execute('CREATE TABLE legs(card TEXT,trnc TEXT,seq INTEGER,serial INTEGER,mode TEXT,ride_dt TEXT,ride_id TEXT,algh_dt TEXT,algh_id TEXT)')
+          batch=[];all_rows=inserted=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  all_rows+=1;card=(row.get('TRCR_ID') or '').strip();trnc=(row.get('TRNC_ID') or '').strip()
+                  if not card or not trnc:continue
+                  try:seq=int((row.get('TRTR_FCNT') or '').strip())
+                  except:seq=-1
+                  try:serial=int((row.get('SERIAL_NUM') or '0').strip() or 0)
+                  except:serial=0
+                  batch.append((card,trnc,seq,serial,(row.get('TRNS_MNS_CD') or '').strip(),nd(row.get('RIDE_DTM')),(row.get('RIDE_BSST_ID') or '').strip(),nd(row.get('ALGH_DTM')),(row.get('ALGH_BSST_ID') or '').strip()));inserted+=1
+                  if len(batch)>=50000:db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch);batch.clear()
+              if batch:db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch)
+              f.close()
+          db.commit();db.execute('CREATE INDEX ix ON legs(card,trnc,ride_dt,serial)');db.commit()
+
+          # Aggregate only qualified strict seq+1 rail-to-rail same-station-name transitions.
+          agg=defaultdict(lambda:{'n':0,'gaps':[],'evidence':Counter(),'raw_pairs':Counter()})
+          total_strict_rr=0;same_name_rr=0;line_resolved=0;crossline=0;valid_gap=0;negative=0
+          cur=None;gr=[]
+          def process(gr):
+              nonlocal_holder=None
+              if not gr:return
+              clean=[];seen=set()
+              for z in gr:
+                  sig=z[2:]
+                  if sig in seen:continue
+                  seen.add(sig);clean.append(z)
+              clean.sort(key=lambda z:((z[5] or ''),z[3]))
+              ep=[];prev=None
+              episodes=[]
+              for z in clean:
+                  if prev is None:ep=[z];prev=z;continue
+                  t0=ts(prev[5]);t1=ts(z[5]);reset=z[2]<=prev[2];back=bool(t0 and t1 and t1<t0);big=bool(t0 and t1 and (t1-t0).total_seconds()>21600)
+                  if reset or back or big:episodes.append(ep);ep=[z]
+                  else:ep.append(z)
+                  prev=z
+              if ep:episodes.append(ep)
+              for ep in episodes:
+                  for a,b in zip(ep,ep[1:]):
+                      if b[2]-a[2]!=1:continue
+                      if a[4] not in RAIL or b[4] not in RAIL:continue
+                      stats['total_strict_rr']+=1
+                      na=idname.get(a[8],'');nb=idname.get(b[6],'')
+                      if not na or not nb or nn(na)!=nn(nb):continue
+                      stats['same_name_rr']+=1
+                      fl,fe=line_of(a[8]);tl,te=line_of(b[6])
+                      if not fl or not tl:continue
+                      stats['line_resolved']+=1
+                      if fl==tl:continue
+                      stats['crossline']+=1
+                      ta=ts(a[7]);tb=ts(b[5])
+                      if not ta or not tb:continue
+                      gap=(tb-ta).total_seconds();stats['valid_gap']+=1
+                      if gap<0:stats['negative']+=1;continue
+                      if gap>3600:continue
+                      k=(nn(na),fl,tl);x=agg[k];x['n']+=1;x['gaps'].append(gap);x['evidence'][fe]+=0.5;x['evidence'][te]+=0.5;x['raw_pairs'][f'{a[8]}->{b[6]}']+=1
+
+          stats=Counter()
+          sql="SELECT card,trnc,seq,serial,mode,ride_dt,ride_id,algh_dt,algh_id FROM legs ORDER BY card,trnc,COALESCE(ride_dt,''),serial"
+          for row in db.execute(sql):
+              key=(row[0],row[1])
+              if cur is None:cur=key
+              if key!=cur:process(gr);gr=[];cur=key
+              gr.append(row)
+          process(gr)
+
+          recs=[];matched_n=0;ge_n=0;gap_pairs=[];short_pairs=[];ex_pairs=[];ratio_pairs=[]
+          for (st,fl,tl),x in agg.items():
+              gaps=x['gaps'];secs=static.get((st,st,fl,tl),[]);mn=min(secs) if secs else None
+              rec={'station_norm':st,'from_line':fl,'to_line':tl,'individual_transition_count':x['n'],'gap_p10_sec':q(gaps,.1),'gap_p50_sec':q(gaps,.5),'gap_p90_sec':q(gaps,.9),'gap_p99_sec':q(gaps,.99),'gap_mean_sec':sum(gaps)/len(gaps) if gaps else None,'line_identity_evidence':dict(x['evidence']),'top_raw_station_id_pairs':x['raw_pairs'].most_common(8),'static_candidate_rows':len(secs),'shortest_transfer_sec':mn,'static_duration_values_sec':sorted(set(secs))}
+              if mn is not None:
+                  rec['median_gap_minus_shortest_sec']=rec['gap_p50_sec']-mn;rec['median_gap_over_shortest_ratio']=rec['gap_p50_sec']/mn if mn>0 else None;matched_n+=x['n'];ge_n+=sum(g>=mn for g in gaps);gap_pairs.append((rec['gap_p50_sec'],x['n']));short_pairs.append((mn,x['n']));ex_pairs.append((rec['gap_p50_sec']-mn,x['n']))
+                  if mn>0:ratio_pairs.append((rec['gap_p50_sec']/mn,x['n']))
+              recs.append(rec)
+          recs.sort(key=lambda x:(-x['individual_transition_count'],x['station_norm'],x['from_line'],x['to_line']));matched=[x for x in recs if x['shortest_transfer_sec'] is not None]
+
+          result={'schema':'mppd-n1-seoul-p2a13-individual-rail-transfer-calibration-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'source_business_date':'2026-08-29','privacy_boundary':'No card/transfer-process identifiers or passenger rows are emitted. Only aggregate station-line-pair distributions are stored.','selection':{'strict_transition':'same TRCR_ID+TRNC_ID episode, adjacent TRTR_FCNT increment +1','rail':'both legs in official rail mode codes','same_interchange':'alight station name of prior leg equals ride station name of next leg after normalization','line_identity':'exact static endpoint code/name if qualified, otherwise P1C accepted prefix->service->static line label','gap':'next leg RIDE_DTM minus previous leg ALGH_DTM; minute-quantized; only nonnegative <=3600s retained'},'coverage':{'strict_rr_transitions':stats['total_strict_rr'],'same_station_name_rr':stats['same_name_rr'],'same_station_name_share':stats['same_name_rr']/stats['total_strict_rr'] if stats['total_strict_rr'] else None,'line_resolved_same_station':stats['line_resolved'],'crossline_same_station':stats['crossline'],'valid_gap_rows':stats['valid_gap'],'negative_gap_rows':stats['negative'],'station_line_pair_groups':len(agg),'matched_static_station_line_pairs':len(matched),'matched_individual_transition_count':matched_n,'matched_share_of_crossline_gap_rows':matched_n/sum(x['n'] for x in agg.values()) if agg else None,'individual_gaps_ge_shortest_share':ge_n/matched_n if matched_n else None},'calibration':{'individual_gap_median_p50_weighted':wq(gap_pairs,.5),'individual_gap_median_p90_weighted':wq(gap_pairs,.9),'shortest_sec_p50_weighted':wq(short_pairs,.5),'shortest_sec_p90_weighted':wq(short_pairs,.9),'median_excess_sec_p50_weighted':wq(ex_pairs,.5),'median_excess_sec_p90_weighted':wq(ex_pairs,.9),'median_ratio_p50_weighted':wq(ratio_pairs,.5),'median_ratio_p90_weighted':wq(ratio_pairs,.9)},'top_matched':matched[:200],'top_unmatched':[x for x in recs if x['shortest_transfer_sec'] is None][:100],'decision':None,'evidence_boundary':['This is observed recorded card-transfer-process timing at minute resolution, not exact walking time.','It covers only transfer processes explicitly represented by consecutive card legs; ordinary paid-area interchanges without separate card legs remain outside this observation layer.','Line identity is cross-source qualified, not directly stored on the DX rail transaction.','No train ancestry is observed.']}
+          share=result['coverage']['matched_share_of_crossline_gap_rows'] or 0
+          if matched_n>=1000 and share>=0.50:result['decision']='INDIVIDUAL_RECORDED_TRANSFER_KERNEL_USABLE_FOR_PROCESS_SUPPORTED_MOVEMENTS'
+          elif matched_n>=200:result['decision']='INDIVIDUAL_RECORDED_TRANSFER_KERNEL_PARTIAL_SUPPORT'
+          else:result['decision']='INDIVIDUAL_RECORDED_TRANSFER_KERNEL_TOO_SPARSE'
+          Path('seoul_p2a13_individual_rail_transfer_calibration_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('seoul_p2a13_station_line_transfer_kernel_20260903.csv','w',encoding='utf-8',newline='') as f:
+              cols=['station_norm','from_line','to_line','individual_transition_count','gap_p10_sec','gap_p50_sec','gap_p90_sec','gap_p99_sec','gap_mean_sec','shortest_transfer_sec','median_gap_minus_shortest_sec','median_gap_over_shortest_ratio'];w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
+              for x in recs:w.writerow({k:x.get(k) for k in cols})
+          print('P2A13_CONCISE='+json.dumps({'coverage':result['coverage'],'calibration':result['calibration'],'decision':result['decision'],'top_matched':matched[:20]},ensure_ascii=False))
+          db.close()
+          PY
+
+      - name: Store outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a13"
+          for F in seoul_p2a13_individual_rail_transfer_calibration_20260903.json seoul_p2a13_station_line_transfer_kernel_20260903.csv; do
+            D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F";rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          done
+          echo SEOUL_P2A13_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

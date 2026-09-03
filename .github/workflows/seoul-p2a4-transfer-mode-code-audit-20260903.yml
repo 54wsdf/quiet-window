@@ -1,0 +1,87 @@
+name: Seoul P2A4 Transfer Mode Code Audit 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a4-transfer-mode-code-audit-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore observed transfer data
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a4"; cd "$RUNNER_TEMP/p2a4"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Audit mode codes and ID families
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a4"
+          python - <<'PY'
+          import csv,io,json,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          with zipfile.ZipFile('observed.zip') as z:
+              member=[x for x in z.namelist() if x.lower().endswith('.csv')][0];f=zr(z,member);r=csv.DictReader(f)
+              from_modes=Counter();to_modes=Counter();pairs=Counter();from_id_by_mode=defaultdict(set);to_id_by_mode=defaultdict(set);count_by_pair=Counter();rows=0
+              for row in r:
+                  rows+=1;fm=(row.get('하차_교통수단_코드') or '').strip();tm=(row.get('승차_교통수단_코드') or '').strip();a=(row.get('하차_정류장/역사_ID') or '').strip();b=(row.get('승차_정류장/역사_ID') or '').strip()
+                  try:c=float((row.get('환승_수_합') or '0').replace(',',''))
+                  except:c=0.0
+                  from_modes[fm]+=1;to_modes[tm]+=1;pairs[(fm,tm)]+=1;count_by_pair[(fm,tm)]+=c
+                  if a and len(from_id_by_mode[fm])<10000:from_id_by_mode[fm].add(a)
+                  if b and len(to_id_by_mode[tm])<10000:to_id_by_mode[tm].add(b)
+              f.close()
+          result={'schema':'mppd-n1-seoul-p2a4-transfer-mode-code-audit-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'rows':rows,'from_mode_row_counts':dict(from_modes),'to_mode_row_counts':dict(to_modes),'mode_pair_row_counts':{f'{a}->{b}':n for (a,b),n in pairs.most_common()},'mode_pair_transfer_count_sums':{f'{a}->{b}':n for (a,b),n in count_by_pair.most_common()},'from_unique_ids_by_mode_capped':{k:len(v) for k,v in from_id_by_mode.items()},'to_unique_ids_by_mode_capped':{k:len(v) for k,v in to_id_by_mode.items()},'interpretation_pending':'These mode codes are dataset-local until mapped by provider documentation or a consistent station-ID/code relationship; do not reuse DX_CARD TRNS_MNS_CD semantics by numeric coincidence.'}
+          Path('seoul_p2a4_transfer_mode_code_audit_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P2A4_CONCISE='+json.dumps(result,ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a4"
+          F=seoul_p2a4_transfer_mode_code_audit_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P2A4_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

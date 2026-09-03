@@ -1,0 +1,213 @@
+name: Seoul P3B4 Downstream Opportunity-Wave Morphology 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b4-downstream-wave-morphology-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b4"; cd "$RUNNER_TEMP/p3b4"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Evaluate same-cohort downstream morphology response
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b4"
+          python - <<'PY'
+          import csv,io,json,math,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          IN_LINE='1008';OUT_LINE='1002';IN_TRANSFER='1008000814';OUT_TRANSFER='1002000216'
+          ENTRY_GUARD=60; BASE_TRANSFER=0; PHYSICAL_TRANSFER=158
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def minute_index(t):return t.hour*60+t.minute
+          def minute_label(i):return f'{(i//60)%24:02d}:{i%60:02d}'
+          def hist(times):
+              c=Counter(minute_index(t) for t in times)
+              return c
+          def tv(a,b):
+              keys=set(a)|set(b);sa=sum(a.values());sb=sum(b.values())
+              if not sa or not sb:return None
+              return .5*sum(abs(a.get(k,0)/sa-b.get(k,0)/sb) for k in keys)
+          def peak(c):
+              if not c:return None
+              k,maxv=max(c.items(),key=lambda kv:(kv[1],-kv[0]));return {'minute':minute_label(k),'count':maxv,'share':maxv/sum(c.values())}
+          def sliding(c,width=5):
+              if not c:return None
+              lo=min(c);hi=max(c);best=None
+              for s in range(lo,hi+1):
+                  n=sum(c.get(x,0) for x in range(s,s+width))
+                  if best is None or n>best[1]:best=(s,n)
+              return {'start_minute':minute_label(best[0]),'count':best[1],'share':best[1]/sum(c.values()),'width_min':width}
+          def entropy(c):
+              n=sum(c.values())
+              if n<=1:return 0.0
+              ps=[v/n for v in c.values() if v>0]
+              h=-sum(p*math.log(p) for p in ps)
+              return h/math.log(len(ps)) if len(ps)>1 else 0.0
+          def local_peaks(c):
+              if not c:return 0
+              lo=min(c);hi=max(c);sm={i:c.get(i-1,0)+c.get(i,0)+c.get(i+1,0) for i in range(lo,hi+1)}
+              return sum(1 for i in range(lo+1,hi) if sm[i]>=5 and sm[i]>sm[i-1] and sm[i]>=sm[i+1])
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          service_name={x['service_statn_id']:x.get('dv_name') for x in p1c['canonical_entries'] if x.get('service_statn_id') and x.get('dv_name')}
+
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+          inbound=defaultdict(list);outbound=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for ta,td in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          for oa,od in evs:
+                              if od<ta and 0<(ta-od).total_seconds()<=7200:
+                                  inbound[os].append((od,ta,tr));break
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for ta,td in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          for da,dd in evs:
+                              if da>td and 0<(da-td).total_seconds()<=7200:
+                                  outbound[ds].append((td,da,tr));break
+          for st in inbound:inbound[st]=sorted(set(inbound[st]))
+          for st in outbound:outbound[st]=sorted(set(outbound[st]))
+
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a['service_subway_id']!=IN_LINE or b['service_subway_id']!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and (t0.hour==7 or (t0.hour==8 and t0.minute<30))):continue
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  os=a['service_statn_id'];ds=b['service_statn_id']
+                  if os in inbound and ds in outbound:passengers.append((t0,t1,os,ds))
+              f.close()
+
+          def select(p,tv):
+              t0,t1,os,ds=p
+              ins=[x for x in inbound[os] if x[0]>=t0+timedelta(seconds=ENTRY_GUARD)]
+              if not ins:return None
+              idep,iarr,itr=min(ins,key=lambda x:(x[1],x[0],x[2]))
+              outs=[x for x in outbound[ds] if x[0]>=iarr+timedelta(seconds=tv)]
+              if not outs:return None
+              odep,darr,otr=min(outs,key=lambda x:(x[1],x[0],x[2]))
+              return {'iarr':iarr,'odep':odep,'darr':darr,'otrain':otr}
+
+          by_dest=defaultdict(list);overall=[]
+          for p in passengers:
+              b=select(p,BASE_TRANSFER);a=select(p,PHYSICAL_TRANSFER)
+              if b is None or a is None:continue
+              rec={'dest':p[3],'base':b,'alt':a,'added':(a['darr']-b['darr']).total_seconds(),'changed':(b['otrain'],b['odep'])!=(a['otrain'],a['odep'])}
+              by_dest[p[3]].append(rec);overall.append(rec)
+
+          def profile(rows):
+              bh=hist([r['base']['darr'] for r in rows]);ah=hist([r['alt']['darr'] for r in rows]);adds=[r['added'] for r in rows]
+              bp=peak(bh);ap=peak(ah);bs=sliding(bh);ass=sliding(ah)
+              return {
+                'rows':len(rows),'changed_service_rows':sum(r['changed'] for r in rows),'changed_service_share':sum(r['changed'] for r in rows)/len(rows) if rows else None,
+                'added_arrival_sec':summ(adds),'minute_distribution_tv':tv(bh,ah),
+                'baseline_peak':bp,'physical_transfer_peak':ap,
+                'peak_clock_shift_min':(minute_index(datetime.strptime(ap['minute'],'%H:%M'))-minute_index(datetime.strptime(bp['minute'],'%H:%M'))) if bp and ap else None,
+                'baseline_sliding_5min':bs,'physical_transfer_sliding_5min':ass,'sliding_5min_share_change':ass['share']-bs['share'] if bs and ass else None,
+                'baseline_normalized_entropy':entropy(bh),'physical_transfer_normalized_entropy':entropy(ah),'entropy_change':entropy(ah)-entropy(bh),
+                'baseline_smoothed_local_peak_count':local_peaks(bh),'physical_transfer_smoothed_local_peak_count':local_peaks(ah),
+                'baseline_histogram':{minute_label(k):v for k,v in sorted(bh.items())},'physical_transfer_histogram':{minute_label(k):v for k,v in sorted(ah.items())}
+              }
+
+          dest_profiles=[]
+          for ds,rows in by_dest.items():
+              if len(rows)<50:continue
+              x=profile(rows);x['destination_service_station_id']=ds;x['destination_name']=service_name.get(ds);dest_profiles.append(x)
+          dest_profiles.sort(key=lambda x:x['rows'],reverse=True)
+          overall_profile=profile(overall)
+          robust=[x for x in dest_profiles if x['rows']>=100]
+          tvs=[x['minute_distribution_tv'] for x in robust if x['minute_distribution_tv'] is not None]
+          shifts=[x['peak_clock_shift_min'] for x in robust if x['peak_clock_shift_min'] is not None]
+          decision='TRANSFER_GATE_RESHAPES_DOWNSTREAM_MINUTE_OPPORTUNITY_WAVES' if robust and statistics.median(tvs)>=0.15 else ('TRANSFER_GATE_HAS_BOUNDED_DOWNSTREAM_MORPHOLOGY_EFFECT' if robust and statistics.median(tvs)>=0.05 else 'NO_STRONG_DOWNSTREAM_MORPHOLOGY_EFFECT_IN_BOUNDED_CASE')
+          result={'schema':'mppd-n1-seoul-p3b4-downstream-opportunity-wave-morphology-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'candidate':{'incoming_line':'1008','outgoing_line':'1002','station_ko':'잠실','station_en':'Jamsil','physical_shortest_transfer_sec':158},'entry_guard_sec':ENTRY_GUARD,'same_cohort_both_scenarios_rows':len(overall),'overall_profile':overall_profile,'destination_profiles_ge50':dest_profiles,'robust_destination_profiles_ge100_count':len(robust),'robust_summary':{'median_minute_distribution_tv':statistics.median(tvs) if tvs else None,'median_peak_clock_shift_min':statistics.median(shifts) if shifts else None,'destinations_with_service_change_share_ge_0_3':sum(1 for x in robust if x['changed_service_share']>=.3),'destinations_with_tv_ge_0_15':sum(1 for x in robust if x['minute_distribution_tv']>=.15)},'decision':decision,'scientific_interpretation':'This experiment keeps the passenger candidate cohort, recorded endpoints and realized service-event field fixed and changes only the transfer-time lower-bound constraint from 0 to 158 seconds. Resulting destination-arrival opportunity histograms therefore isolate the extent to which a physical transfer gate can repartition and reshape downstream minute-scale service opportunities. They are opportunity-wave morphology, not observed passenger exit-pulse predictions.','evidence_boundary':['The analyzed wave is a feasible service-opportunity arrival field, not observed passenger train assignment or observed exit pulse.','Public AFC entry/exit timestamps are minute-quantized.','The 158-second value is a physical shortest-transfer lower bound rather than an empirical walking distribution.','No egress-time model is used.','No T6 observed train-to-train genealogy claim.']}
+          Path('seoul_p3b4_downstream_opportunity_wave_morphology_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B4_CONCISE='+json.dumps({'overall_rows':len(overall),'overall':{k:overall_profile[k] for k in ('changed_service_share','added_arrival_sec','minute_distribution_tv','baseline_peak','physical_transfer_peak','sliding_5min_share_change','entropy_change','baseline_smoothed_local_peak_count','physical_transfer_smoothed_local_peak_count')},'robust_count':len(robust),'robust_summary':result['robust_summary'],'top5':[{k:x.get(k) for k in ('destination_service_station_id','destination_name','rows','changed_service_share','minute_distribution_tv','baseline_peak','physical_transfer_peak','peak_clock_shift_min','sliding_5min_share_change','entropy_change','baseline_smoothed_local_peak_count','physical_transfer_smoothed_local_peak_count')} for x in dest_profiles[:5]],'decision':decision},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b4"
+          F=seoul_p3b4_downstream_opportunity_wave_morphology_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3B4_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

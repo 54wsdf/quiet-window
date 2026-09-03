@@ -1,0 +1,159 @@
+name: Seoul P2A7 Canonical Station Transfer Envelope 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a7-canonical-station-transfer-envelope-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a7"; cd "$RUNNER_TEMP/p2a7"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Match canonical station transfer envelopes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a7"
+          python - <<'PY'
+          import csv,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+          RID=re.compile(r'^\d{4}$')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def num(v):
+              try:return float(str(v or '').replace(',','').strip())
+              except:return None
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip()
+              s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s);s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def ds(v):
+              s=str(v or '').strip();m=re.fullmatch(r'(\d+):(\d{1,2})',s)
+              if m:return int(m.group(1))*60+int(m.group(2))
+              return num(s)
+          def wq(vals,q):
+              a=sorted((float(v),float(w)) for v,w in vals if v is not None and w and w>0 and math.isfinite(float(v)))
+              T=sum(w for _,w in a);x=q*T;c=0
+              for v,w in a:
+                  c+=w
+                  if c>=x:return v
+              return a[-1][0] if a else None
+
+          # passenger-side canonical names
+          idname={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip();name=(row.get('STN_KR_NM') or '').strip()
+                  if RID.fullmatch(sid) and name:idname[sid]=name
+              f.close()
+
+          # static shortest-transfer candidate envelope keyed by normalized station-name movement
+          raw=Path('directional.csv').read_bytes();enc=detect(raw[:262144]);r=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace')));F=r.fieldnames or []
+          def fld(exact=None,contains=None):
+              if exact:
+                  return next(k for k in F if k==exact)
+              return next(k for k in F if contains in k)
+          sn=fld(exact='환승시작역');en=fld(exact='환승종료역');sl=fld(exact='환승시작 호선');el=fld(exact='환승종료 호선');du=fld(exact='소요시간')
+          env=defaultdict(list)
+          for row in r:
+              a=nn(row.get(sn));b=nn(row.get(en));sec=ds(row.get(du))
+              if not a or not b or sec is None:continue
+              rec={'from_line':(row.get(sl) or '').strip(),'to_line':(row.get(el) or '').strip(),'sec':float(sec)}
+              key=(rec['from_line'],rec['to_line'],rec['sec'])
+              if key not in {(x['from_line'],x['to_line'],x['sec']) for x in env[(a,b)]}:env[(a,b)].append(rec)
+
+          # rail-only observed movements, first at raw code-pair level then canonical name-pair level
+          rawpairs=defaultdict(lambda:{'rows':0,'count':0.0,'tn':0.0,'tw':0.0,'hours':Counter()})
+          totalrail=0.0;railrows=0;namedmass=0.0
+          with zipfile.ZipFile('observed.zip') as z:
+              mem=[x for x in z.namelist() if x.lower().endswith('.csv')][0];f=zr(z,mem);r=csv.DictReader(f)
+              for row in r:
+                  a=(row.get('하차_정류장/역사_ID') or '').strip();b=(row.get('승차_정류장/역사_ID') or '').strip()
+                  if not(RID.fullmatch(a) and RID.fullmatch(b)):continue
+                  railrows+=1;c=num(row.get('환승_수_합')) or 0.0;t=num(row.get('환승_시간_평균'));h=(row.get('시간대') or '').strip();totalrail+=c
+                  m=rawpairs[(a,b)];m['rows']+=1;m['count']+=c
+                  if t is not None and c>0:m['tn']+=t*c;m['tw']+=c
+                  if h:m['hours'][h]+=c
+              f.close()
+          namepairs=defaultdict(lambda:{'raw_pairs':set(),'rows':0,'count':0.0,'tn':0.0,'tw':0.0,'hours':Counter()})
+          unresolved=[]
+          for (a,b),m in rawpairs.items():
+              na=idname.get(a);nb=idname.get(b)
+              if not na or not nb:
+                  unresolved.append({'from_id':a,'to_id':b,'count':m['count'],'from_name':na,'to_name':nb});continue
+              namedmass+=m['count'];k=(nn(na),nn(nb));x=namepairs[k];x['raw_pairs'].add((a,b));x['rows']+=m['rows'];x['count']+=m['count'];x['tn']+=m['tn'];x['tw']+=m['tw'];x['hours'].update(m['hours'])
+
+          recs=[];matchmass=0.0;gemass=0.0;ex=[];rat=[];obsq=[];minq=[];samecanon=0.0
+          for (a,b),m in namepairs.items():
+              obs=m['tn']/m['tw'] if m['tw'] else None;cands=env.get((a,b),[]);secs=sorted({x['sec'] for x in cands})
+              if a==b:samecanon+=m['count']
+              z={'from_name_norm':a,'to_name_norm':b,'raw_code_pairs':sorted([f'{x}->{y}' for x,y in m['raw_pairs']]),'observed_rows':m['rows'],'observed_transfer_count':m['count'],'observed_weighted_average_transfer_time_raw':obs,'top_hours':m['hours'].most_common(6),'directional_candidate_count':len(cands),'directional_line_pairs':sorted({f"{x['from_line']}->{x['to_line']}" for x in cands}),'shortest_sec_min':min(secs) if secs else None,'shortest_sec_median':statistics.median(secs) if secs else None,'shortest_sec_max':max(secs) if secs else None}
+              if secs and obs is not None:
+                  mn=min(secs);z['observed_minus_shortest_min_raw']=obs-mn;z['observed_over_shortest_min_ratio']=obs/mn if mn>0 else None;matchmass+=m['count'];obsq.append((obs,m['count']));minq.append((mn,m['count']));ex.append((obs-mn,m['count']))
+                  if mn>0:rat.append((obs/mn,m['count']))
+                  if obs>=mn:gemass+=m['count']
+              recs.append(z)
+          recs.sort(key=lambda x:(-x['observed_transfer_count'],x['from_name_norm'],x['to_name_norm']));matched=[x for x in recs if x['directional_candidate_count']]
+          res={'schema':'mppd-n1-seoul-p2a7-canonical-station-transfer-envelope-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'source':{'rail_filter':'both endpoint IDs exactly 4 digits per official provider semantics','observed_time_field':'환승_시간_평균','observed_time_unit':'not explicit in public metadata; raw numerical scale retained','shortest_table_semantic':'shortest transfer path/car-door location; transfer duration is reference and varies by walking speed'},'coverage':{'rail_rows':railrows,'rail_transfer_count':totalrail,'raw_rail_pairs':len(rawpairs),'name_resolved_transfer_count':namedmass,'name_resolved_mass_share':namedmass/totalrail if totalrail else None,'canonical_name_pairs':len(namepairs),'same_canonical_station_transfer_count':samecanon,'same_canonical_station_mass_share':samecanon/totalrail if totalrail else None,'matched_canonical_pairs':len(matched),'matched_transfer_count':matchmass,'matched_mass_share_of_all_rail':matchmass/totalrail if totalrail else None,'matched_mass_share_of_name_resolved':matchmass/namedmass if namedmass else None,'observed_ge_shortest_min_mass_share':gemass/matchmass if matchmass else None},'calibration':{'observed_raw_p50':wq(obsq,.5),'observed_raw_p90':wq(obsq,.9),'shortest_min_sec_p50':wq(minq,.5),'shortest_min_sec_p90':wq(minq,.9),'excess_raw_p50':wq(ex,.5),'excess_raw_p90':wq(ex,.9),'ratio_p50':wq(rat,.5),'ratio_p90':wq(rat,.9)},'top_matched':matched[:150],'top_unmatched':[x for x in recs if not x['directional_candidate_count']][:100],'unresolved_name_pairs':sorted(unresolved,key=lambda x:-x['count'])[:100],'evidence_boundary':['Canonical station-name matching expands candidate coverage without identifying the actual line pair used by observed passengers.','Directional line pairs are candidate envelopes only; do not label them observed passenger route or train ancestry.','Observed transfer-process time must not be relabelled pure walking time.','T6 observed genealogy remains unsupported.']}
+          Path('seoul_p2a7_canonical_station_transfer_envelope_20260903.json').write_text(json.dumps(res,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('seoul_p2a7_matched_canonical_movements_20260903.csv','w',encoding='utf-8',newline='') as f:
+              cols=['from_name_norm','to_name_norm','observed_transfer_count','observed_weighted_average_transfer_time_raw','directional_candidate_count','shortest_sec_min','shortest_sec_median','shortest_sec_max','observed_minus_shortest_min_raw','observed_over_shortest_min_ratio'];w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
+              for x in matched:w.writerow({k:x.get(k) for k in cols})
+          print('P2A7_CONCISE='+json.dumps({'coverage':res['coverage'],'calibration':res['calibration'],'top_matched':matched[:12]},ensure_ascii=False))
+          PY
+
+      - name: Store outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a7"
+          for F in seoul_p2a7_canonical_station_transfer_envelope_20260903.json seoul_p2a7_matched_canonical_movements_20260903.csv; do
+            D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F";rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          done
+          echo SEOUL_P2A7_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

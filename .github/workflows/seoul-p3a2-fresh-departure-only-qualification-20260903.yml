@@ -1,0 +1,165 @@
+name: Seoul P3A2 Fresh Departure-Only Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3a2-fresh-departure-only-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore matched service source
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3a2"; cd "$RUNNER_TEMP/p3a2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Reconstruct fresh departure-only status transitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a2"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def parse(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def qs(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'p10':q(.1),'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          pat=re.compile(r'subarr_(260829(\d{6}))')
+          # For each stable service key retain each unique status observation with its best snapshot freshness.
+          obs=defaultdict(dict); rows=0; valid_time_rows=0; shard_times=[]; raw_state=Counter(); line_state=defaultdict(Counter)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if not m:continue
+                  hh=m.group(2)
+                  if '070000'<=hh<'100000':
+                      st=datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S');infos.append((x,st));shard_times.append(st)
+              shard_times.sort();poll=[(b-a).total_seconds() for a,b in zip(shard_times,shard_times[1:])]
+              for x,st in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      rows+=1;t=parse(row.get('recptn_dt'))
+                      if not t:continue
+                      valid_time_rows+=1
+                      state=(row.get('arvl_cd') or '').strip();line=(row.get('subway_id') or '').strip();train=(row.get('btrain_no') or '').strip();station=(row.get('statn_id') or '').strip()
+                      if not (state and line and train and station):continue
+                      raw_state[state]+=1;line_state[line][state]+=1
+                      age=(st-t).total_seconds(); key=(line,train,station); ok=(t,state)
+                      old=obs[key].get(ok)
+                      if old is None or abs(age)<abs(old):obs[key][ok]=age
+                  f.close()
+
+          def reconstruct(fresh):
+              events=[]; by_line=Counter();by_prev=Counter();ages=[];keys=Counter();boundary_state2=0;nontransition_state2=0
+              for key,d in obs.items():
+                  # Fresh status sequence over RECPTN_DT. Include all state codes so 2 may be preceded by 0/1/3/5/99.
+                  items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=fresh)
+                  trans=[]
+                  for t,s,a in items:
+                      if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+                  for i,(t,s,a) in enumerate(trans):
+                      if s!='2':continue
+                      if i==0:
+                          boundary_state2+=1;continue
+                      pt,ps,pa=trans[i-1]
+                      if ps=='2':
+                          nontransition_state2+=1;continue
+                      if not (t.date().isoformat()=='2026-08-29' and 7<=t.hour<10):continue
+                      line,train,station=key
+                      events.append({
+                        'evidence_class':'FRESH_DIRECT_OPERATIONAL_STATUS_DEPARTURE_CANDIDATE',
+                        'subway_id':line,'btrain_no':train,'statn_id':station,
+                        'departure_detect_time':t.strftime('%Y%m%d%H%M%S'),
+                        'preceding_status_code':ps,
+                        'departure_min_snapshot_age_seconds':a,
+                        'freshness_limit_seconds':fresh
+                      })
+                      by_line[line]+=1;by_prev[ps]+=1;ages.append(a);keys[key]+=1
+              # exact duplicate candidate rows cannot survive set-like key+time+state processing, but report anyway.
+              dup=len(events)-len({(x['subway_id'],x['btrain_no'],x['statn_id'],x['departure_detect_time']) for x in events})
+              return {'events':events,'rows':len(events),'lines':dict(by_line),'preceding_state_counts':dict(by_prev),'snapshot_age_sec':qs(ages),'service_keys':len(keys),'multi_departure_keys':sum(1 for v in keys.values() if v>1),'boundary_state2_dropped':boundary_state2,'duplicate_candidates':dup}
+
+          results={str(x):reconstruct(x) for x in (30,60,120,300)}
+          counts={k:v['rows'] for k,v in results.items()}
+          selected=results['120'];events=selected.pop('events')
+          for k in ('30','60','300'):results[k].pop('events')
+          target_counts={line:selected['lines'].get(line,0) for line in ('1001','1063','1065','1004')}
+          supported=bool(selected['rows']>=5000 and target_counts['1001']>=100 and target_counts['1063']>=100 and selected['duplicate_candidates']==0)
+          with open('am_fresh_departure_only_candidates_0700_1000.csv','w',encoding='utf-8',newline='') as f:
+              if events:
+                  w=csv.DictWriter(f,fieldnames=list(events[0]));w.writeheader();w.writerows(events)
+          result={
+            'schema':'mppd-n1-seoul-p3a2-fresh-departure-only-qualification-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'window':'2026-08-29 07:00-10:00','archive_shards':len(infos),'snapshot_rows':rows,'valid_timestamp_rows':valid_time_rows,'poll_gap_sec':qs(poll),
+            'raw_state_counts':dict(raw_state),'raw_state_counts_by_line':{k:dict(v) for k,v in line_state.items()},
+            'freshness_sensitivity':results,'selected_freshness_limit_sec':120,'selected_event_rows':len(events),'selected_event_lines':selected['lines'],
+            'selected_target_line_counts':target_counts,'selected_event_table':'am_fresh_departure_only_candidates_0700_1000.csv',
+            'qualification':{'departure_only_event_layer_supported_for_p3a':supported,'line_1001_supported':target_counts['1001']>=100,'line_1063_supported':target_counts['1063']>=100},
+            'scientific_role':'Connection-opportunity studies require downstream departure opportunities, not full ARR->DEP dwell pairs. This layer accepts a fresh transition into ARVL_CD=2 from any prior non-2 status, while dropping boundary state-2 residuals.',
+            'timestamp_boundary':'departure_detect_time is the direct operational-status RECPTN_DT at a freshness-qualified transition into state 2 under approximately 10-second polling; it is not proprietary ATS track-circuit time.',
+            'evidence_boundary':['Departure-only qualification is scoped to connection opportunity and must not replace paired ARR->DEP events for dwell analysis.','A departure opportunity is not observed passenger boarding.','No T6 genealogy claim.']
+          }
+          Path('seoul_p3a2_fresh_departure_only_qualification_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3A2_CONCISE='+json.dumps({'poll':result['poll_gap_sec'],'counts':counts,'selected_rows':len(events),'selected_lines':selected['lines'],'target_lines':target_counts,'preceding_states':selected['preceding_state_counts'],'age':selected['snapshot_age_sec'],'qualification':result['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store qualified departure-only layer
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a2"
+          cpv(){ local s="$1" d="$2"; rclone copyto "$s" "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; local l r; l="$(stat -c '%s' "$s")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$l" = "$r"; }
+          cpv seoul_p3a2_fresh_departure_only_qualification_20260903.json 99_manifests/seoul_p3a2_fresh_departure_only_qualification_20260903.json
+          cpv am_fresh_departure_only_candidates_0700_1000.csv processed/service_events/20260829/am_fresh_departure_only_candidates_0700_1000.csv
+          echo SEOUL_P3A2_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

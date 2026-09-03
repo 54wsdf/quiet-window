@@ -1,0 +1,241 @@
+name: Seoul P2A10 Hybrid Line Transfer Calibration 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a10-hybrid-line-transfer-calibration-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore sources and qualified prefix model
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a10"; cd "$RUNNER_TEMP/p2a10"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p2a9_full_prefix_line_model_20260903.json" p2a9.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build hybrid exact-code plus full-prefix line calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a10"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          RID=re.compile(r'^\d{4}$')
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def num(v):
+              try:return float(str(v or '').replace(',','').strip())
+              except:return None
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip()
+              s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s); s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def dur(v):
+              s=str(v or '').strip();m=re.fullmatch(r'(\d+):(\d{1,2})',s)
+              if m:return int(m.group(1))*60+int(m.group(2))
+              return num(s)
+          def wq(vals,q):
+              a=sorted((float(v),float(w)) for v,w in vals if v is not None and w and w>0 and math.isfinite(float(v)))
+              if not a:return None
+              total=sum(w for _,w in a);target=q*total;acc=0.0
+              for v,w in a:
+                  acc+=w
+                  if acc>=target:return v
+              return a[-1][0]
+
+          p2a9=json.loads(Path('p2a9.json').read_text(encoding='utf-8'))
+          prefix_model={p:r['service_subway_id'] for p,r in p2a9['accepted_prefix_model'].items()}
+
+          # T-money station ID -> canonical passenger-facing station name.
+          idname={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip(); nm=(row.get('STN_KR_NM') or '').strip()
+                  if RID.fullmatch(sid) and nm:idname[sid]=nm
+              f.close()
+
+          # Static transfer table: exact endpoint code/name/line evidence and line-pair durations.
+          raw=Path('directional.csv').read_bytes();enc=detect(raw[:262144]);r=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace')))
+          static_by_key=defaultdict(list)
+          code_line_votes=defaultdict(Counter)
+          service_line_votes=defaultdict(Counter)
+          static_rows=0
+          for row in r:
+              static_rows+=1
+              a=(row.get('환승시작 코드') or '').strip();b=(row.get('환승종료역 코드') or '').strip()
+              an=(row.get('환승시작역') or '').strip();bn=(row.get('환승종료역') or '').strip()
+              fl=(row.get('환승시작 호선') or '').strip();tl=(row.get('환승종료 호선') or '').strip();sec=dur(row.get('소요시간'))
+              if an and bn and fl and tl and sec is not None:
+                  static_by_key[(nn(an),nn(bn),fl,tl)].append(float(sec))
+              for code,name,label in ((a,an,fl),(b,bn,tl)):
+                  if not (RID.fullmatch(code) and label):continue
+                  # Exact code evidence is accepted only when static name agrees with T-money station name when the latter exists.
+                  dvn=idname.get(code)
+                  if dvn and nn(dvn)!=nn(name):continue
+                  code_line_votes[code][label]+=1
+                  sid=prefix_model.get(code[:2])
+                  if sid:service_line_votes[sid][label]+=1
+
+          def accepted_vote(counter,min_support=2,min_share=.70,min_margin=.20):
+              total=sum(counter.values())
+              if not total:return None
+              ranked=counter.most_common();best,n=ranked[0];second=ranked[1][1] if len(ranked)>1 else 0
+              share=n/total;margin=(n-second)/total
+              if n>=min_support and share>=min_share and margin>=min_margin:return best
+              return None
+
+          exact_code_line={c:accepted_vote(v,1,.80,.40) for c,v in code_line_votes.items()}
+          exact_code_line={c:x for c,x in exact_code_line.items() if x}
+          service_line_label={sid:accepted_vote(v,2,.65,.15) for sid,v in service_line_votes.items()}
+          service_line_label={sid:x for sid,x in service_line_label.items() if x}
+
+          def resolve_line(code):
+              if code in exact_code_line:return exact_code_line[code],'EXACT_STATIC_ENDPOINT_CODE_NAME'
+              sid=prefix_model.get(code[:2])
+              label=service_line_label.get(sid) if sid else None
+              if label:return label,'P1C_ACCEPTED_PREFIX_TO_SERVICE_TO_STATIC_LABEL'
+              return None,None
+
+          # Aggregate observed rail-to-rail rows into canonical station x resolved line pair.
+          agg=defaultdict(lambda:{'rows':0,'count':0.0,'tn':0.0,'tw':0.0,'hours':Counter(),'raw_pairs':set(),'evidence':Counter()})
+          rail_rows=0;rail_mass=0.0;line_resolved_rows=0;line_resolved_mass=0.0;cross_rows=0;cross_mass=0.0
+          endpoint_evidence_mass=Counter();unresolved_prefix_mass=Counter()
+          with zipfile.ZipFile('observed.zip') as z:
+              mem=[x for x in z.namelist() if x.lower().endswith('.csv')][0];f=zr(z,mem);r=csv.DictReader(f)
+              for row in r:
+                  a=(row.get('하차_정류장/역사_ID') or '').strip();b=(row.get('승차_정류장/역사_ID') or '').strip()
+                  if not(RID.fullmatch(a) and RID.fullmatch(b)):continue
+                  c=num(row.get('환승_수_합')) or 0.0;t=num(row.get('환승_시간_평균'));h=(row.get('시간대') or '').strip()
+                  rail_rows+=1;rail_mass+=c
+                  na=idname.get(a);nb=idname.get(b);fl,fe=resolve_line(a);tl,te=resolve_line(b)
+                  if not na or not nb or not fl or not tl:
+                      if not fl:unresolved_prefix_mass[a[:2]]+=c
+                      if not tl:unresolved_prefix_mass[b[:2]]+=c
+                      continue
+                  line_resolved_rows+=1;line_resolved_mass+=c;endpoint_evidence_mass[fe]+=c/2;endpoint_evidence_mass[te]+=c/2
+                  if fl==tl:continue
+                  cross_rows+=1;cross_mass+=c
+                  k=(nn(na),nn(nb),fl,tl);x=agg[k];x['rows']+=1;x['count']+=c;x['raw_pairs'].add((a,b));x['evidence'][fe]+=c/2;x['evidence'][te]+=c/2
+                  if t is not None and c>0:x['tn']+=t*c;x['tw']+=c
+                  if h:x['hours'][h]+=c
+              f.close()
+
+          recs=[];matched_mass=0.0;ge_mass=0.0;obsq=[];shortq=[];exq=[];ratq=[]
+          for (a,b,fl,tl),m in agg.items():
+              obs=m['tn']/m['tw'] if m['tw'] else None;secs=static_by_key.get((a,b,fl,tl),[]);mn=min(secs) if secs else None
+              rec={'from_station_norm':a,'to_station_norm':b,'from_line':fl,'to_line':tl,'raw_code_pairs':sorted(f'{x}->{y}' for x,y in m['raw_pairs']),'observed_rows':m['rows'],'observed_transfer_count':m['count'],'observed_weighted_average_transfer_time_raw':obs,'top_hours':m['hours'].most_common(6),'line_identity_evidence_mass':dict(m['evidence']),'static_candidate_rows':len(secs),'shortest_transfer_sec':mn,'static_duration_values_sec':sorted(set(secs))}
+              if mn is not None and obs is not None:
+                  rec['observed_minus_shortest_raw']=obs-mn;rec['observed_over_shortest_ratio']=obs/mn if mn>0 else None
+                  matched_mass+=m['count'];obsq.append((obs,m['count']));shortq.append((mn,m['count']));exq.append((obs-mn,m['count']))
+                  if mn>0:ratq.append((obs/mn,m['count']))
+                  if obs>=mn:ge_mass+=m['count']
+              recs.append(rec)
+          recs.sort(key=lambda x:(-x['observed_transfer_count'],x['from_station_norm'],x['from_line'],x['to_line']))
+          matched=[x for x in recs if x['shortest_transfer_sec'] is not None]
+
+          res={
+            'schema':'mppd-n1-seoul-p2a10-hybrid-line-transfer-calibration-v1',
+            'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'line_identity_contract':{
+              'precedence':['exact static endpoint code + normalized-name agreement','P1C accepted prefix -> service_subway_id -> static line-label majority'],
+              'accepted_prefix_count':len(prefix_model),
+              'exact_code_line_count':len(exact_code_line),
+              'service_to_static_line_label':service_line_label,
+              'boundary':'This is a qualified cross-source identity bridge, not a passenger route-choice observation.'
+            },
+            'coverage':{
+              'all_rail_rows':rail_rows,'all_rail_transfer_mass':rail_mass,
+              'line_resolved_rows':line_resolved_rows,'line_resolved_mass':line_resolved_mass,'line_resolved_mass_share':line_resolved_mass/rail_mass if rail_mass else None,
+              'strict_crossline_rows':cross_rows,'strict_crossline_mass':cross_mass,'strict_crossline_mass_share_of_all_rail':cross_mass/rail_mass if rail_mass else None,
+              'strict_crossline_station_line_pairs':len(agg),'matched_station_line_pairs':len(matched),'matched_transfer_mass':matched_mass,
+              'matched_mass_share_of_crossline_resolved':matched_mass/cross_mass if cross_mass else None,
+              'observed_ge_shortest_mass_share':ge_mass/matched_mass if matched_mass else None
+            },
+            'calibration':{
+              'observed_raw_p50':wq(obsq,.5),'observed_raw_p90':wq(obsq,.9),'shortest_sec_p50':wq(shortq,.5),'shortest_sec_p90':wq(shortq,.9),
+              'excess_raw_p50':wq(exq,.5),'excess_raw_p90':wq(exq,.9),'ratio_p50':wq(ratq,.5),'ratio_p90':wq(ratq,.9)
+            },
+            'identity_evidence_mass':dict(endpoint_evidence_mass),
+            'unresolved_prefix_mass_top':unresolved_prefix_mass.most_common(50),
+            'top_matched':matched[:200],
+            'top_unmatched':[x for x in recs if x['shortest_transfer_sec'] is None][:120],
+            'decision':None,
+            'evidence_boundary':[
+              'Observed aggregate transfer records are station/time/user-type statistics, not individual train ancestry.',
+              'The observed transfer-time field remains transfer-process time; do not relabel it pure walking time.',
+              'Line identity is cross-source reconstructed and must not be described as directly observed passenger line choice.',
+              'T6 observed genealogy remains unsupported.'
+            ]
+          }
+          # Qualification disposition based on usable matched mass, not merely pair count.
+          share=res['coverage']['matched_mass_share_of_crossline_resolved'] or 0
+          if share>=0.50 and matched_mass>=1000:
+              res['decision']='CALIBRATION_LAYER_USABLE'
+          elif share>=0.20 and matched_mass>=200:
+              res['decision']='CALIBRATION_LAYER_PARTIAL_SUPPORT'
+          else:
+              res['decision']='DIRECT_LINE_PAIR_CALIBRATION_TOO_SPARSE_USE_STATION_LEVEL_PROCESS_VALIDATION'
+          Path('seoul_p2a10_hybrid_line_transfer_calibration_20260903.json').write_text(json.dumps(res,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('seoul_p2a10_matched_station_line_pairs_20260903.csv','w',encoding='utf-8',newline='') as f:
+              cols=['from_station_norm','to_station_norm','from_line','to_line','observed_transfer_count','observed_weighted_average_transfer_time_raw','shortest_transfer_sec','observed_minus_shortest_raw','observed_over_shortest_ratio'];w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
+              for x in matched:w.writerow({k:x.get(k) for k in cols})
+          print('P2A10_CONCISE='+json.dumps({'line_identity_contract':res['line_identity_contract'],'coverage':res['coverage'],'calibration':res['calibration'],'decision':res['decision'],'unresolved_prefix_mass_top':res['unresolved_prefix_mass_top'][:20],'top_matched':matched[:15]},ensure_ascii=False))
+          PY
+
+      - name: Store outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a10"
+          for F in seoul_p2a10_hybrid_line_transfer_calibration_20260903.json seoul_p2a10_matched_station_line_pairs_20260903.csv; do
+            D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"; rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$L" = "$R"
+          done
+          echo SEOUL_P2A10_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

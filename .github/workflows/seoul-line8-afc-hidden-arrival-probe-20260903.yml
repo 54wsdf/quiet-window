@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_CONFIG_B64 }}
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
     steps:
       - uses: actions/checkout@v5
@@ -125,7 +125,6 @@ jobs:
           order=[k for k,v in sorted(stations.items(),key=lambda kv:(kv[1]['seq'] is None,kv[1]['seq'] or 9999,kv[0]))]
           pos={s:i for i,s in enumerate(order)}
 
-          # AFC minute histograms for unique-path same-line Line 8 passengers.
           exit_hist=defaultdict(Counter)
           entry_hist=defaultdict(Counter)
           od_rows=0
@@ -140,13 +139,11 @@ jobs:
                   if not (START<=t0<END and START<=t1<END): continue
                   os=a['service_statn_id']; ds=b['service_statn_id']
                   if os==ds: continue
-                  # Line 8 is treated as a simple line here; all same-line OD pairs have a unique station-order path.
                   entry_hist[os][minute_floor(t0)]+=1
                   exit_hist[ds][minute_floor(t1)]+=1
                   od_rows+=1
               f.close()
 
-          # Direct operational arrival truth, used only for design calibration and held-out validation.
           pat=re.compile(r'subarr_(260829(\d{6}))')
           obs=defaultdict(dict); snapshot_rows=0; line_rows=0
           with zipfile.ZipFile('BMS.zip') as z:
@@ -187,13 +184,11 @@ jobs:
           truth_by_train=defaultdict(dict)
           for e in truth:
               truth_by_station[e['station']].append(e)
-              # Keep earliest arrival per train-station if duplicate transition artifacts remain.
               cur=truth_by_train[e['train']].get(e['station'])
               if cur is None or e['time']<cur: truth_by_train[e['train']][e['station']]=e['time']
 
           design_minutes=[START+timedelta(minutes=i) for i in range(int((END-START).total_seconds()/60)) if not (MASK_START<=START+timedelta(minutes=i)<MASK_END)]
 
-          # Learn station egress lag from non-masked direct arrivals only. This is nuisance calibration, not holdout leakage.
           station_lag={}; lag_scores={}
           for st in order:
               th=Counter(minute_floor(e['time']) for e in truth_by_station.get(st,[]) if not (MASK_START<=e['time']<MASK_END))
@@ -209,7 +204,6 @@ jobs:
               best=scores[0] if scores else (0.0,0)
               station_lag[st]=best[1]; lag_scores[st]={'best_lag_min':best[1],'best_corr':best[0],'all':{str(l):c for c,l in scores}}
 
-          # Learn design headway and adjacent-station running-time priors from non-masked truth only.
           headway_by_station={}
           for st in order:
               ts=sorted(e['time'] for e in truth_by_station.get(st,[]) if not (MASK_START<=e['time']<MASK_END))
@@ -225,37 +219,29 @@ jobs:
                       if 30<=abs(d)<=900: vals.append(d)
               if vals: run_sec[(a,b)]=statistics.median(vals)
 
-          # Score AFC pulse intensity as candidate latent arrival evidence in the masked interval.
           own_score=defaultdict(dict)
           score_values={}
+          mask_minutes=[MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]
           for st in order:
               lag=station_lag.get(st,0)
               eh=exit_hist.get(st,Counter())
-              vals=[]
-              for m in [MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]:
-                  vals.append(eh.get(m+timedelta(minutes=lag),0))
+              vals=[eh.get(m+timedelta(minutes=lag),0) for m in mask_minutes]
               score_values[st]=vals[:] if vals else [0]
-              for i,m in enumerate([MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]):
-                  own_score[st][m]=robust_z(vals[i],vals)
+              for i,m in enumerate(mask_minutes): own_score[st][m]=robust_z(vals[i],vals)
 
-          # Add neighboring-station support using learned running-time priors: pulse + line continuity.
           joint_score=defaultdict(dict)
-          mask_minutes=[MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]
           for st in order:
               i=pos[st]
               for m in mask_minutes:
-                  s=own_score[st].get(m,0.0)
-                  w=1.0
+                  s=own_score[st].get(m,0.0); w=1.0
                   if i>0:
                       prev=order[i-1]; d=run_sec.get((prev,st))
                       if d is not None:
-                          mp=m-timedelta(seconds=d); mp=minute_floor(mp)
-                          s+=0.5*own_score[prev].get(mp,0.0); w+=0.5
+                          mp=minute_floor(m-timedelta(seconds=d)); s+=0.5*own_score[prev].get(mp,0.0); w+=0.5
                   if i+1<len(order):
                       nxt=order[i+1]; d=run_sec.get((st,nxt))
                       if d is not None:
-                          mn=m+timedelta(seconds=d); mn=minute_floor(mn)
-                          s+=0.5*own_score[nxt].get(mn,0.0); w+=0.5
+                          mn=minute_floor(m+timedelta(seconds=d)); s+=0.5*own_score[nxt].get(mn,0.0); w+=0.5
                   joint_score[st][m]=s/w
 
           def nms_select(scores, k, min_sep_min=1):
@@ -268,9 +254,7 @@ jobs:
 
           predictions={'B1_FIXED_HEADWAY':defaultdict(list),'B3_AFC_PULSE':defaultdict(list),'B4_AFC_PULSE_LINE_CONTINUITY':defaultdict(list)}
           for st in order:
-              h=max(90.0,headway_by_station.get(st,300.0))
-              k=max(1,round((MASK_END-MASK_START).total_seconds()/h))
-              # B1: extrapolate fixed headway from last visible design arrival before mask.
+              h=max(90.0,headway_by_station.get(st,300.0)); k=max(1,round((MASK_END-MASK_START).total_seconds()/h))
               prior=[e['time'] for e in truth_by_station.get(st,[]) if e['time']<MASK_START]
               if prior:
                   t=max(prior)
@@ -281,8 +265,7 @@ jobs:
               predictions['B4_AFC_PULSE_LINE_CONTINUITY'][st]=nms_select(joint_score[st],k,1)
 
           holdout_truth=defaultdict(list)
-          for st,evs in truth_by_station.items():
-              holdout_truth[st]=[e['time'] for e in evs if MASK_START<=e['time']<MASK_END]
+          for st,evs in truth_by_station.items(): holdout_truth[st]=[e['time'] for e in evs if MASK_START<=e['time']<MASK_END]
 
           def match_station(truth_times,pred_minutes,tol_sec):
               pairs=[]; used=set()
@@ -308,7 +291,6 @@ jobs:
               err60=[x[2] for x in m60];err120=[x[2] for x in m120]
               metrics[model]={'holdout_truth_events':total_truth,'predicted_events':total_pred,'recall_60':len(m60)/total_truth if total_truth else None,'precision_60':len(m60)/total_pred if total_pred else None,'recall_120':len(m120)/total_truth if total_truth else None,'precision_120':len(m120)/total_pred if total_pred else None,'matched_error_sec_60':summary(err60),'matched_error_sec_120':summary(err120),'absolute_train_event_count_error':abs(total_pred-total_truth),'station_profiles':station_rows}
 
-          # Headway diagnostic in holdout, comparing median per-station headways where >=2 events exist.
           for model,pby in predictions.items():
               diffs=[]
               for st in order:
@@ -322,24 +304,7 @@ jobs:
           continuity_gain=(b4['recall_120'] or 0)-(b3['recall_120'] or 0)
           decision='AFC_PULSE_CONTAINS_HIDDEN_ARRIVAL_INFORMATION' if (b3['recall_120'] or 0)>=(b1['recall_120'] or 0)+0.05 and (b3['precision_120'] or 0)>=0.35 else ('AFC_PULSE_SIGNAL_PRESENT_BUT_NOT_YET_STRONGER_THAN_HEADWAY_BASELINE' if (b3['recall_120'] or 0)>=0.30 else 'AFC_PULSE_HIDDEN_ARRIVAL_SIGNAL_WEAK_IN_FIRST_PROBE')
 
-          result={
-            'schema':'seoul-line8-afc-hidden-arrival-probe-v1',
-            'generated_at_utc':datetime.now(timezone.utc).isoformat(),
-            'line':'1008',
-            'business_date':'2026-08-29',
-            'analysis_window':'07:00-10:00',
-            'masked_validation_window':'08:00-08:30',
-            'method_contract':'Direct operational arrivals inside the contiguous masked window are excluded from inference. Direct arrivals outside the mask are used only to calibrate station-level egress lag, headway and adjacent-station running-time nuisance priors. AFC exit pulse intensity inside the mask reconstructs hidden arrival events; B4 additionally uses neighboring-station pulse support under learned line-continuity travel-time priors.',
-            'afc':{'same_line_unique_path_rows':od_rows,'stations_with_exit_mass':sum(bool(v) for v in exit_hist.values())},
-            'direct_truth':{'snapshot_rows_scanned':snapshot_rows,'line_state_rows':line_rows,'fresh_arrival_events':len(truth),'masked_arrival_events':sum(len(v) for v in holdout_truth.values())},
-            'station_egress_lag_min':{st:station_lag.get(st) for st in order},
-            'station_egress_lag_correlation':{st:lag_scores.get(st,{}).get('best_corr') for st in order},
-            'adjacent_running_time_sec':{f'{a}->{b}':v for (a,b),v in run_sec.items()},
-            'metrics':metrics,
-            'comparison':{'B3_recall120_gain_vs_B1':pulse_gain,'B4_recall120_gain_vs_B3':continuity_gain},
-            'decision':decision,
-            'evidence_boundary':['AFC timestamps are minute-quantized; inferred arrivals are minute-resolution AFC_INFERRED_TRAIN_EVENT candidates, not observed ATS.','Station egress lags and headway/running-time priors are calibrated only outside the masked target window.','This first probe tests hidden arrival-event recoverability, not passenger-to-train assignment.','No card identifiers are exported or logged.']
-          }
+          result={'schema':'seoul-line8-afc-hidden-arrival-probe-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'line':'1008','business_date':'2026-08-29','analysis_window':'07:00-10:00','masked_validation_window':'08:00-08:30','method_contract':'Direct operational arrivals inside the contiguous masked window are excluded from inference. Direct arrivals outside the mask are used only to calibrate station-level egress lag, headway and adjacent-station running-time nuisance priors. AFC exit pulse intensity inside the mask reconstructs hidden arrival events; B4 additionally uses neighboring-station pulse support under learned line-continuity travel-time priors.','afc':{'same_line_unique_path_rows':od_rows,'stations_with_exit_mass':sum(bool(v) for v in exit_hist.values())},'direct_truth':{'snapshot_rows_scanned':snapshot_rows,'line_state_rows':line_rows,'fresh_arrival_events':len(truth),'masked_arrival_events':sum(len(v) for v in holdout_truth.values())},'station_egress_lag_min':{st:station_lag.get(st) for st in order},'station_egress_lag_correlation':{st:lag_scores.get(st,{}).get('best_corr') for st in order},'adjacent_running_time_sec':{f'{a}->{b}':v for (a,b),v in run_sec.items()},'metrics':metrics,'comparison':{'B3_recall120_gain_vs_B1':pulse_gain,'B4_recall120_gain_vs_B3':continuity_gain},'decision':decision,'evidence_boundary':['AFC timestamps are minute-quantized; inferred arrivals are minute-resolution AFC_INFERRED_TRAIN_EVENT candidates, not observed ATS.','Station egress lags and headway/running-time priors are calibrated only outside the masked target window.','This first probe tests hidden arrival-event recoverability, not passenger-to-train assignment.','No card identifiers are exported or logged.']}
           Path('seoul_r1_line8_afc_hidden_arrival_probe_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
           concise={'decision':decision,'afc_rows':od_rows,'truth':result['direct_truth'],'B1':{k:b1[k] for k in ('predicted_events','recall_60','precision_60','recall_120','precision_120','absolute_train_event_count_error','median_station_headway_median_abs_error_sec')},'B3':{k:b3[k] for k in ('predicted_events','recall_60','precision_60','recall_120','precision_120','absolute_train_event_count_error','median_station_headway_median_abs_error_sec')},'B4':{k:b4[k] for k in ('predicted_events','recall_60','precision_60','recall_120','precision_120','absolute_train_event_count_error','median_station_headway_median_abs_error_sec')},'comparison':result['comparison']}
           print('SEOUL_R1_LINE8_CONCISE='+json.dumps(concise,ensure_ascii=False))

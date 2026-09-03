@@ -1,0 +1,265 @@
+name: Seoul P2A6 Rail Transfer Calibration 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a6-rail-transfer-calibration-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore source layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a6"; cd "$RUNNER_TEMP/p2a6"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build rail transfer calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a6"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, math, re, statistics, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          RAIL_ID = re.compile(r'^\d{4}$')
+
+          def detect(raw: bytes) -> str:
+              for enc in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:
+                      raw.decode(enc); return enc
+                  except UnicodeDecodeError:
+                      pass
+              return 'cp949'
+
+          def zip_reader(z: zipfile.ZipFile, name: str):
+              f=z.open(name); head=f.read(262144); f.close(); enc=detect(head)
+              return io.TextIOWrapper(z.open(name), encoding=enc, errors='replace', newline=''), enc
+
+          def num(v):
+              try: return float(str(v or '').replace(',','').strip())
+              except Exception: return None
+
+          def norm_name(v):
+              s=unicodedata.normalize('NFKC', str(v or '')).strip()
+              s=re.sub(r'\s+','',s); s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s)
+              if s.endswith('역'): s=s[:-1]
+              return s
+
+          def duration_seconds(v):
+              s=str(v or '').strip()
+              m=re.fullmatch(r'(\d+):(\d{1,2})', s)
+              if m:
+                  return int(m.group(1))*60 + int(m.group(2))
+              x=num(s)
+              return x
+
+          def weighted_quantile(pairs, q):
+              # pairs: (value, weight)
+              xs=sorted((float(v),float(w)) for v,w in pairs if v is not None and w is not None and w>0 and math.isfinite(float(v)))
+              total=sum(w for _,w in xs)
+              if total<=0: return None
+              target=q*total; acc=0.0
+              for v,w in xs:
+                  acc+=w
+                  if acc>=target: return v
+              return xs[-1][0]
+
+          # T-money station names for 4-digit station IDs.
+          dv={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f,_=zip_reader(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip()
+                  if RAIL_ID.fullmatch(sid):
+                      dv[sid]=(row.get('STN_KR_NM') or '').strip()
+              f.close()
+
+          # Directional shortest-transfer candidates by exact station-code movement.
+          raw=Path('directional.csv').read_bytes(); enc=detect(raw[:262144])
+          dr=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace'))); fields=dr.fieldnames or []
+          sc=next(k for k in fields if '환승시작 코드' in k)
+          ec=next(k for k in fields if '환승종료역 코드' in k)
+          sl=next(k for k in fields if k=='환승시작 호선')
+          el=next(k for k in fields if k=='환승종료 호선')
+          sn=next(k for k in fields if k=='환승시작역')
+          en=next(k for k in fields if k=='환승종료역')
+          du=next(k for k in fields if k=='소요시간')
+          directional=defaultdict(list)
+          invalid_duration=0
+          for row in dr:
+              a=(row.get(sc) or '').strip(); b=(row.get(ec) or '').strip()
+              if not (RAIL_ID.fullmatch(a) and RAIL_ID.fullmatch(b)): continue
+              sec=duration_seconds(row.get(du))
+              if sec is None: invalid_duration+=1; continue
+              rec={
+                  'from_id':a,'to_id':b,
+                  'from_name':(row.get(sn) or '').strip(),'to_name':(row.get(en) or '').strip(),
+                  'from_line':(row.get(sl) or '').strip(),'to_line':(row.get(el) or '').strip(),
+                  'shortest_duration_sec':sec,
+              }
+              key=(rec['from_line'],rec['to_line'],sec)
+              if key not in {(x['from_line'],x['to_line'],x['shortest_duration_sec']) for x in directional[(a,b)]}:
+                  directional[(a,b)].append(rec)
+
+          # Observed aggregate: official provider semantics say 4-digit IDs are subway stations, 9-digit IDs are bus stops.
+          agg=defaultdict(lambda:{'rows':0,'count':0.0,'time_num':0.0,'time_w':0.0,'hour_count':Counter(),'times':[]})
+          all_rows=rail_rows=0; all_count=rail_count=0.0
+          id_length_pairs=Counter()
+          with zipfile.ZipFile('observed.zip') as z:
+              member=[x for x in z.namelist() if x.lower().endswith('.csv')][0]
+              f,_=zip_reader(z,member); r=csv.DictReader(f)
+              for row in r:
+                  all_rows+=1
+                  a=(row.get('하차_정류장/역사_ID') or '').strip(); b=(row.get('승차_정류장/역사_ID') or '').strip()
+                  c=num(row.get('환승_수_합')); t=num(row.get('환승_시간_평균')); h=(row.get('시간대') or '').strip()
+                  if c is not None: all_count+=c
+                  id_length_pairs[(len(a),len(b))]+=1
+                  if not (RAIL_ID.fullmatch(a) and RAIL_ID.fullmatch(b)): continue
+                  rail_rows+=1
+                  if c is not None: rail_count+=c
+                  m=agg[(a,b)]; m['rows']+=1
+                  if c is not None: m['count']+=c
+                  if t is not None:
+                      m['times'].append(t)
+                      if c is not None and c>0:
+                          m['time_num']+=t*c; m['time_w']+=c
+                  if h: m['hour_count'][h]+=c if c is not None else 1
+              f.close()
+
+          records=[]; matched_mass=matched_rows=0.0; same_station_mass=0.0
+          excess_pairs=[]; ratio_pairs=[]; observed_pairs=[]; shortest_pairs=[]
+          observed_ge_min_mass=0.0
+          for (a,b),m in agg.items():
+              obs=m['time_num']/m['time_w'] if m['time_w']>0 else (statistics.median(m['times']) if m['times'] else None)
+              cand=directional.get((a,b),[])
+              secs=sorted({float(x['shortest_duration_sec']) for x in cand})
+              rec={
+                  'from_id':a,'to_id':b,'from_name':dv.get(a),'to_name':dv.get(b),
+                  'observed_rows':m['rows'],'observed_transfer_count':m['count'],
+                  'observed_weighted_average_transfer_time_raw':obs,
+                  'top_hours':m['hour_count'].most_common(6),
+                  'directional_candidate_count':len(cand),
+                  'directional_line_pairs':sorted({f"{x['from_line']}->{x['to_line']}" for x in cand}),
+                  'shortest_candidate_sec_min':min(secs) if secs else None,
+                  'shortest_candidate_sec_median':statistics.median(secs) if secs else None,
+                  'shortest_candidate_sec_max':max(secs) if secs else None,
+              }
+              if cand and obs is not None:
+                  mn=min(secs); rec['observed_minus_shortest_min_raw']=obs-mn
+                  rec['observed_over_shortest_min_ratio']=obs/mn if mn>0 else None
+                  matched_mass+=m['count']; matched_rows+=m['rows']
+                  excess_pairs.append((obs-mn,m['count'])); observed_pairs.append((obs,m['count'])); shortest_pairs.append((mn,m['count']))
+                  if mn>0: ratio_pairs.append((obs/mn,m['count']))
+                  if obs>=mn: observed_ge_min_mass+=m['count']
+              if a==b: same_station_mass+=m['count']
+              records.append(rec)
+
+          records.sort(key=lambda x:(-x['observed_transfer_count'],x['from_id'],x['to_id']))
+          matched=[x for x in records if x['directional_candidate_count']>0 and x['observed_weighted_average_transfer_time_raw'] is not None]
+
+          result={
+              'schema':'mppd-n1-seoul-p2a6-rail-transfer-calibration-v1',
+              'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+              'provider_semantics':{
+                  'rail_filter':'both endpoint IDs match exactly four numeric digits',
+                  'basis':'Seoul Open Data dataset description: stop IDs are 9-digit, subway-station IDs are 4-digit.',
+                  'observed_transfer_time_field':'환승_시간_평균',
+                  'observed_transfer_time_unit_status':'NOT_EXPLICIT_IN_PUBLIC_PAGE_METADATA; numerical values are retained raw. Cross-table compatibility with MM:SS shortest-transfer durations is evaluated below rather than assumed.'
+              },
+              'source_counts':{
+                  'all_rows':all_rows,'all_transfer_count':all_count,
+                  'rail_to_rail_rows':rail_rows,'rail_to_rail_transfer_count':rail_count,
+                  'rail_to_rail_movement_pairs':len(agg),
+                  'same_station_rail_transfer_count':same_station_mass,
+                  'id_length_pair_row_counts':{f'{a}->{b}':n for (a,b),n in id_length_pairs.items()},
+                  'directional_pairs':len(directional),'directional_invalid_duration_rows':invalid_duration,
+              },
+              'directional_match':{
+                  'matched_movement_pairs':len(matched),
+                  'matched_transfer_count':matched_mass,
+                  'matched_transfer_count_share':matched_mass/rail_count if rail_count else None,
+                  'observed_ge_shortest_min_mass_share':observed_ge_min_mass/matched_mass if matched_mass else None,
+              },
+              'mass_weighted_calibration':{
+                  'observed_transfer_time_raw_p50':weighted_quantile(observed_pairs,.5),
+                  'observed_transfer_time_raw_p90':weighted_quantile(observed_pairs,.9),
+                  'shortest_candidate_sec_min_p50':weighted_quantile(shortest_pairs,.5),
+                  'shortest_candidate_sec_min_p90':weighted_quantile(shortest_pairs,.9),
+                  'observed_minus_shortest_min_raw_p50':weighted_quantile(excess_pairs,.5),
+                  'observed_minus_shortest_min_raw_p90':weighted_quantile(excess_pairs,.9),
+                  'observed_over_shortest_min_ratio_p50':weighted_quantile(ratio_pairs,.5),
+                  'observed_over_shortest_min_ratio_p90':weighted_quantile(ratio_pairs,.9),
+              },
+              'top_rail_movements':records[:150],
+              'top_directionally_matched_movements':matched[:100],
+              'evidence_boundary':[
+                  'Observed transfer rows are aggregate station-to-station transfer process statistics, not individual passenger train ancestry.',
+                  'The observed table contains no line-pair field; directional line-pair candidates must not be treated as observed line assignment.',
+                  'The static directional table provides shortest transfer-path constraints; observed transfer-time averages can include behavioral and operational delay beyond physical minimum.',
+                  'Do not call the comparison pure walking-time calibration unless the observed transfer-time semantic is independently shown to exclude waiting.'
+              ]
+          }
+          Path('seoul_p2a6_rail_transfer_calibration_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          with open('seoul_p2a6_matched_rail_movements_20260903.csv','w',encoding='utf-8',newline='') as f:
+              cols=['from_id','to_id','from_name','to_name','observed_rows','observed_transfer_count','observed_weighted_average_transfer_time_raw','directional_candidate_count','shortest_candidate_sec_min','shortest_candidate_sec_median','shortest_candidate_sec_max','observed_minus_shortest_min_raw','observed_over_shortest_min_ratio']
+              w=csv.DictWriter(f,fieldnames=cols); w.writeheader()
+              for x in matched:
+                  w.writerow({k:x.get(k) for k in cols})
+
+          print('P2A6_CONCISE='+json.dumps({
+              'all_rows':all_rows,'rail_rows':rail_rows,'rail_pairs':len(agg),'rail_transfer_count':rail_count,
+              'matched_pairs':len(matched),'matched_mass_share':result['directional_match']['matched_transfer_count_share'],
+              'observed_ge_shortest_share':result['directional_match']['observed_ge_shortest_min_mass_share'],
+              'calibration':result['mass_weighted_calibration'],
+              'top_matched':matched[:12]
+          },ensure_ascii=False))
+          PY
+
+      - name: Store qualified outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a6"
+          for F in seoul_p2a6_rail_transfer_calibration_20260903.json seoul_p2a6_matched_rail_movements_20260903.csv; do
+            D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+            rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          done
+          echo SEOUL_P2A6_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

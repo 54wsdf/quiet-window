@@ -1,0 +1,101 @@
+name: Seoul P3B4B Phase-Shape Decomposition 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b4b-phase-shape-decomposition-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore P3B4 result
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b4b"; cd "$RUNNER_TEMP/p3b4b"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p3b4_downstream_opportunity_wave_morphology_20260903.json" p3b4.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Decompose phase shift from residual shape change
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b4b"
+          python - <<'PY'
+          import json,statistics
+          from pathlib import Path
+          from datetime import datetime,timezone
+
+          src=json.loads(Path('p3b4.json').read_text(encoding='utf-8'))
+          def idx(s):
+              h,m=map(int,s.split(':'));return h*60+m
+          def tv(a,b):
+              keys=set(a)|set(b);sa=sum(a.values());sb=sum(b.values())
+              return .5*sum(abs(a.get(k,0)/sa-b.get(k,0)/sb) for k in keys) if sa and sb else None
+          def shift_hist(h,s):return {k+s:v for k,v in h.items()}
+          def parse_hist(h):return {idx(k):v for k,v in h.items()}
+          def best_shift(base,alt,lo=-15,hi=15):
+              vals=[]
+              for s in range(lo,hi+1): vals.append((tv(shift_hist(base,s),alt),s))
+              vals.sort(key=lambda x:(x[0],abs(x[1]),x[1]));return vals[0],vals
+
+          rows=[]
+          for x in src['destination_profiles_ge50']:
+              b=parse_hist(x['baseline_histogram']);a=parse_hist(x['physical_transfer_histogram'])
+              raw=x['minute_distribution_tv'];(resid,s),curve=best_shift(b,a)
+              phase_expl=(raw-resid)/raw if raw and raw>0 else None
+              row={
+                'destination_service_station_id':x['destination_service_station_id'],'destination_name':x.get('destination_name'),'rows':x['rows'],
+                'raw_minute_distribution_tv':raw,'best_phase_shift_min':s,'phase_aligned_residual_tv':resid,'fraction_of_raw_tv_removed_by_phase_alignment':phase_expl,
+                'changed_service_share':x['changed_service_share'],'peak_clock_shift_min':x['peak_clock_shift_min'],'sliding_5min_share_change':x['sliding_5min_share_change'],'entropy_change':x['entropy_change'],
+                'classification':'PHASE_DOMINANT' if resid<0.10 and phase_expl is not None and phase_expl>=0.60 else ('PHASE_PLUS_SHAPE' if resid>=0.10 and phase_expl is not None and phase_expl>=0.30 else 'SHAPE_OR_MIXED_DOMINANT')
+              }
+              rows.append(row)
+          rows.sort(key=lambda x:x['rows'],reverse=True)
+          robust=[x for x in rows if x['rows']>=100]
+          residuals=[x['phase_aligned_residual_tv'] for x in robust];removed=[x['fraction_of_raw_tv_removed_by_phase_alignment'] for x in robust];shifts=[x['best_phase_shift_min'] for x in robust]
+          if robust and statistics.median(residuals)<0.10 and statistics.median(removed)>=0.60:
+              decision='TRANSFER_GATE_EFFECT_IS_PRIMARILY_DOWNSTREAM_PHASE_RETIMING'
+          elif robust and statistics.median(residuals)>=0.10:
+              decision='TRANSFER_GATE_CAUSES_PHASE_SHIFT_WITH_NONTRIVIAL_RESIDUAL_SHAPE_CHANGE'
+          else:decision='PHASE_SHAPE_DECOMPOSITION_INCONCLUSIVE'
+          result={'schema':'mppd-n1-seoul-p3b4b-phase-shape-decomposition-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'source':'seoul_p3b4_downstream_opportunity_wave_morphology_20260903.json','method':'For each destination minute histogram, shift the zero-transfer baseline by every integer offset from -15 to +15 minutes and select the offset minimizing total-variation distance to the 158-second-transfer histogram. The residual total-variation distance after optimal shift is treated as shape difference not explained by a pure phase translation.','robust_destination_count_ge100':len(robust),'robust_summary':{'median_best_phase_shift_min':statistics.median(shifts) if shifts else None,'median_raw_tv':statistics.median([x['raw_minute_distribution_tv'] for x in robust]) if robust else None,'median_phase_aligned_residual_tv':statistics.median(residuals) if residuals else None,'median_fraction_raw_tv_removed_by_phase_alignment':statistics.median(removed) if removed else None,'phase_dominant_count':sum(x['classification']=='PHASE_DOMINANT' for x in robust),'phase_plus_shape_count':sum(x['classification']=='PHASE_PLUS_SHAPE' for x in robust),'shape_or_mixed_count':sum(x['classification']=='SHAPE_OR_MIXED_DOMINANT' for x in robust)},'destination_profiles':rows,'decision':decision,'scientific_interpretation':'This decomposition prevents a large clock-time shift from being mislabeled as morphology change. The transfer gate may materially retime downstream service-opportunity waves even when within-wave concentration or normalized shape changes only modestly. Residual phase-aligned TV quantifies the non-translation component.','evidence_boundary':['This remains service-opportunity-wave analysis, not observed exit-pulse prediction.','Integer-minute alignment matches the public AFC time resolution and does not imply sub-minute passenger timing.','No passenger-to-train assignment or T6 genealogy claim.']}
+          Path('seoul_p3b4b_phase_shape_decomposition_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B4B_CONCISE='+json.dumps({'robust':result['robust_summary'],'top5':rows[:5],'decision':decision},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b4b"
+          F=seoul_p3b4b_phase_shape_decomposition_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3B4B_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

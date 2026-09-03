@@ -1,0 +1,233 @@
+name: Seoul R1E2 Line 2 Leave-One Perturbed Train 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-r1e2-line2-leave-one-perturbed-train-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore canonical layers
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1e2"; cd "$RUNNER_TEMP/r1e2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Evaluate each predeclared perturbation separately
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1e2"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          LINE='1002'; DIR='INC'; START=datetime(2026,8,29,7); END=datetime(2026,8,29,10); FRESH=120; TH=120.0
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); return io.TextIOWrapper(z.open(n),encoding=detect(h),errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit()); return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit()); return int(d) if d else None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a); return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'max':max(a)}
+          def pearson(x,y):
+              if len(x)<3:return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy) if vx>0 and vy>0 else 0.0
+          def classify(sts,seq):
+              p=sorted((seq[s],t.timestamp()) for s,t in sts.items() if s in seq and seq[s] is not None)
+              if len(p)<4:return None
+              c=pearson([x for x,y in p],[y for x,y in p]); return None if abs(c)<.35 else ('INC' if c>0 else 'DEC')
+          def mf(t):return t.replace(second=0,microsecond=0)
+          def mc(t):
+              z=mf(t);return z if z==t else z+timedelta(minutes=1)
+          def ierr(t,m):
+              if t<m:return (m-t).total_seconds()
+              hi=m+timedelta(seconds=59)
+              return (t-hi).total_seconds() if t>hi else 0.0
+          def prominence(h,m):
+              c=h.get(m,0); nb=[h.get(m+timedelta(minutes=k),0) for k in (-3,-2,-1,1,2,3)]
+              med=statistics.median(nb) if nb else 0; mad=statistics.median([abs(x-med) for x in nb]) if nb else 0
+              return (c-med)/max(1.0,1.4826*mad)
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          es=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id') and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in es}; le=[x for x in es if x['service_subway_id']==LINE]
+          meta={x['service_statn_id']:{'seq':seqnum(x.get('service_statn_sn')),'name':x.get('dv_name')} for x in le}; seq={s:v['seq'] for s,v in meta.items()}
+          minutes=[START+timedelta(minutes=i) for i in range(180)]
+
+          same=defaultdict(Counter); allf=defaultdict(Counter); same_n=all_n=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID'))); b=cw.get(z4(row.get('ALGH_BSST_ID'))); t=dt(row.get('ALGH_DTM'))
+                  if not b or b['service_subway_id']!=LINE or not t or not START<=t<END:continue
+                  st=b['service_statn_id']; allf[st][mf(t)]+=1; all_n+=1
+                  if a and a['service_subway_id']==LINE:same[st][mf(t)]+=1;same_n+=1
+              f.close()
+
+          pat=re.compile(r'subarr_(260829(\d{6}))'); obs=defaultdict(dict)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,sh in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      if (row.get('subway_id') or '').strip()!=LINE:continue
+                      state=(row.get('arvl_cd') or '').strip()
+                      if state not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip()
+                      if not t or not tr or st not in meta:continue
+                      age=(sh-t).total_seconds();key=(tr,st);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+          trains=defaultdict(dict)
+          for (tr,st),d in obs.items():
+              its=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in its:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':
+                      old=trains[tr].get(st);trains[tr][st]=t if old is None or t<old else old
+                  prev=s
+          dirs={tr:classify(sts,seq) for tr,sts in trains.items()}; dtr=[tr for tr,d in dirs.items() if d==DIR]
+          cov=Counter(s for tr in dtr for s in trains[tr]); ref=cov.most_common(1)[0][0]
+          rs=sorted((trains[tr][ref],tr) for tr in dtr if ref in trains[tr]); times=[t for t,tr in rs]
+          gaps=[(b-a).total_seconds() for a,b in zip(times,times[1:]) if 60<=(b-a).total_seconds()<=1800]; normal=q(gaps,.35)
+          lo=max(60,.25*normal); hi=min(1800,max(600,2.75*normal))
+          challenge=[]
+          for i in range(1,len(rs)-1):
+              t,tr=rs[i];gp=(t-rs[i-1][0]).total_seconds();gn=(rs[i+1][0]-t).total_seconds()
+              if lo<=gp<=hi and lo<=gn<=hi:
+                  r=abs(gp-gn)/2
+                  if r>=TH:challenge.append({'idx':i,'train':tr,'truth':t,'residual':r,'gp':gp,'gn':gn})
+
+          results=[]
+          for c in challenge:
+              target=c['train']; anchors={tr:sts for tr,sts in trains.items() if tr in dtr and tr!=target}; target_sts=trains[target]
+              # Keep the original full-truth reference station fixed if possible.
+              if ref not in target_sts:continue
+              ar=sorted((sts[ref],tr) for tr,sts in anchors.items() if ref in sts)
+              left=[x for x in ar if x[0]<c['truth']];right=[x for x in ar if x[0]>c['truth']]
+              if not left or not right:continue
+              L=max(left)[0];R=min(right)[0]
+              # Exactly one target was removed in this fold; no post-mask count gate is needed.
+              acov=Counter(s for tr,sts in anchors.items() for s in sts); aref=ref if ref in acov else acov.most_common(1)[0][0]
+              off=defaultdict(list)
+              for tr,sts in anchors.items():
+                  if aref not in sts:continue
+                  rt=sts[aref]
+                  for s,t in sts.items():off[s].append((t-rt).total_seconds())
+              offsets={s:statistics.median(v) for s,v in off.items() if len(v)>=5}
+              if aref!=ref:
+                  # Translate target reference time to the per-fold template reference.
+                  if aref not in target_sts:continue
+                  truth_ref=target_sts[aref]
+              else:truth_ref=c['truth']
+              # Egress lag from visible anchors only.
+              lag={}
+              for s in offsets:
+                  th=Counter(mf(sts[s]) for tr,sts in anchors.items() if s in sts);scores=[]
+                  for l in range(11):scores.append((pearson([th.get(m,0) for m in minutes],[allf[s].get(m+timedelta(minutes=l),0) for m in minutes]),l))
+                  scores.sort(key=lambda x:(x[0],-x[1]),reverse=True);lag[s]=scores[0][1] if scores else 0
+              ma={s:sum(allf[s].values()) for s in offsets};ms={s:sum(same[s].values()) for s in offsets}
+              def ridge(m,field,mass):
+                  num=den=0.0
+                  for s,o in offsets.items():
+                      if mass.get(s,0)<20:continue
+                      em=mf(m+timedelta(seconds=o))+timedelta(minutes=lag.get(s,0));w=math.sqrt(mass[s]);num+=w*prominence(field[s],em);den+=w
+                  return num/den if den else -999
+              def refpulse(m):return prominence(allf[aref],mf(m)+timedelta(minutes=lag.get(aref,0)))
+              # Candidate interval translated to aref if needed via target-free template. L/R are at full ref; aref is normally same.
+              cand=[m for m in minutes if mc(L+timedelta(seconds=30))<=m<=mf(R-timedelta(seconds=30))]
+              mid=mf(L+(R-L)/2);p2=max(cand,key=refpulse) if cand else mid;p3=max(cand,key=lambda m:ridge(m,same,ms)) if cand else mid;p4=max(cand,key=lambda m:ridge(m,allf,ma)) if cand else mid
+              pred={'regular':mid,'reference_pulse':p2,'same_line_ridge':p3,'all_destination_ridge':p4}
+              row={'challenge_residual_sec':c['residual'],'visible_gap_sec':(R-L).total_seconds()}
+              for k,p in pred.items():row[k+'_error_sec']=ierr(truth_ref,p)
+              # Trajectory error with the same per-fold template.
+              for k,p in pred.items():
+                  es=[]
+                  for s,actual in target_sts.items():
+                      if s not in offsets:continue
+                      es.append(ierr(actual,mf(p+timedelta(seconds=offsets[s]))))
+                  row[k+'_trajectory_error_sec']=summ(es);row[k+'_trajectory_recall120']=sum(e<=120 for e in es)/len(es) if es else None
+              results.append(row)
+
+          models=['regular','reference_pulse','same_line_ridge','all_destination_ridge'];metrics={}
+          for k in models:
+              es=[r[k+'_error_sec'] for r in results]
+              tr=[r[k+'_trajectory_recall120'] for r in results if r[k+'_trajectory_recall120'] is not None]
+              metrics[k]={'n':len(es),'reference_error_sec':summ(es),'reference_recall60':sum(e<=60 for e in es)/len(es) if es else None,'reference_recall120':sum(e<=120 for e in es)/len(es) if es else None,'mean_fold_trajectory_recall120':sum(tr)/len(tr) if tr else None}
+          reg=[r['regular_error_sec'] for r in results];allerr=[r['all_destination_ridge_error_sec'] for r in results];sameerr=[r['same_line_ridge_error_sec'] for r in results]
+          wins=sum(a<b for a,b in zip(allerr,reg));losses=sum(a>b for a,b in zip(allerr,reg));ties=len(reg)-wins-losses
+          xwins=sum(a<b for a,b in zip(allerr,sameerr));xloss=sum(a>b for a,b in zip(allerr,sameerr));xties=len(allerr)-xwins-xloss
+          if len(results)>=3 and wins>losses and statistics.median(allerr)<statistics.median(reg):decision='R1E2_AFC_PULSE_IMPROVES_PERTURBED_TRAIN_TIMING'
+          elif len(results)>=3 and wins>=losses:decision='R1E2_BOUNDED_AFC_PERTURBATION_SIGNAL'
+          else:decision='R1E2_NO_CLEAR_AFC_GAIN'
+          out={'schema':'seoul-r1e2-line2-leave-one-perturbed-train-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'case':{'line':LINE,'direction':DIR,'business_date':'2026-08-29','perturbation_threshold_sec':TH,'full_truth_reference_station':ref},'challenge_contract':'The exact same full-truth continuity-qualified trains with midpoint residual >=120 s used by R1E define the stress cohort. Each stress train is masked in its own fold; all other direction-compatible trains, including other stress trains, remain visible anchors. No target time or identity enters the fold inference features.','counts':{'full_direction_train_count':len(dtr),'challenge_train_count':len(challenge),'evaluated_leave_one_folds':len(results),'same_line_afc_rows':same_n,'all_destination_line2_afc_rows':all_n},'metrics':metrics,'paired_fold_details_without_ids':results,'comparison':{'all_destination_vs_regular_wins':wins,'ties':ties,'losses':losses,'all_destination_vs_same_line_wins':xwins,'ties2':xties,'losses2':xloss},'decision':decision,'evidence_boundary':['This is a truth-defined perturbation stress cohort and must be reported with random regular-operation controls.','AFC timestamps are minute-quantized.','All-destination Line-2 exit mass includes cross-line-origin passengers but does not explicitly resolve their transfer station or transfer-time distribution; that belongs to R2.','The Line-2 circular topology may mix directions in raw exit pulses; this is recorded as a case limitation and motivates non-circular replication if needed.']}
+          Path('seoul_r1e2_line2_leave_one_perturbed_train_20260903.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SEOUL_R1E2_CONCISE='+json.dumps({'decision':decision,'counts':out['counts'],'metrics':metrics,'comparison':out['comparison'],'details':results},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.restore.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1e2";F=seoul_r1e2_line2_leave_one_perturbed_train_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          test "$(stat -c '%s' "$F")" = "$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"
+          echo SEOUL_R1E2_DURABLE_PASS
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

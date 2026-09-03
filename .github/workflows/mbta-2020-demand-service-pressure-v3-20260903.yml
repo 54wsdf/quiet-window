@@ -1,0 +1,137 @@
+name: MBTA 2020 Demand Service Pressure V3 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mbta-2020-demand-service-pressure-v3-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      BASE_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/boston_mbta
+      OUT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/boston_mbta/demand_service_pressure_2020
+    steps:
+      - name: Restore held public sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq p7zip-full
+          python -m pip install --disable-pip-version-check duckdb pandas
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP"
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/gated_entries_historical/GSE_by_year.zip" GSE_by_year.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/rapid_transit_events_2020/Events_2020.zip" Events_2020.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/gtfs_2020_archive_probe/stops.parquet" stops.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          mkdir -p events
+          7z x -y Events_2020.zip -oevents '*.csv' >/dev/null
+
+      - name: Build same-date aggregate demand-realized service panel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import json,zipfile
+          from pathlib import Path
+          import duckdb
+
+          with zipfile.ZipFile('GSE_by_year.zip') as z:
+              xs=[n for n in z.namelist() if n.endswith('GSE_2020.csv')]
+              if len(xs)!=1: raise SystemExit(f'GSE member ambiguity: {xs}')
+              z.extract(xs[0],'gse_extract'); gse=str(Path('gse_extract')/xs[0])
+          ev=sorted(Path('events').rglob('*.csv'))
+          if not ev: raise SystemExit('no event CSVs')
+          con=duckdb.connect(':memory:')
+          con.execute('''CREATE TABLE stop_map AS
+            SELECT stop_id,min(parent_station) parent_station
+            FROM read_parquet('stops.parquet')
+            WHERE parent_station IS NOT NULL AND trim(cast(parent_station as varchar))<>''
+            GROUP BY stop_id HAVING count(DISTINCT parent_station)=1''')
+          map_count=con.execute('select count(*) from stop_map').fetchone()[0]
+          map_conflict=con.execute('''SELECT count(*) FROM (
+            SELECT stop_id FROM read_parquet('stops.parquet') WHERE parent_station IS NOT NULL AND trim(cast(parent_station as varchar))<>''
+            GROUP BY stop_id HAVING count(DISTINCT parent_station)>1)''').fetchone()[0]
+          con.execute('CREATE TABLE g AS SELECT * FROM read_csv_auto(?,header=true,all_varchar=true,sample_size=-1)',[gse])
+          con.execute('''CREATE TABLE gd AS SELECT try_cast(service_date AS DATE) service_date,stop_id,route_or_line,
+            try_cast(gated_entries AS DOUBLE) gated_entries,
+            try_cast(regexp_extract(time_period,'(\\d{2}):(\\d{2})',1) AS INTEGER)*2+
+            CASE WHEN try_cast(regexp_extract(time_period,'(\\d{2}):(\\d{2})',2) AS INTEGER)>=30 THEN 1 ELSE 0 END halfhour
+            FROM g''')
+          glob=str(Path('events')/'**'/'*.csv')
+          con.execute(f"CREATE VIEW e0 AS SELECT * FROM read_csv_auto('{glob}',header=true,union_by_name=true,all_varchar=true)")
+          con.execute('''CREATE TABLE ed AS SELECT try_cast(e.service_date AS DATE) service_date,m.parent_station stop_id,
+            CASE WHEN e.route_id='Red' THEN 'Red Line' WHEN e.route_id='Blue' THEN 'Blue Line'
+                 WHEN e.route_id='Orange' THEN 'Orange Line' WHEN starts_with(e.route_id,'Green-') THEN 'Green Line' ELSE NULL END route_or_line,
+            floor(try_cast(e.event_time_sec AS DOUBLE)/1800)::INTEGER halfhour,e.event_type,try_cast(e.event_time_sec AS DOUBLE) event_time_sec
+            FROM e0 e JOIN stop_map m USING(stop_id)
+            WHERE e.event_type IN ('ARR','DEP') AND try_cast(e.event_time_sec AS DOUBLE)>=0 AND try_cast(e.event_time_sec AS DOUBLE)<86400''')
+          con.execute('''CREATE TABLE supply AS SELECT service_date,stop_id,route_or_line,halfhour,
+            count(*) FILTER(WHERE event_type='DEP') departures,count(*) FILTER(WHERE event_type='ARR') arrivals
+            FROM ed WHERE route_or_line IS NOT NULL GROUP BY ALL''')
+          con.execute('''CREATE TABLE panel AS SELECT gd.service_date,gd.stop_id,gd.route_or_line,gd.halfhour,gd.gated_entries,
+            coalesce(s.departures,0) departures,coalesce(s.arrivals,0) arrivals,
+            CASE WHEN coalesce(s.departures,0)>0 THEN gd.gated_entries/s.departures ELSE NULL END entry_per_departure_proxy
+            FROM gd LEFT JOIN supply s USING(service_date,stop_id,route_or_line,halfhour)
+            WHERE gd.route_or_line IN ('Red Line','Blue Line','Orange Line','Green Line')''')
+          con.execute('''CREATE TABLE hw AS WITH d AS (
+            SELECT service_date,stop_id,route_or_line,event_time_sec,
+              event_time_sec-lag(event_time_sec) OVER(PARTITION BY service_date,stop_id,route_or_line ORDER BY event_time_sec) headway_sec
+            FROM ed WHERE event_type='DEP' AND route_or_line IS NOT NULL)
+            SELECT * FROM d WHERE headway_sec>0 AND headway_sec<=7200''')
+          s=con.execute('''SELECT count(*) n_rows,sum(gated_entries) gated_mass,
+            count(*) FILTER(WHERE departures>0) n_rows_with_departures,
+            sum(gated_entries) FILTER(WHERE departures>0) mass_with_departures,
+            count(*) FILTER(WHERE gated_entries>0 AND departures=0) n_positive_demand_no_departure,
+            sum(gated_entries) FILTER(WHERE gated_entries>0 AND departures=0) mass_positive_demand_no_departure,
+            quantile_cont(entry_per_departure_proxy,.5),quantile_cont(entry_per_departure_proxy,.9),quantile_cont(entry_per_departure_proxy,.99),max(entry_per_departure_proxy)
+            FROM panel''').fetchone()
+          h=con.execute('SELECT count(*),quantile_cont(headway_sec,.5),quantile_cont(headway_sec,.9),quantile_cont(headway_sec,.99),max(headway_sec) FROM hw').fetchone()
+          byline=con.execute('''SELECT route_or_line,count(*) n_rows,sum(gated_entries) mass,sum(departures) departures,
+            quantile_cont(entry_per_departure_proxy,.5) p50,quantile_cont(entry_per_departure_proxy,.9) p90,quantile_cont(entry_per_departure_proxy,.99) p99
+            FROM panel GROUP BY 1 ORDER BY 1''').fetchdf().to_dict('records')
+          con.execute('''CREATE TABLE baseline AS SELECT stop_id,route_or_line,halfhour,median(gated_entries) base_entries,median(departures) base_departures FROM panel GROUP BY ALL''')
+          mismatch=con.execute('''SELECT p.service_date::VARCHAR service_date,p.stop_id,p.route_or_line,p.halfhour,p.gated_entries,p.departures,b.base_entries,b.base_departures,
+            CASE WHEN b.base_entries>0 THEN p.gated_entries/b.base_entries ELSE NULL END demand_ratio,p.departures-b.base_departures departure_delta
+            FROM panel p JOIN baseline b USING(stop_id,route_or_line,halfhour)
+            WHERE b.base_entries>0 AND p.gated_entries>=2*b.base_entries ORDER BY demand_ratio DESC LIMIT 100''').fetchdf().to_dict('records')
+          out={'schema':'mbta-2020-demand-service-pressure.v3','dataset_id':'US_BOS_MBTA_2020_THREE_SOURCE_PROFILE','evidence_class':'SAME_DATE_AGGREGATE_ENTRY_DEMAND_PLUS_DIRECT_REALIZED_SERVICE_EVENTS',
+            'source_member':xs[0],'event_csv_count':len(ev),'panel':{'n_rows':int(s[0]),'gated_mass':float(s[1] or 0),'n_rows_with_departures':int(s[2]),'mass_with_departures':float(s[3] or 0),'matched_mass_share':float((s[3] or 0)/(s[1] or 1)),'n_positive_demand_no_departure':int(s[4]),'mass_positive_demand_no_departure':float(s[5] or 0),'entry_per_departure_proxy':{'median':s[6],'p90':s[7],'p99':s[8],'max':s[9]}},
+            'realized_departure_headway_sec':{'n':int(h[0]),'median':h[1],'p90':h[2],'p99':h[3],'max_capped_7200':h[4]},'by_line':byline,'large_demand_ratio_cells':mismatch,
+            'stop_mapping':{'unique_child_parent_mappings':int(map_count),'conflicting_child_parent_ids_excluded':int(map_conflict)},
+            'interpretation':'entry_per_departure_proxy is aggregate gated-entry pressure per realized departure opportunity; not train load, capacity utilization, platform queue, or passenger-to-train assignment.',
+            'claim_boundary':'GSE is aggregate entry demand. Same-date service opportunity can be studied, but individual pulse genealogy/catch-miss is not observed.'}
+          Path('mbta_2020_demand_service_pressure.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+          con.execute("COPY panel TO 'mbta_2020_station_line_halfhour_panel.csv.gz' (HEADER,COMPRESSION GZIP)")
+          print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
+          PY
+
+      - name: Persist aggregate evidence
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          for f in mbta_2020_demand_service_pressure.json mbta_2020_station_line_halfhour_panel.csv.gz; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

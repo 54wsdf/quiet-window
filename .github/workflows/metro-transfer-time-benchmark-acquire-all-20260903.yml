@@ -1,0 +1,401 @@
+name: Metro Transfer-Time Benchmark Acquire All 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/metro-transfer-time-benchmark-acquire-all-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_time_benchmark/20260903
+
+jobs:
+  direct-gtfs:
+    name: direct-${{ matrix.dataset_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dataset_id: CL_SCL_DTPM_GTFS_PATHWAYS_20260829
+            source_url: https://dtpm.cl/descargas/gtfs/GTFS_20260829.zip
+            filename: santiago_gtfs_20260829.zip
+            subdir: santiago
+            required_extra: pathways.txt
+            source_note: DTPM Red Metropolitana current GTFS published 2026-08-29
+          - dataset_id: US_BOS_MBTA_GTFS_PATHWAYS_20260903
+            source_url: https://cdn.mbta.com/MBTA_GTFS.zip
+            filename: mbta_gtfs_20260903.zip
+            subdir: boston_mbta
+            required_extra: pathways.txt transfers.txt
+            source_note: MBTA official current GTFS
+          - dataset_id: HU_BUD_BKK_GTFS_PATHWAYS_20260903
+            source_url: https://bkk.hu/gtfs/budapest_gtfs.zip
+            filename: budapest_bkk_gtfs_20260903.zip
+            subdir: budapest_bkk
+            required_extra: pathways.txt
+            source_note: BKK official current GTFS
+          - dataset_id: US_NY_MTA_SUBWAY_GTFS_TRANSFERS_20260903
+            source_url: https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip
+            filename: nyc_mta_subway_gtfs_20260903.zip
+            subdir: nyc_mta
+            required_extra: transfers.txt
+            source_note: MTA official current subway GTFS
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DATASET_ID: ${{ matrix.dataset_id }}
+      SOURCE_URL: ${{ matrix.source_url }}
+      FILENAME: ${{ matrix.filename }}
+      SUBDIR: ${{ matrix.subdir }}
+      REQUIRED_EXTRA: ${{ matrix.required_extra }}
+      SOURCE_NOTE: ${{ matrix.source_note }}
+    steps:
+      - name: Check storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone unzip jq
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME" || { echo 'rclone remote not found'; exit 4; }
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download and validate official feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 \
+            -A 'quiet-window-public-data-acquisition/1.0' \
+            "$SOURCE_URL" -o "$FILENAME"
+          unzip -t "$FILENAME" >/tmp/unzip_test.log
+          tail -n 3 /tmp/unzip_test.log
+          NAMES="$(unzip -Z1 "$FILENAME" | tr -d '\r')"
+          for f in stops.txt routes.txt trips.txt stop_times.txt; do
+            printf '%s\n' "$NAMES" | grep -Fxq "$f" || { echo "missing base GTFS file: $f"; exit 10; }
+          done
+          for f in $REQUIRED_EXTRA; do
+            printf '%s\n' "$NAMES" | grep -Fxq "$f" || { echo "missing required transfer/pathways file: $f"; exit 11; }
+          done
+
+      - name: Build validation manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          export SHA256="$(sha256sum "$FILENAME" | awk '{print $1}')"
+          export SIZE_BYTES="$(stat -c '%s' "$FILENAME")"
+          for f in pathways.txt transfers.txt levels.txt stops.txt; do
+            if unzip -Z1 "$FILENAME" | tr -d '\r' | grep -Fxq "$f"; then
+              key="$(printf '%s' "$f" | tr '.-' '__' | tr '[:lower:]' '[:upper:]')_ROWS"
+              val="$(unzip -p "$FILENAME" "$f" | wc -l | tr -d ' ')"
+              export "$key=$val"
+            fi
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          def iv(name):
+              v=os.getenv(name)
+              return int(v) if v else None
+          d={
+            'dataset_id': os.environ['DATASET_ID'],
+            'state': 'VALIDATED_LOCAL',
+            'source_url': os.environ['SOURCE_URL'],
+            'source_note': os.environ['SOURCE_NOTE'],
+            'downloaded_at_utc': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+            'filename': os.environ['FILENAME'],
+            'size_bytes': int(os.environ['SIZE_BYTES']),
+            'sha256': os.environ['SHA256'],
+            'required_extra': os.environ['REQUIRED_EXTRA'].split(),
+            'rows_including_header': {
+              'pathways.txt': iv('PATHWAYS_TXT_ROWS'),
+              'transfers.txt': iv('TRANSFERS_TXT_ROWS'),
+              'levels.txt': iv('LEVELS_TXT_ROWS'),
+              'stops.txt': iv('STOPS_TXT_ROWS'),
+            }
+          }
+          Path('manifest.json').write_text(json.dumps(d,indent=2),encoding='utf-8')
+          print(json.dumps(d,indent=2))
+          PY
+
+      - name: Copy to Google Drive and verify remote bytes
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          DEST="$ROOT_DRIVE/$SUBDIR"
+          for f in "$FILENAME" manifest.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" \
+              --retries 8 --low-level-retries 20 --transfers 1 --checkers 4 --stats 30s --stats-one-line
+            LOCAL_SIZE="$(stat -c '%s' "$f")"
+            REMOTE_SIZE="$(rclone size "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"
+            test "$LOCAL_SIZE" = "$REMOTE_SIZE" || { echo "remote-size mismatch for $f"; exit 20; }
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path('manifest.json'); d=json.loads(p.read_text())
+          d['state']='ACQUIRED'
+          d['durable_storage']={'backend':'Google Drive via rclone','path':f"{os.environ['ROOT_DRIVE']}/{os.environ['SUBDIR']}/",'verified_by':'remote_size'}
+          p.write_text(json.dumps(d,indent=2),encoding='utf-8')
+          PY
+          rclone copyto manifest.json "$REMOTE_NAME:$DEST/manifest.json" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+
+      - name: Clean temporary configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  melbourne:
+    name: melbourne-ptv-pathways
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_URL: https://opendata.transport.vic.gov.au/dataset/3f4e292e-7f8a-4ffe-831f-1953be0fe448/resource/fb152201-859f-4882-9206-b768060b50ad/download/gtfs.zip
+      SUBDIR: melbourne_ptv
+    steps:
+      - name: Prepare tools and storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download outer GTFS and extract metropolitan train feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 8 --retry-all-errors "$SOURCE_URL" -o melbourne_victoria_gtfs_outer_20260903.zip
+          unzip -t melbourne_victoria_gtfs_outer_20260903.zip >/tmp/outer_test.log
+          unzip -p melbourne_victoria_gtfs_outer_20260903.zip '2/google_transit.zip' > melbourne_metropolitan_train_gtfs_20260903.zip
+          test -s melbourne_metropolitan_train_gtfs_20260903.zip
+          unzip -t melbourne_metropolitan_train_gtfs_20260903.zip >/tmp/inner_test.log
+          NAMES="$(unzip -Z1 melbourne_metropolitan_train_gtfs_20260903.zip | tr -d '\r')"
+          for f in stops.txt routes.txt trips.txt stop_times.txt pathways.txt levels.txt transfers.txt; do
+            printf '%s\n' "$NAMES" | grep -Fxq "$f" || { echo "missing metro-train file $f"; exit 11; }
+          done
+
+      - name: Manifest, store, and verify
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          export OUTER_SHA="$(sha256sum melbourne_victoria_gtfs_outer_20260903.zip | awk '{print $1}')"
+          export INNER_SHA="$(sha256sum melbourne_metropolitan_train_gtfs_20260903.zip | awk '{print $1}')"
+          export PATHWAYS_ROWS="$(unzip -p melbourne_metropolitan_train_gtfs_20260903.zip pathways.txt | wc -l | tr -d ' ')"
+          export TRANSFERS_ROWS="$(unzip -p melbourne_metropolitan_train_gtfs_20260903.zip transfers.txt | wc -l | tr -d ' ')"
+          export LEVELS_ROWS="$(unzip -p melbourne_metropolitan_train_gtfs_20260903.zip levels.txt | wc -l | tr -d ' ')"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          d={'dataset_id':'AU_MEL_PTV_GTFS_PATHWAYS_20260903','state':'VALIDATED_LOCAL','source_url':os.environ['SOURCE_URL'],
+             'outer_sha256':os.environ['OUTER_SHA'],'metro_train_sha256':os.environ['INNER_SHA'],
+             'rows_including_header':{'pathways.txt':int(os.environ['PATHWAYS_ROWS']),'transfers.txt':int(os.environ['TRANSFERS_ROWS']),'levels.txt':int(os.environ['LEVELS_ROWS'])},
+             'structure_note':'Official Victoria GTFS outer ZIP; operational branch 2/google_transit.zip is metropolitan train feed.'}
+          Path('manifest.json').write_text(json.dumps(d,indent=2),encoding='utf-8'); print(json.dumps(d,indent=2))
+          PY
+          DEST="$ROOT_DRIVE/$SUBDIR"
+          for f in melbourne_victoria_gtfs_outer_20260903.zip melbourne_metropolitan_train_gtfs_20260903.zip manifest.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1
+            L="$(stat -c '%s' "$f")"; R="$(rclone size "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path('manifest.json'); d=json.loads(p.read_text()); d['state']='ACQUIRED'; d['durable_storage']={'path':f"{os.environ['ROOT_DRIVE']}/{os.environ['SUBDIR']}/",'verified_by':'remote_size'}; p.write_text(json.dumps(d,indent=2))
+          PY
+          rclone copyto manifest.json "$REMOTE_NAME:$DEST/manifest.json" --config "$CONFIG_FILE"
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  singapore:
+    name: singapore-measured-transfer-times
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      FEED_URL: https://github.com/Vorld/singapore-gtfs/releases/download/v2026-07-12/singapore-gtfs.zip
+      SHEET_URL: https://docs.google.com/spreadsheets/d/1e-Tuf6rHBFsgsuFN7XqbFL8ec_vdRjQw/export?format=xlsx
+      EXPECTED_SHA256: d92173127e9a5cbf8ecb5b4d50ab03f68deb7f8ddff73648b8ffb33c70ab4801
+      SUBDIR: singapore_mrt
+    steps:
+      - name: Prepare tools and storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip jq file
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download release and raw measured-time workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 8 --retry-all-errors "$FEED_URL" -o singapore-gtfs_v2026-07-12.zip
+          ACTUAL="$(sha256sum singapore-gtfs_v2026-07-12.zip | awk '{print $1}')"; test "$ACTUAL" = "$EXPECTED_SHA256"
+          unzip -t singapore-gtfs_v2026-07-12.zip >/tmp/sg_test.log
+          unzip -Z1 singapore-gtfs_v2026-07-12.zip | tr -d '\r' | grep -Fxq transfers.txt
+          curl -fL --retry 8 --retry-all-errors -A 'Mozilla/5.0' "$SHEET_URL" -o singapore_interchange_transfer_times_measured.xlsx
+          file singapore_interchange_transfer_times_measured.xlsx
+          test -s singapore_interchange_transfer_times_measured.xlsx
+          unzip -t singapore_interchange_transfer_times_measured.xlsx >/tmp/xlsx_test.log
+
+      - name: Manifest, store, and verify
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          export TRANSFERS_ROWS="$(unzip -p singapore-gtfs_v2026-07-12.zip transfers.txt | wc -l | tr -d ' ')"
+          export XLSX_SHA="$(sha256sum singapore_interchange_transfer_times_measured.xlsx | awk '{print $1}')"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          d={'dataset_id':'SG_SG_MRT_MEASURED_TRANSFER_TIMES_20260903','state':'VALIDATED_LOCAL','feed_url':os.environ['FEED_URL'],'raw_workbook_url':os.environ['SHEET_URL'],
+             'feed_sha256':os.environ['EXPECTED_SHA256'],'workbook_sha256':os.environ['XLSX_SHA'],'transfers_rows_including_header':int(os.environ['TRANSFERS_ROWS']),
+             'evidence_note':'Community-measured directional interchange walking times; compiled feed release v2026-07-12 plus preserved public workbook.'}
+          Path('manifest.json').write_text(json.dumps(d,indent=2),encoding='utf-8'); print(json.dumps(d,indent=2))
+          PY
+          DEST="$ROOT_DRIVE/$SUBDIR"
+          for f in singapore-gtfs_v2026-07-12.zip singapore_interchange_transfer_times_measured.xlsx manifest.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1
+            L="$(stat -c '%s' "$f")"; R="$(rclone size "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path('manifest.json'); d=json.loads(p.read_text()); d['state']='ACQUIRED'; d['durable_storage']={'path':f"{os.environ['ROOT_DRIVE']}/{os.environ['SUBDIR']}/",'verified_by':'remote_size'}; p.write_text(json.dumps(d,indent=2))
+          PY
+          rclone copyto manifest.json "$REMOTE_NAME:$DEST/manifest.json" --config "$CONFIG_FILE"
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  london:
+    name: london-tube-interchange-times
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      HF_REPO: https://huggingface.co/datasets/permutans/tube-interchange-times
+      SUBDIR: london_tfl
+    steps:
+      - name: Prepare tools and storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq zip git-lfs
+          git lfs install
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Clone complete public Hugging Face dataset snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          git clone --depth 1 "$HF_REPO" london_repo
+          (cd london_repo && git lfs pull)
+          find london_repo -maxdepth 3 -type f -not -path '*/.git/*' -printf '%P\t%s\n' | sort > london_file_inventory.tsv
+          test -s london_file_inventory.tsv
+          DATA_COUNT="$(find london_repo -type f -not -path '*/.git/*' \( -name '*.json' -o -name '*.jsonl' -o -name '*.csv' -o -name '*.parquet' \) | wc -l | tr -d ' ')"
+          test "$DATA_COUNT" -ge 1 || { echo 'no structured data files found'; exit 11; }
+          rm -rf london_repo/.git
+          zip -qr london_tube_interchange_times_hf_snapshot_20260903.zip london_repo london_file_inventory.tsv
+
+      - name: Manifest, store, and verify
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          export SNAP_SHA="$(sha256sum london_tube_interchange_times_hf_snapshot_20260903.zip | awk '{print $1}')"
+          export FILE_COUNT="$(wc -l < london_file_inventory.tsv | tr -d ' ')"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          inv=Path('london_file_inventory.tsv').read_text(encoding='utf-8').splitlines()
+          d={'dataset_id':'UK_LON_TFL_INTERCHANGE_TIMES_2015_PROCESSED_20260903','state':'VALIDATED_LOCAL','source_repo':os.environ['HF_REPO'],
+             'snapshot_sha256':os.environ['SNAP_SHA'],'file_count':int(os.environ['FILE_COUNT']),'files':inv,
+             'evidence_note':'Processed dataset derived from TfL FOI-0986-1516; gate-to-platform values are walking times, interchange values include waiting penalty.'}
+          Path('manifest.json').write_text(json.dumps(d,indent=2),encoding='utf-8'); print(json.dumps(d,indent=2))
+          PY
+          DEST="$ROOT_DRIVE/$SUBDIR"
+          for f in london_tube_interchange_times_hf_snapshot_20260903.zip london_file_inventory.tsv manifest.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1
+            L="$(stat -c '%s' "$f")"; R="$(rclone size "$REMOTE_NAME:$DEST/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path('manifest.json'); d=json.loads(p.read_text()); d['state']='ACQUIRED'; d['durable_storage']={'path':f"{os.environ['ROOT_DRIVE']}/{os.environ['SUBDIR']}/",'verified_by':'remote_size'}; p.write_text(json.dumps(d,indent=2))
+          PY
+          rclone copyto manifest.json "$REMOTE_NAME:$DEST/manifest.json" --config "$CONFIG_FILE"
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

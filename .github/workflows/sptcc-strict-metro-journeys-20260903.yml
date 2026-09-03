@@ -26,7 +26,7 @@ jobs:
           set -euo pipefail
           test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
-          python -m pip install --disable-pip-version-check duckdb
+          python -m pip install --disable-pip-version-check duckdb pandas
           CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
           printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
           REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
@@ -45,88 +45,72 @@ jobs:
             echo "building $src"
             rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$src" input.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
             SRC="$src" python - <<'PY'
-          import codecs,json,os,re
+          import codecs,json,os
           from pathlib import Path
           import duckdb
           src=os.environ['SRC']; day=src[6:14]; raw=Path('input.csv'); utf8=Path('input.utf8.csv')
           with raw.open('rb') as fi, utf8.open('w',encoding='utf-8',newline='') as fo:
               for line in codecs.getreader('gb18030')(fi,errors='strict'): fo.write(line)
-          con=duckdb.connect(':memory:')
-          con.execute("PRAGMA threads=4")
+          con=duckdb.connect(':memory:'); con.execute('PRAGMA threads=4')
           con.execute("CREATE TABLE t AS SELECT * FROM read_csv_auto(?,header=true,all_varchar=true,sample_size=200000,ignore_errors=false)",[str(utf8)])
           con.execute('''CREATE TABLE metro AS SELECT "卡ID" card_key,"刷卡站点" station_token,
             try_cast("刷卡扣钱" AS DOUBLE) fare,
             strptime("刷卡日期"||' '||"刷卡时间",'%Y-%m-%d %H:%M:%S') ts
             FROM t WHERE "刷卡乘车类型"='地铁' AND try_cast("刷卡扣钱" AS DOUBLE) IS NOT NULL''')
-          # A strict pair is two immediately adjacent metro transactions for the same card, ordered by timestamp;
-          # entry is zero fare, exit positive fare, gap is >0 and <=6h. Exact timestamp ties are excluded.
+          con.execute('''CREATE TABLE metro_tagged AS SELECT *,count(*) OVER(PARTITION BY card_key,ts) same_ts_count FROM metro''')
           con.execute('''CREATE TABLE ordered AS SELECT *,
             lead(ts) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) next_ts,
             lead(station_token) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) next_station,
             lead(fare) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) next_fare,
-            count(*) OVER(PARTITION BY card_key,ts) same_ts_count
-            FROM metro''')
-          con.execute('''CREATE TABLE journeys0 AS SELECT ts entry_ts,next_ts exit_ts,station_token entry_station,next_station exit_station,
+            lead(same_ts_count) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) next_same_ts_count
+            FROM metro_tagged''')
+          con.execute('''CREATE TABLE journeys AS SELECT
+            row_number() OVER(ORDER BY ts,station_token,next_ts,next_station,card_key) journey_index,
+            ts entry_ts,next_ts exit_ts,station_token entry_station,next_station exit_station,
             epoch(next_ts-ts)::BIGINT duration_sec,next_fare exit_fare,
             regexp_extract(station_token,'^([0-9]+)号线',1) entry_line,
-            regexp_extract(next_station,'^([0-9]+)号线',1) exit_line
+            regexp_extract(next_station,'^([0-9]+)号线',1) exit_line,
+            station_token=next_station same_station
             FROM ordered
-            WHERE fare=0 AND next_fare>0 AND next_ts>ts AND epoch(next_ts-ts)<=21600 AND same_ts_count=1''')
-          # Exclude exits that participate in timestamp ties too, using a timestamp-card ambiguity table.
-          con.execute('''CREATE TABLE amb AS SELECT card_key,ts FROM metro GROUP BY 1,2 HAVING count(*)>1''')
-          # Since card_key is intentionally absent from journeys0, rebuild strict final using a CTE that checks both endpoints before dropping ID.
-          con.execute('''CREATE TABLE journeys AS WITH x AS (
-            SELECT card_key,ts entry_ts,next_ts exit_ts,station_token entry_station,next_station exit_station,
-              epoch(next_ts-ts)::BIGINT duration_sec,next_fare exit_fare,
-              regexp_extract(station_token,'^([0-9]+)号线',1) entry_line,
-              regexp_extract(next_station,'^([0-9]+)号线',1) exit_line,
-              same_ts_count,
-              lead(same_ts_count) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) next_same_ts_count
-            FROM ordered)
-            SELECT row_number() OVER(ORDER BY entry_ts,entry_station,exit_ts,exit_station,duration_sec) journey_index,
-              entry_ts,exit_ts,entry_station,exit_station,duration_sec,exit_fare,entry_line,exit_line,
-              entry_station=exit_station same_station
-            FROM x WHERE same_ts_count=1 AND coalesce(next_same_ts_count,1)=1
-              AND duration_sec>0 AND duration_sec<=21600
-              AND EXISTS (SELECT 1 FROM metro m WHERE m.card_key=x.card_key AND m.ts=x.entry_ts AND m.fare=0)
-              AND EXISTS (SELECT 1 FROM metro m WHERE m.card_key=x.card_key AND m.ts=x.exit_ts AND m.fare>0)''')
-          # The EXISTS form above keeps source semantics explicit; final table contains no card identifiers.
-          # Deduplicate exact journey tuples only if they arose from the same source rows? No: multiple passengers may share identical times/stations,
-          # so duplicates are scientifically meaningful and must be retained.
+            WHERE fare=0 AND next_fare>0 AND next_ts>ts AND epoch(next_ts-ts)<=21600
+              AND same_ts_count=1 AND next_same_ts_count=1''')
           n=con.execute('SELECT count(*) FROM journeys').fetchone()[0]
-          mass=con.execute('SELECT count(*),count(*) FILTER(WHERE NOT same_station),count(*) FILTER(WHERE entry_line<>exit_line AND entry_line<>\'\' AND exit_line<>\'\'),quantile_cont(duration_sec,.5),quantile_cont(duration_sec,.9),quantile_cont(duration_sec,.99),max(duration_sec) FROM journeys').fetchone()
-          od=con.execute('SELECT count(DISTINCT entry_station||\' -> \'||exit_station),count(DISTINCT entry_station),count(DISTINCT exit_station) FROM journeys').fetchone()
-          # Pulse-friendly aggregate summaries by 5/15/60 seconds at exit stations.
+          mass=con.execute('''SELECT count(*),count(*) FILTER(WHERE NOT same_station),
+            count(*) FILTER(WHERE entry_line<>exit_line AND entry_line<>'' AND exit_line<>''),
+            quantile_cont(duration_sec,.5),quantile_cont(duration_sec,.9),quantile_cont(duration_sec,.99),max(duration_sec) FROM journeys''').fetchone()
+          od=con.execute("SELECT count(DISTINCT entry_station||' -> '||exit_station),count(DISTINCT entry_station),count(DISTINCT exit_station) FROM journeys").fetchone()
           pulse={}
           for w in (5,15,60):
-              x=con.execute(f'''WITH b AS (SELECT exit_station,floor(epoch(exit_ts)/{w})::BIGINT bin,count(*) n FROM journeys GROUP BY 1,2)
-                SELECT count(*) bins,quantile_cont(n,.5),quantile_cont(n,.9),quantile_cont(n,.99),max(n),sum(n) FILTER(WHERE n>=2),sum(n) FILTER(WHERE n>=5) FROM b''').fetchone()
+              x=con.execute(f'''WITH b AS (SELECT exit_station,floor(epoch(exit_ts)/{w})::BIGINT time_bin,count(*) n FROM journeys GROUP BY 1,2)
+                SELECT count(*) n_bins,quantile_cont(n,.5),quantile_cont(n,.9),quantile_cont(n,.99),max(n),sum(n) FILTER(WHERE n>=2),sum(n) FILTER(WHERE n>=5) FROM b''').fetchone()
               pulse[str(w)]={'occupied_bins':int(x[0]),'bin_mass_p50':x[1],'p90':x[2],'p99':x[3],'max':int(x[4]),'journeys_in_bins_ge2':int(x[5] or 0),'journeys_in_bins_ge5':int(x[6] or 0)}
-          top=con.execute('''SELECT entry_station,exit_station,count(*) journeys,quantile_cont(duration_sec,.5) p50,quantile_cont(duration_sec,.9) p90
-            FROM journeys WHERE NOT same_station GROUP BY 1,2 ORDER BY journeys DESC LIMIT 50''').fetchdf().to_dict('records')
-          out={'schema':'sptcc-strict-metro-journeys.v1','source_file':src,'source_date':day,'strict_journeys':int(n),
+          top=con.execute('''SELECT entry_station,exit_station,count(*) n_journeys,quantile_cont(duration_sec,.5) p50,quantile_cont(duration_sec,.9) p90
+            FROM journeys WHERE NOT same_station GROUP BY 1,2 ORDER BY n_journeys DESC LIMIT 50''').fetchdf().to_dict('records')
+          out={'schema':'sptcc-strict-metro-journeys.v2','source_file':src,'source_date':day,'strict_journeys':int(n),
             'different_station_journeys':int(mass[1]),'different_station_share':mass[1]/n if n else None,'cross_line_token_journeys':int(mass[2]),'cross_line_token_share':mass[2]/n if n else None,
             'duration_sec':{'median':mass[3],'p90':mass[4],'p99':mass[5],'max':int(mass[6])},'od_pairs':int(od[0]),'entry_station_tokens':int(od[1]),'exit_station_tokens':int(od[2]),
             'exit_pulse_bins':pulse,'top_od_pairs':top,
-            'pairing_rule':'Immediately adjacent metro transactions for the same card, zero-fare entry then positive-fare exit, strictly increasing time, duration<=6h, both endpoint timestamps non-ambiguous. No imputation.',
-            'privacy_rule':'Trip-level derived output contains no card identifier and no cross-journey passenger linkage. Raw card IDs never leave the runner.',
-            'claim_boundary':'Strict journey table is a high-confidence subset, not a claim of complete recovery of every metro journey.'}
+            'pairing_rule':'Immediately adjacent metro transactions for the same card, source-qualified zero-fare entry followed by positive-fare exit, strictly increasing time, duration<=6h, both endpoint timestamps unique for that card. No imputation.',
+            'privacy_rule':'Output contains no card identifier and no cross-journey passenger linkage. Raw card identifiers remain transient runner-only data.',
+            'claim_boundary':'High-confidence strict journey subset, not complete recovery of all metro journeys.'}
           outp=f'SPTCC-{day}.strict_metro_journeys.parquet'
           con.execute(f"COPY journeys TO '{outp}' (FORMAT PARQUET,COMPRESSION ZSTD)")
           Path(f'SPTCC-{day}.strict_metro_journeys.summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
           print(json.dumps(out,ensure_ascii=False,indent=2,default=str)); con.close(); raw.unlink(); utf8.unlink()
           PY
-            for f in SPTCC-$day.strict_metro_journeys.parquet SPTCC-$day.strict_metro_journeys.summary.json; do :; done 2>/dev/null || true
           done
           python - <<'PY'
           import json
           from pathlib import Path
           ps=[json.loads(p.read_text(encoding='utf-8')) for p in sorted(Path('.').glob('SPTCC-*.strict_metro_journeys.summary.json'))]
-          out={'schema':'sptcc-strict-metro-journeys-crossday.v1','dataset_id':'CN_SH_SPTCC_2016_DRIVE_STACK','days':len(ps),'strict_journeys':sum(p['strict_journeys'] for p in ps),'different_station_journeys':sum(p['different_station_journeys'] for p in ps),'cross_line_token_journeys':sum(p['cross_line_token_journeys'] for p in ps),'daily':[{'source_date':p['source_date'],'strict_journeys':p['strict_journeys'],'duration_sec':p['duration_sec']} for p in ps],'evidence_state':'STRICT_SECOND_LEVEL_METRO_JOURNEY_LAYER_BUILT','claim_boundary':'High-confidence strict subset only; no passenger-to-train truth and no same-date ATS linkage.'}
+          out={'schema':'sptcc-strict-metro-journeys-crossday.v2','dataset_id':'CN_SH_SPTCC_2016_DRIVE_STACK','days':len(ps),
+            'strict_journeys':sum(p['strict_journeys'] for p in ps),'different_station_journeys':sum(p['different_station_journeys'] for p in ps),'cross_line_token_journeys':sum(p['cross_line_token_journeys'] for p in ps),
+            'daily':[{'source_date':p['source_date'],'strict_journeys':p['strict_journeys'],'different_station_share':p['different_station_share'],'cross_line_token_share':p['cross_line_token_share'],'duration_sec':p['duration_sec']} for p in ps],
+            'evidence_state':'STRICT_SECOND_LEVEL_METRO_JOURNEY_LAYER_BUILT','claim_boundary':'High-confidence strict subset only; no passenger-to-train truth and no same-date ATS linkage.'}
           Path('sptcc_strict_metro_journeys_summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(out,ensure_ascii=False,indent=2))
           PY
 
-      - name: Persist trip-level deidentified derived layer to Drive only
+      - name: Persist deidentified trip layer to Drive only
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}

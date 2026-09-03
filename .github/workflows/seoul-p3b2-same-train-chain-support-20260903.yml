@@ -1,0 +1,171 @@
+name: Seoul P3B2 Same-Train Chain Support Audit 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b2-same-train-chain-support-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b2"; cd "$RUNNER_TEMP/p3b2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p3b1_candidate_interchange_refinement_20260903.json" p3b1.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Audit same-train segment coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b2"
+          python - <<'PY'
+          import csv,io,json,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          IN_LINE='1008'; OUT_LINE='1002'; IN_TRANSFER='1008000814'; OUT_TRANSFER='1002000216'
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+
+          # Build paired realized event trajectories by line and public train number.
+          trains=defaultdict(lambda:defaultdict(list));row_n=0
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  train=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();arr=dt(row.get('arrival_detect_time'));dep=dt(row.get('departure_detect_time'))
+                  if not train or not st or not arr or not dep:continue
+                  row_n+=1;trains[(line,train)][st].append((arr,dep))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+
+          # Segment support: origin station -> Jamsil arrival on same train; Jamsil departure -> destination station on same train.
+          inbound_by_origin=defaultdict(list);outbound_by_dest=defaultdict(list)
+          inbound_transfer_trains=set();outbound_transfer_trains=set()
+          for (line,train),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for tarr,tdep in sts[IN_TRANSFER]:
+                      inbound_transfer_trains.add(train)
+                      for ost,events in sts.items():
+                          if ost==IN_TRANSFER:continue
+                          for oarr,odep in events:
+                              if odep<tarr and 0<(tarr-odep).total_seconds()<=7200:
+                                  inbound_by_origin[ost].append({'train':train,'origin_departure':odep,'transfer_arrival':tarr,'segment_sec':(tarr-odep).total_seconds()});break
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for tarr,tdep in sts[OUT_TRANSFER]:
+                      outbound_transfer_trains.add(train)
+                      for dst,events in sts.items():
+                          if dst==OUT_TRANSFER:continue
+                          for darr,ddep in events:
+                              if darr>tdep and 0<(darr-tdep).total_seconds()<=7200:
+                                  outbound_by_dest[dst].append({'train':train,'transfer_departure':tdep,'destination_arrival':darr,'segment_sec':(darr-tdep).total_seconds()});break
+          for st in inbound_by_origin:inbound_by_origin[st].sort(key=lambda x:x['origin_departure'])
+          for st in outbound_by_dest:outbound_by_dest[st].sort(key=lambda x:x['transfer_departure'])
+
+          # Passenger candidate coverage.
+          stats=Counter();origin_mass=Counter();dest_mass=Counter();supported_origin_mass=Counter();supported_dest_mass=Counter();obs_tt=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a['service_subway_id']!=IN_LINE or b['service_subway_id']!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and 7<=t0.hour<9):continue
+                  stats['am_candidate']+=1
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  stats['valid_time']+=1;obs_tt.append((t1-t0).total_seconds())
+                  os=a['service_statn_id'];ds=b['service_statn_id'];origin_mass[os]+=1;dest_mass[ds]+=1
+                  ins=inbound_by_origin.get(os,[]);outs=outbound_by_dest.get(ds,[])
+                  if ins:stats['origin_same_train_segment_supported']+=1;supported_origin_mass[os]+=1
+                  if outs:stats['destination_same_train_segment_supported']+=1;supported_dest_mass[ds]+=1
+                  if ins and outs:stats['both_segments_structurally_supported']+=1
+              f.close()
+
+          inbound_summary={st:{'service_instances':len(v),'unique_trains':len({x['train'] for x in v}),'segment_median_sec':statistics.median([x['segment_sec'] for x in v]),'segment_p90_sec':q([x['segment_sec'] for x in v],.9)} for st,v in inbound_by_origin.items()}
+          outbound_summary={st:{'service_instances':len(v),'unique_trains':len({x['train'] for x in v}),'segment_median_sec':statistics.median([x['segment_sec'] for x in v]),'segment_p90_sec':q([x['segment_sec'] for x in v],.9)} for st,v in outbound_by_dest.items()}
+          top_orig=[]
+          for st,m in origin_mass.most_common(20):top_orig.append({'service_station_id':st,'passenger_rows':m,'same_train_segment_supported':st in inbound_summary,'service_support':inbound_summary.get(st)})
+          top_dest=[]
+          for st,m in dest_mass.most_common(20):top_dest.append({'service_station_id':st,'passenger_rows':m,'same_train_segment_supported':st in outbound_summary,'service_support':outbound_summary.get(st)})
+          both=stats['both_segments_structurally_supported'];valid=stats['valid_time']
+          result={
+            'schema':'mppd-n1-seoul-p3b2-same-train-segment-support-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'candidate':{'incoming_line':IN_LINE,'outgoing_line':OUT_LINE,'station_ko':'잠실','station_en':'Jamsil','incoming_transfer_station_id':IN_TRANSFER,'outgoing_transfer_station_id':OUT_TRANSFER,'physical_shortest_transfer_sec':158},
+            'service_event_rows_on_two_lines':row_n,'incoming_transfer_unique_trains':len(inbound_transfer_trains),'outgoing_transfer_unique_trains':len(outbound_transfer_trains),'origin_stations_with_same_train_path_to_transfer':len(inbound_by_origin),'destination_stations_with_same_train_path_from_transfer':len(outbound_by_dest),
+            'passenger_funnel':dict(stats),'both_segment_support_share':both/valid if valid else None,'observed_od_travel_time_median_sec':statistics.median(obs_tt) if obs_tt else None,
+            'top_origin_stations':top_orig,'top_destination_stations':top_dest,
+            'qualification':{
+              'same_train_segment_support_pass':bool(valid>=500 and both/valid>=0.70),
+              'minimum_valid_passenger_rows':500,'minimum_both_segment_support_share':0.70,
+              'next_gate':'P3B3_FEASIBLE_SERVICE_CHAIN_OPPORTUNITY_AUDIT' if (valid>=500 and both/valid>=0.70) else 'REASSESS_CANDIDATE_OR_SERVICE_EVENT_SCOPE'
+            },
+            'evidence_boundary':['Same public train number across two stations with ordered freshness-qualified events supports a realized service segment; it does not assign a passenger to that train.','The passenger population remains a structurally constrained unique-direct-interchange candidate population, not observed route choice.','No passenger train-to-train genealogy is claimed.']
+          }
+          Path('seoul_p3b2_same_train_chain_support_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B2_CONCISE='+json.dumps({'service_rows':row_n,'in_transfer_trains':len(inbound_transfer_trains),'out_transfer_trains':len(outbound_transfer_trains),'origin_path_stations':len(inbound_by_origin),'dest_path_stations':len(outbound_by_dest),'funnel':dict(stats),'both_share':result['both_segment_support_share'],'qualification':result['qualification'],'top_orig':top_orig[:5],'top_dest':top_dest[:5]},ensure_ascii=False))
+          PY
+
+      - name: Store audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b2"
+          F=seoul_p3b2_same_train_chain_support_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3B2_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

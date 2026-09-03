@@ -1,0 +1,104 @@
+name: Seoul P2A9 Full Prefix Line Model 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a9-full-prefix-line-model-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore P1C durable result
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a9"; cd "$RUNNER_TEMP/p2a9"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Extract accepted prefix model and line labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a9"
+          python - <<'PY'
+          import json
+          from datetime import datetime,timezone
+          from pathlib import Path
+          x=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          keys=sorted(x.keys())
+          pm=x.get('prefix_model') or x.get('empirical_prefix_model') or x.get('out_stn_prefix_model')
+          ilm=x.get('inferred_line_map') or x.get('transfer_line_to_service') or x.get('line_map')
+          if pm is None:
+              # Search recursively for a dict whose values look like prefix-model records.
+              found=[]
+              def walk(v,path=''):
+                  if isinstance(v,dict):
+                      if v and all(isinstance(k,str) for k in v) and any(k.isdigit() and len(k)==2 for k in v):
+                          sample=next(iter(v.values()))
+                          if isinstance(sample,dict) and ('service_subway_id' in sample or 'accepted' in sample): found.append((path,v))
+                      for k,z in v.items(): walk(z,path+'/'+str(k))
+                  elif isinstance(v,list):
+                      for i,z in enumerate(v): walk(z,path+f'/{i}')
+              walk(x)
+              if found: pm=found[0][1]
+          if pm is None:
+              raise RuntimeError('P1C durable result does not contain prefix_model; reconstruction required')
+          accepted={}
+          rejected={}
+          for p,rec in pm.items():
+              if not isinstance(rec,dict): continue
+              item={k:rec.get(k) for k in ('service_subway_id','support','total_resolved','share','runner_up','accepted') if k in rec}
+              if rec.get('accepted'): accepted[p]=item
+              else: rejected[p]=item
+          result={
+              'schema':'mppd-n1-seoul-p2a9-full-prefix-line-model-v1',
+              'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+              'p1c_top_level_keys':keys,
+              'accepted_prefix_model':accepted,
+              'rejected_prefix_model':rejected,
+              'accepted_prefix_count':len(accepted),
+              'rejected_prefix_count':len(rejected),
+              'inferred_line_map':ilm,
+              'source':'seoul_p1c_line_aware_crosswalk_20260903.json',
+              'boundary':'This model is inherited from the P1C data-derived crosswalk and is not a universal Seoul station-code specification. Only accepted prefixes may be used for strict P2 line-aware transfer calibration.'
+          }
+          Path('seoul_p2a9_full_prefix_line_model_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P2A9_CONCISE='+json.dumps({'accepted_prefix_count':len(accepted),'accepted_prefix_model':accepted,'has_inferred_line_map':ilm is not None},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a9"
+          F=seoul_p2a9_full_prefix_line_model_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P2A9_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

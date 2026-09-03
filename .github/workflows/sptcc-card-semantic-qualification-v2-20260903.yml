@@ -1,0 +1,136 @@
+name: SPTCC Card Semantic Qualification V2 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sptcc-card-semantic-qualification-v2-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/99_manifests/sptcc_semantic_qualification_20260903
+    steps:
+      - name: Prepare storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check duckdb pandas
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/sptcc"
+
+      - name: Qualify source-defined temporal and mode semantics
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sptcc"
+          for src in SPTCC-20160701.csv SPTCC-20160802.csv SPTCC-20160901.csv; do
+            rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$src" input.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            SRC="$src" python - <<'PY'
+          import codecs,json,os
+          from pathlib import Path
+          import duckdb
+          src=os.environ['SRC']; raw=Path('input.csv'); utf8=Path('input.utf8.csv')
+          with raw.open('rb') as fi, utf8.open('w',encoding='utf-8',newline='') as fo:
+              for line in codecs.getreader('gb18030')(fi,errors='strict'): fo.write(line)
+          con=duckdb.connect(':memory:')
+          con.execute("CREATE TABLE t AS SELECT * FROM read_csv_auto(?,header=true,all_varchar=true,sample_size=200000,ignore_errors=false)",[str(utf8)])
+          cols=[x[0] for x in con.execute('DESCRIBE t').fetchall()]
+          req={'卡ID','刷卡日期','刷卡时间','刷卡站点','刷卡乘车类型','刷卡扣钱','是否优惠'}
+          if not req.issubset(cols): raise SystemExit(f'schema mismatch {cols}')
+          n=con.execute('SELECT count(*) FROM t').fetchone()[0]
+          best=None
+          for df in ('%Y-%m-%d','%Y/%m/%d','%Y%m%d'):
+              for tf in ('%H:%M:%S','%H%M%S'):
+                  fmt=df+' '+tf
+                  x=con.execute(f'''SELECT count(*) FILTER(WHERE try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}') IS NOT NULL),
+                    min(try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}')),max(try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}')),
+                    count(DISTINCT extract(second FROM try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}'))) FILTER(WHERE try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}') IS NOT NULL),
+                    count(*) FILTER(WHERE try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}') IS NOT NULL AND extract(second FROM try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}'))=0) FROM t''').fetchone()
+                  cand=(int(x[0]),fmt,x)
+                  if best is None or cand[0]>best[0]:best=cand
+          parsed,fmt,tx=best
+          con.execute(f'''CREATE TABLE e AS SELECT *,try_strptime("刷卡日期"||' '||"刷卡时间",'{fmt}') ts FROM t''')
+          source_modes=con.execute('''SELECT "刷卡乘车类型" source_mode,count(*) n_rows,approx_count_distinct("卡ID") approx_cards,
+            approx_count_distinct("刷卡站点") approx_stations,quantile_cont(try_cast("刷卡扣钱" AS DOUBLE),.5) fare_p50,
+            quantile_cont(try_cast("刷卡扣钱" AS DOUBLE),.9) fare_p90 FROM e GROUP BY 1 ORDER BY n_rows DESC''').fetchdf().to_dict('records')
+          discounts=con.execute('''SELECT "是否优惠" discount_label,count(*) n_rows FROM e GROUP BY 1 ORDER BY n_rows DESC''').fetchdf().to_dict('records')
+          station_card=con.execute('SELECT approx_count_distinct("刷卡站点"),approx_count_distinct("卡ID") FROM e').fetchone()
+          con.execute('CREATE TABLE cm AS SELECT "卡ID" card_key,count(*) n_events FROM e GROUP BY 1')
+          mult=con.execute('SELECT n_events,count(*) n_cards FROM cm WHERE n_events<=10 GROUP BY 1 ORDER BY 1').fetchdf().to_dict('records')
+          cs=con.execute('SELECT count(*),quantile_cont(n_events,.5),quantile_cont(n_events,.9),quantile_cont(n_events,.99),max(n_events),count(*) FILTER(WHERE n_events>10) FROM cm').fetchone()
+          con.execute('''CREATE TABLE exact2 AS WITH x AS (
+             SELECT "卡ID" card_key,"刷卡乘车类型" source_mode,ts,"刷卡站点" station_token,
+               row_number() OVER(PARTITION BY "卡ID" ORDER BY ts,"刷卡乘车类型","刷卡站点") rn,
+               count(*) OVER(PARTITION BY "卡ID") cnt FROM e WHERE ts IS NOT NULL)
+             SELECT card_key,max(CASE WHEN rn=1 THEN source_mode END) source_mode_1,max(CASE WHEN rn=2 THEN source_mode END) source_mode_2,
+               max(CASE WHEN rn=1 THEN ts END) ts1,max(CASE WHEN rn=2 THEN ts END) ts2,
+               max(CASE WHEN rn=1 THEN station_token END) st1,max(CASE WHEN rn=2 THEN station_token END) st2
+             FROM x WHERE cnt=2 GROUP BY card_key''')
+          seq=con.execute('''SELECT source_mode_1,source_mode_2,count(*) n_cards,
+             quantile_cont(epoch(ts2-ts1),.5) duration_p50_sec,quantile_cont(epoch(ts2-ts1),.9) duration_p90_sec,quantile_cont(epoch(ts2-ts1),.99) duration_p99_sec,
+             count(*) FILTER(WHERE st1<>st2) n_different_station_tokens
+             FROM exact2 WHERE ts2>=ts1 GROUP BY 1,2 ORDER BY n_cards DESC''').fetchdf().to_dict('records')
+          exact2=con.execute('SELECT count(*) FROM exact2').fetchone()[0]
+          dv=con.execute('SELECT min("刷卡日期"),max("刷卡日期"),count(DISTINCT "刷卡日期") FROM e').fetchone()
+          out={'schema':'sptcc-card-semantic-qualification.v2','source_file':src,'n_rows':int(n),'columns':cols,
+            'temporal':{'selected_combined_format':fmt,'parsed_rows':parsed,'parse_share':parsed/n if n else None,'min':str(tx[1]) if tx[1] else None,'max':str(tx[2]) if tx[2] else None,'distinct_second_values':int(tx[3] or 0),'second_zero_share':tx[4]/parsed if parsed else None,'raw_date_min':dv[0],'raw_date_max':dv[1],'raw_date_distinct':int(dv[2])},
+            'source_mode_counts':source_modes,'discount_counts':discounts,'card_station_cardinality':{'approx_station_tokens':int(station_card[0] or 0),'approx_card_ids':int(station_card[1] or 0)},
+            'card_record_multiplicity':{'n_cards':int(cs[0]),'median_events':cs[1],'p90_events':cs[2],'p99_events':cs[3],'max_events':int(cs[4]),'n_cards_gt10':int(cs[5]),'counts_n_le10':mult},
+            'exact_two_timestamped_cards':int(exact2),'exact_two_ordered_source_mode_sequences':seq,
+            'privacy_rule':'No 卡ID or card-specific station/time records are exported.','semantic_rule':'Source labels are preserved exactly; no metro/entry/exit interpretation is manufactured.','evidence_state':'SOURCE_TEMPORAL_AND_MODE_SEMANTICS_PROFILED'}
+          Path(src+'.semantic.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2,default=str)); con.close(); raw.unlink(); utf8.unlink()
+          PY
+          done
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          ps=[json.loads(p.read_text(encoding='utf-8')) for p in sorted(Path('.').glob('SPTCC-*.semantic.json'))]
+          pooled_modes={}; pooled_seq={}
+          for p in ps:
+              for x in p['source_mode_counts']:
+                  k=str(x['source_mode']);pooled_modes[k]=pooled_modes.get(k,0)+int(x['n_rows'])
+              for x in p['exact_two_ordered_source_mode_sequences']:
+                  k=f"{x['source_mode_1']} -> {x['source_mode_2']}";pooled_seq[k]=pooled_seq.get(k,0)+int(x['n_cards'])
+          out={'schema':'sptcc-card-semantic-crossday-summary.v2','dataset_id':'CN_SH_SPTCC_2016_DRIVE_STACK','days':len(ps),'files':[p['source_file'] for p in ps],
+            'total_rows':sum(p['n_rows'] for p in ps),'all_rows_combined_timestamp_parsed':all((p['temporal']['parse_share'] or 0)==1 for p in ps),'all_days_second_level_support':all(p['temporal']['distinct_second_values']>1 for p in ps),
+            'source_mode_counts_pooled':dict(sorted(pooled_modes.items(),key=lambda kv:-kv[1])),'exact_two_mode_sequence_counts_pooled':dict(sorted(pooled_seq.items(),key=lambda kv:-kv[1])[:30]),
+            'decision_gate':'Determine metro-specific subset and whether source labels distinguish entry/exit before using SPTCC as metro AFC.','evidence_state':'TEMPORAL_RESOLUTION_AND_SOURCE_MODE_PROFILE_QUALIFIED'}
+          Path('sptcc_semantic_summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8');print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist safe outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sptcc"
+          for f in *.semantic.json sptcc_semantic_summary.json; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

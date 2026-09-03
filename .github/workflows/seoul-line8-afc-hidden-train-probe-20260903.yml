@@ -1,0 +1,285 @@
+name: Seoul Line 8 AFC Hidden Train Probe 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-line8-afc-hidden-train-probe-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore canonical layers
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing protected storage configuration'; exit 2; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1b_line8"; cd "$RUNNER_TEMP/r1b_line8"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          test -s TAIMS.zip && test -s BMS.zip && test -s p1c.json
+
+      - name: Recover deterministically hidden whole-train arrivals from AFC pulses
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1b_line8"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, io, json, math, re, statistics, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          LINE='1008'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7,0,0); END=datetime(2026,8,29,10,0,0)
+          FRESH=120; LAG_MINUTES=list(range(0,11))
+          HOLDOUT_NUM=1; HOLDOUT_DEN=5
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s): return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              return int(d) if d else None
+          def minute_floor(t):return t.replace(second=0,microsecond=0)
+          def holdout_train(train):return hashlib.sha1(train.encode('utf-8')).digest()[0] % HOLDOUT_DEN < HOLDOUT_NUM
+          def pearson(x,y):
+              if len(x)<3 or len(x)!=len(y):return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              if vx<=0 or vy<=0:return 0.0
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy)
+          def robust_z(v,vals):
+              if not vals:return 0.0
+              med=statistics.median(vals);mad=statistics.median([abs(x-med) for x in vals]);scale=max(1.0,1.4826*mad)
+              return (v-med)/scale
+          def interval_distance_sec(t,m):
+              lo=m;hi=m+timedelta(seconds=59)
+              if t<lo:return (lo-t).total_seconds()
+              if t>hi:return (t-hi).total_seconds()
+              return 0.0
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          canonical=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in canonical}
+          stations={x['service_statn_id']:{'name':x.get('dv_name'),'seq':seqnum(x.get('service_statn_sn'))} for x in canonical}
+          order=[k for k,v in sorted(stations.items(),key=lambda kv:(kv[1]['seq'] is None,kv[1]['seq'] or 9999,kv[0]))];pos={s:i for i,s in enumerate(order)}
+
+          # AFC same-line unique-path pulse field.
+          exit_hist=defaultdict(Counter);afc_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  if not (START<=t0<END and START<=t1<END):continue
+                  if a['service_statn_id']==b['service_statn_id']:continue
+                  exit_hist[b['service_statn_id']][minute_floor(t1)]+=1;afc_rows+=1
+              f.close()
+
+          # Fresh direct Line 8 arrivals.
+          pat=re.compile(r'subarr_(260829(\d{6}))');obs=defaultdict(dict);snapshot_rows=0;line_rows=0
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if not m:continue
+                  hh=m.group(2)
+                  if '070000'<=hh<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,st in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      snapshot_rows+=1
+                      if (row.get('subway_id') or '').strip()!=LINE:continue
+                      state=(row.get('arvl_cd') or '').strip()
+                      if state not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();stn=(row.get('statn_id') or '').strip()
+                      if not t or not tr or stn not in stations:continue
+                      line_rows+=1;age=(st-t).total_seconds();key=(tr,stn);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+
+          truth=[]
+          for (tr,stn),d in obs.items():
+              items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in items:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':truth.append({'train':tr,'station':stn,'time':t})
+                  prev=s
+          truth.sort(key=lambda x:(x['time'],x['station'],x['train']))
+          all_trains=sorted({e['train'] for e in truth});held={tr for tr in all_trains if holdout_train(tr)};anchors=[e for e in truth if e['train'] not in held];hidden=[e for e in truth if e['train'] in held]
+          anchor_by_station=defaultdict(list);hidden_by_station=defaultdict(list);anchor_by_train=defaultdict(dict)
+          for e in anchors:
+              anchor_by_station[e['station']].append(e);anchor_by_train[e['train']][e['station']]=min(e['time'],anchor_by_train[e['train']].get(e['station'],e['time']))
+          for e in hidden:hidden_by_station[e['station']].append(e)
+
+          minutes=[START+timedelta(minutes=i) for i in range(int((END-START).total_seconds()/60))]
+
+          # Nuisance calibration uses only non-held trains.
+          lag={};lag_corr={};headway={}
+          for stn in order:
+              th=Counter(minute_floor(e['time']) for e in anchor_by_station.get(stn,[]));eh=exit_hist.get(stn,Counter());scores=[]
+              for l in LAG_MINUTES:scores.append((pearson([th.get(m,0) for m in minutes],[eh.get(m+timedelta(minutes=l),0) for m in minutes]),l))
+              scores.sort(key=lambda x:(x[0],-x[1]),reverse=True);best=scores[0] if scores else (0,0);lag[stn]=best[1];lag_corr[stn]=best[0]
+              ts=sorted(e['time'] for e in anchor_by_station.get(stn,[]));gaps=[(b-a).total_seconds() for a,b in zip(ts,ts[1:]) if 60<=(b-a).total_seconds()<=900]
+              # lower-middle quantile resists the deliberately removed trains that create doubled gaps.
+              headway[stn]=q(gaps,.35) if gaps else 300.0
+
+          run_sec={}
+          for a,b in zip(order,order[1:]):
+              vals=[]
+              for tr,sts in anchor_by_train.items():
+                  if a in sts and b in sts:
+                      d=(sts[b]-sts[a]).total_seconds()
+                      if 30<=abs(d)<=900:vals.append(d)
+              if vals:run_sec[(a,b)]=statistics.median(vals)
+
+          # AFC pulse scores over the full window; visible-anchor minutes are suppressed later.
+          own=defaultdict(dict);joint=defaultdict(dict)
+          for stn in order:
+              vals=[exit_hist.get(stn,Counter()).get(m+timedelta(minutes=lag[stn]),0) for m in minutes]
+              for m,v in zip(minutes,vals):own[stn][m]=robust_z(v,vals)
+          for stn in order:
+              i=pos[stn]
+              for m in minutes:
+                  s=own[stn].get(m,0);w=1.0
+                  if i>0:
+                      p=order[i-1];d=run_sec.get((p,stn))
+                      if d is not None:s+=0.5*own[p].get(minute_floor(m-timedelta(seconds=d)),0);w+=0.5
+                  if i+1<len(order):
+                      n=order[i+1];d=run_sec.get((stn,n))
+                      if d is not None:s+=0.5*own[n].get(minute_floor(m+timedelta(seconds=d)),0);w+=0.5
+                  joint[stn][m]=s/w
+
+          def nms(candidates,k):
+              out=[]
+              for m,s in sorted(candidates,key=lambda x:(x[1],-x[0].timestamp()),reverse=True):
+                  if all(abs((m-x).total_seconds())>=60 for x in out):out.append(m)
+                  if len(out)>=k:break
+              return sorted(out)
+
+          preds={'B1_REGULAR_GAP_FILL':defaultdict(list),'B3_AFC_PULSE_GAP_FILL':defaultdict(list),'B4_AFC_PULSE_CONTINUITY_GAP_FILL':defaultdict(list)}
+          eligible_windows=defaultdict(list)
+          for stn in order:
+              aa=sorted(e['time'] for e in anchor_by_station.get(stn,[]));h=max(90.0,headway.get(stn,300.0))
+              for left,right in zip(aa,aa[1:]):
+                  gap=(right-left).total_seconds();missing=max(0,round(gap/h)-1)
+                  if missing<=0 or gap>2400:continue
+                  eligible_windows[stn].append((left,right,missing))
+                  for j in range(1,missing+1):
+                      t=left+timedelta(seconds=gap*j/(missing+1));preds['B1_REGULAR_GAP_FILL'][stn].append(minute_floor(t))
+                  lo=minute_floor(left)+timedelta(minutes=1);hi=minute_floor(right)-timedelta(minutes=1)
+                  cms=[m for m in minutes if lo<=m<=hi]
+                  preds['B3_AFC_PULSE_GAP_FILL'][stn].extend(nms([(m,own[stn].get(m,0)) for m in cms],missing))
+                  preds['B4_AFC_PULSE_CONTINUITY_GAP_FILL'][stn].extend(nms([(m,joint[stn].get(m,0)) for m in cms],missing))
+              for model in preds:preds[model][stn]=sorted(set(preds[model][stn]))
+
+          # Evaluate only hidden events bracketed by visible anchors and therefore recoverable by all methods.
+          eligible_hidden=defaultdict(list);hidden_train_eligible=defaultdict(list)
+          for e in hidden:
+              ok=False
+              for l,r,k in eligible_windows.get(e['station'],[]):
+                  if l<e['time']<r:ok=True;break
+              if ok:
+                  eligible_hidden[e['station']].append(e['time']);hidden_train_eligible[e['train']].append((e['station'],e['time']))
+
+          def match(truth_times,pred_times,tol):
+              used=set();pairs=[]
+              for tt in sorted(truth_times):
+                  cc=[]
+                  for j,pm in enumerate(pred_times):
+                      if j in used:continue
+                      d=interval_distance_sec(tt,pm)
+                      if d<=tol:cc.append((d,j,pm))
+                  if cc:
+                      d,j,pm=min(cc);used.add(j);pairs.append((tt,pm,d))
+              return pairs
+
+          metrics={}
+          for model,pby in preds.items():
+              truth_n=sum(len(v) for v in eligible_hidden.values());pred_n=sum(len(v) for v in pby.values());m60=[];m120=[]
+              matched_by_station_120={}
+              for stn in order:
+                  a=match(eligible_hidden.get(stn,[]),pby.get(stn,[]),60);b=match(eligible_hidden.get(stn,[]),pby.get(stn,[]),120)
+                  m60.extend(a);m120.extend(b);matched_by_station_120[stn]=b
+              # Per hidden-train station coverage, without exporting train IDs.
+              cover=[]
+              for tr,evs in hidden_train_eligible.items():
+                  hit=0
+                  for stn,tt in evs:
+                      if any(x[0]==tt for x in matched_by_station_120.get(stn,[])):hit+=1
+                  if evs:cover.append(hit/len(evs))
+              metrics[model]={'eligible_hidden_arrival_events':truth_n,'predicted_gap_fill_events':pred_n,'recall_60':len(m60)/truth_n if truth_n else None,'precision_60':len(m60)/pred_n if pred_n else None,'recall_120':len(m120)/truth_n if truth_n else None,'precision_120':len(m120)/pred_n if pred_n else None,'matched_error_sec_60':summ([x[2] for x in m60]),'matched_error_sec_120':summ([x[2] for x in m120]),'hidden_train_station_coverage_120':summ(cover),'hidden_trains_with_ge70pct_station_events_recovered_share':sum(x>=.7 for x in cover)/len(cover) if cover else None}
+
+          b1=metrics['B1_REGULAR_GAP_FILL'];b3=metrics['B3_AFC_PULSE_GAP_FILL'];b4=metrics['B4_AFC_PULSE_CONTINUITY_GAP_FILL']
+          g3=(b3['recall_60'] or 0)-(b1['recall_60'] or 0);g4=(b4['recall_60'] or 0)-(b1['recall_60'] or 0)
+          decision='WHOLE_TRAIN_HOLDOUT_SUPPORTS_AFC_LATENT_ARRIVAL_RECONSTRUCTION' if g4>=.05 and (b4['precision_60'] or 0)>=(b1['precision_60'] or 0) else ('WHOLE_TRAIN_HOLDOUT_SHOWS_BOUNDED_AFC_TIMING_GAIN' if g4>0 else 'WHOLE_TRAIN_HOLDOUT_NO_AFC_GAIN_OVER_REGULAR_GAP_FILL')
+
+          result={'schema':'seoul-line8-afc-hidden-train-probe-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'line':'1008','business_date':'2026-08-29','window':'07:00-10:00','holdout_contract':'A deterministic 20% subset of public train numbers is removed as complete train trajectories from all direct operational-status anchors. Train identifiers are used only inside the runner for masking/evaluation and are not exported. Remaining direct arrivals calibrate station egress lag, normal headway and adjacent-station running-time priors. Missing-event count is inferred from visible-anchor gaps; B1 places them regularly, B3 places the same count at AFC pulse maxima, and B4 adds neighboring-station continuity support.','counts':{'afc_same_line_rows':afc_rows,'snapshot_rows_scanned':snapshot_rows,'line_state_rows':line_rows,'fresh_arrival_events':len(truth),'all_public_trains':len(all_trains),'heldout_train_count':len(held),'anchor_arrival_events':len(anchors),'hidden_arrival_events':len(hidden),'eligible_hidden_arrival_events':sum(len(v) for v in eligible_hidden.values()),'eligible_hidden_train_count':len(hidden_train_eligible)},'metrics':metrics,'comparison':{'B3_recall60_gain_vs_B1':g3,'B4_recall60_gain_vs_B1':g4,'B4_recall120_gain_vs_B1':(b4['recall_120'] or 0)-(b1['recall_120'] or 0)},'decision':decision,'evidence_boundary':['AFC timestamps are minute-quantized; recovered events are AFC_INFERRED_TRAIN_EVENT candidates, not observed ATS.','The experiment isolates timing placement conditional on a missing-event count inferred from visible-anchor gaps; free train-count recovery remains a later R1 subtest.','Held-out train identities never enter inference features.','No passenger-to-train assignment is performed and no card identifiers are exported.']}
+          Path('seoul_r1b_line8_afc_hidden_train_probe_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SEOUL_R1B_LINE8_CONCISE='+json.dumps({'decision':decision,'counts':result['counts'],'B1':b1,'B3':b3,'B4':b4,'comparison':result['comparison']},ensure_ascii=False))
+          PY
+
+      - name: Store aggregate result durably
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.restore.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1b_line8"
+          F=seoul_r1b_line8_afc_hidden_train_probe_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_R1B_LINE8_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

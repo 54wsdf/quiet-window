@@ -1,0 +1,260 @@
+name: Seoul R1E Line 2 Perturbation Recovery 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-r1e-line2-perturbation-recovery-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore canonical layers
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf";umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")";test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT";echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1e";cd "$RUNNER_TEMP/r1e"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Mask actual perturbations and recover them from AFC pulse ridges
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1e"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          LINE='1002';DIRECTION='INC';START=datetime(2026,8,29,7);END=datetime(2026,8,29,10);FRESH=120;THRESHOLD=120.0
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();return io.TextIOWrapper(z.open(n),encoding=detect(h),errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit());return int(d) if d else None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def pearson(x,y):
+              if len(x)<3:return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy) if vx>0 and vy>0 else 0.0
+          def classify(sts,seq):
+              p=sorted((seq[s],t.timestamp()) for s,t in sts.items() if s in seq and seq[s] is not None)
+              if len(p)<4:return None
+              c=pearson([x for x,y in p],[y for x,y in p]);return None if abs(c)<.35 else ('INC' if c>0 else 'DEC')
+          def minute_floor(t):return t.replace(second=0,microsecond=0)
+          def minute_ceil(t):
+              z=minute_floor(t);return z if z==t else z+timedelta(minutes=1)
+          def interval_distance_sec(t,m):
+              lo=m;hi=m+timedelta(seconds=59)
+              if t<lo:return (lo-t).total_seconds()
+              if t>hi:return (t-hi).total_seconds()
+              return 0.0
+          def robust_local_prominence(hist,m):
+              center=hist.get(m,0)
+              nb=[hist.get(m+timedelta(minutes=k),0) for k in (-3,-2,-1,1,2,3)]
+              med=statistics.median(nb) if nb else 0
+              absdev=[abs(x-med) for x in nb];scale=max(1.0,1.4826*(statistics.median(absdev) if absdev else 0))
+              return (center-med)/scale
+          def median_dt(vals):
+              if not vals:return None
+              return datetime.fromtimestamp(statistics.median(v.timestamp() for v in vals))
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          entries=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id') and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in entries};line_entries=[x for x in entries if x['service_subway_id']==LINE]
+          meta={x['service_statn_id']:{'seq':seqnum(x.get('service_statn_sn')),'name':x.get('dv_name')} for x in line_entries};seq={s:v['seq'] for s,v in meta.items()}
+
+          # Two AFC pulse fields: same-line-only and all rail passengers whose final mapped line is Line 2.
+          h_same=defaultdict(Counter);h_all=defaultdict(Counter);same_rows=all_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')));t=dt(row.get('ALGH_DTM'))
+                  if not b or b['service_subway_id']!=LINE or not t or not START<=t<END:continue
+                  st=b['service_statn_id'];m=minute_floor(t);h_all[st][m]+=1;all_rows+=1
+                  if a and a['service_subway_id']==LINE:h_same[st][m]+=1;same_rows+=1
+              f.close()
+
+          # Direct arrival truth.
+          pat=re.compile(r'subarr_(260829(\d{6}))');obs=defaultdict(dict)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,sh in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      if (row.get('subway_id') or '').strip()!=LINE:continue
+                      state=(row.get('arvl_cd') or '').strip()
+                      if state not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip()
+                      if not t or not tr or st not in meta:continue
+                      age=(sh-t).total_seconds();key=(tr,st);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+          by_train=defaultdict(dict)
+          for (tr,st),d in obs.items():
+              its=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in its:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':
+                      old=by_train[tr].get(st);by_train[tr][st]=t if old is None or t<old else old
+                  prev=s
+          dirs={tr:classify(sts,seq) for tr,sts in by_train.items()};target_dir_trains=[tr for tr,d in dirs.items() if d==DIRECTION]
+          coverage=Counter(s for tr in target_dir_trains for s in by_train[tr]);ref=coverage.most_common(1)[0][0]
+          ref_seq=sorted((by_train[tr][ref],tr) for tr in target_dir_trains if ref in by_train[tr])
+          times=[t for t,tr in ref_seq];gaps=[(b-a).total_seconds() for a,b in zip(times,times[1:]) if 60<=(b-a).total_seconds()<=1800];normal=q(gaps,.35)
+          local_cap=min(1800,max(600,2.75*normal));local_floor=max(60,.25*normal)
+
+          # Define perturbation challenge targets from full direct truth, then remove all their trajectories from inference.
+          candidate=[]
+          for i in range(1,len(ref_seq)-1):
+              t,tr=ref_seq[i];gp=(t-ref_seq[i-1][0]).total_seconds();gn=(ref_seq[i+1][0]-t).total_seconds()
+              if local_floor<=gp<=local_cap and local_floor<=gn<=local_cap:
+                  residual=abs(gp-gn)/2
+                  if residual>=THRESHOLD:candidate.append((residual,i,tr,t,gp,gn))
+          # Keep nonadjacent stress targets to ensure each visible-anchor gap contains at most one deliberately removed train.
+          chosen=[];used_idx=set()
+          for rec in sorted(candidate,reverse=True):
+              _,i,tr,t,gp,gn=rec
+              if any(abs(i-j)<=1 for j in used_idx):continue
+              chosen.append(rec);used_idx.add(i)
+          chosen=sorted(chosen,key=lambda x:x[3]);target_ids={x[2] for x in chosen}
+          anchors={tr:sts for tr,sts in by_train.items() if tr in target_dir_trains and tr not in target_ids};targets={tr:by_train[tr] for tr in target_ids}
+
+          # Template learned from remaining visible trajectories only.
+          acov=Counter(s for tr,sts in anchors.items() for s in sts);aref=acov.most_common(1)[0][0]
+          off=defaultdict(list)
+          for tr,sts in anchors.items():
+              if aref not in sts:continue
+              rt=sts[aref]
+              for s,t in sts.items():off[s].append((t-rt).total_seconds())
+          offsets={s:statistics.median(v) for s,v in off.items() if len(v)>=5}
+          anchor_ref=sorted((sts[aref],tr) for tr,sts in anchors.items() if aref in sts)
+          agaps=[(b[0]-a[0]).total_seconds() for a,b in zip(anchor_ref,anchor_ref[1:]) if 60<=(b[0]-a[0]).total_seconds()<=1800];anormal=q(agaps,.30)
+
+          # Common egress-lag calibration from all-destination pulse field; no target direct arrival is used.
+          lag={}
+          minutes=[START+timedelta(minutes=i) for i in range(180)]
+          for s in offsets:
+              th=Counter(minute_floor(sts[s]) for tr,sts in anchors.items() if s in sts)
+              scores=[]
+              for l in range(0,11):scores.append((pearson([th.get(m,0) for m in minutes],[h_all[s].get(m+timedelta(minutes=l),0) for m in minutes]),l))
+              scores.sort(key=lambda x:(x[0],-x[1]),reverse=True);lag[s]=scores[0][1] if scores else 0
+
+          # Convert an assumed reference-arrival minute into a coherent cross-station pulse score.
+          mass_all={s:sum(h_all[s].values()) for s in offsets};mass_same={s:sum(h_same[s].values()) for s in offsets}
+          def ridge_score(t0,field,mass):
+              num=den=0.0
+              for s,offsec in offsets.items():
+                  if mass.get(s,0)<20:continue
+                  arrival=minute_floor(t0+timedelta(seconds=offsec));exitm=arrival+timedelta(minutes=lag.get(s,0));z=robust_local_prominence(field[s],exitm)
+                  w=math.sqrt(mass[s]);num+=w*z;den+=w
+              return num/den if den else -999
+          def ref_score(t0):
+              arrival=minute_floor(t0);exitm=arrival+timedelta(minutes=lag.get(aref,0));return robust_local_prominence(h_all[aref],exitm)
+
+          # Build one inference gap per stress target using only visible anchor trains.
+          gaps_eval=[]
+          for residual,i,tr,true_t,gp,gn in chosen:
+              visible=[(t,x) for t,x in anchor_ref if t<true_t];right=[(t,x) for t,x in anchor_ref if t>true_t]
+              if not visible or not right:continue
+              left=max(visible);rr=min(right);gap=(rr[0]-left[0]).total_seconds();missing=max(0,round(gap/anormal)-1) if anormal else 0
+              if missing!=1:continue
+              gaps_eval.append({'target':tr,'truth':true_t,'left':left[0],'right':rr[0],'challenge_residual':residual})
+
+          models={'B1_REGULAR_MIDPOINT':[],'B2_REFERENCE_STATION_PULSE':[],'B3_SAME_LINE_COHERENT_RIDGE':[],'B4_ALL_DESTINATION_COHERENT_RIDGE':[]}
+          detail=[]
+          for g in gaps_eval:
+              left,right=g['left'],g['right'];mid=minute_floor(left+(right-left)/2);lo=minute_ceil(left+timedelta(seconds=30));hi=minute_floor(right-timedelta(seconds=30));cands=[m for m in minutes if lo<=m<=hi]
+              p2=max(cands,key=ref_score) if cands else mid
+              p3=max(cands,key=lambda m:ridge_score(m,h_same,mass_same)) if cands else mid
+              p4=max(cands,key=lambda m:ridge_score(m,h_all,mass_all)) if cands else mid
+              preds={'B1_REGULAR_MIDPOINT':mid,'B2_REFERENCE_STATION_PULSE':p2,'B3_SAME_LINE_COHERENT_RIDGE':p3,'B4_ALL_DESTINATION_COHERENT_RIDGE':p4}
+              for k,v in preds.items():models[k].append((g['target'],g['truth'],v))
+              detail.append({'challenge_residual_sec':g['challenge_residual'],'visible_gap_sec':(right-left).total_seconds(),'regular_midpoint_error_sec':interval_distance_sec(g['truth'],mid),'reference_pulse_error_sec':interval_distance_sec(g['truth'],p2),'same_line_ridge_error_sec':interval_distance_sec(g['truth'],p3),'all_destination_ridge_error_sec':interval_distance_sec(g['truth'],p4)})
+
+          metrics={}
+          for name,rows in models.items():
+              errs=[interval_distance_sec(tt,pm) for tr,tt,pm in rows]
+              station_err=[];hit60=hit120=total=0
+              for tr,tt,pm in rows:
+                  sts=targets[tr]
+                  for s,actual in sts.items():
+                      if s not in offsets:continue
+                      predm=minute_floor(pm+timedelta(seconds=offsets[s]));e=interval_distance_sec(actual,predm);station_err.append(e);total+=1;hit60+=int(e<=60);hit120+=int(e<=120)
+              metrics[name]={'eligible_stress_trains':len(rows),'reference_time_error_sec':summ(errs),'reference_recall_60':sum(e<=60 for e in errs)/len(errs) if errs else None,'reference_recall_120':sum(e<=120 for e in errs)/len(errs) if errs else None,'trajectory_station_event_count':total,'trajectory_station_event_recall_60':hit60/total if total else None,'trajectory_station_event_recall_120':hit120/total if total else None,'trajectory_station_error_sec':summ(station_err)}
+
+          b1=metrics['B1_REGULAR_MIDPOINT'];b3=metrics['B3_SAME_LINE_COHERENT_RIDGE'];b4=metrics['B4_ALL_DESTINATION_COHERENT_RIDGE']
+          errors_b1=[x['regular_midpoint_error_sec'] for x in detail];errors_b4=[x['all_destination_ridge_error_sec'] for x in detail]
+          wins=sum(a<b for a,b in zip(errors_b4,errors_b1));losses=sum(a>b for a,b in zip(errors_b4,errors_b1));ties=len(detail)-wins-losses
+          gain=(b4['reference_recall_120'] or 0)-(b1['reference_recall_120'] or 0);transfer_mass_gain=(b4['reference_recall_120'] or 0)-(b3['reference_recall_120'] or 0)
+          if len(detail)>=3 and wins>losses and (statistics.median(errors_b4) if errors_b4 else 9999)<(statistics.median(errors_b1) if errors_b1 else 9999):decision='R1E_AFC_PULSE_IMPROVES_PERTURBED_TRAIN_TIMING_OVER_REGULAR_INTERPOLATION'
+          elif len(detail)>=3 and wins>=losses:decision='R1E_AFC_PULSE_SHOWS_BOUNDED_PERTURBATION_RECOVERY_SIGNAL'
+          else:decision='R1E_NO_CLEAR_AFC_GAIN_ON_PREDECLARED_PERTURBATION_STRESS_SET'
+
+          result={'schema':'seoul-r1e-line2-perturbation-recovery-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'case':{'line':'1002','direction':'INC','business_date':'2026-08-29','window':'07:00-10:00','reference_station_full_truth':ref,'reference_station_anchor_template':aref,'perturbation_threshold_sec':THRESHOLD},'stress_selection_contract':'Before masking, select continuity-qualified Line-2 INC trains whose reference-station leave-one-train midpoint residual is >=120 seconds, greedily retaining nonadjacent targets. Remove each selected train complete trajectory from all direct operational anchors. Evaluation is restricted to selected targets whose post-mask visible-anchor gap independently implies exactly one missing train under the anchor-only robust headway. This is a predeclared stress test and does not replace random-holdout controls.','counts':{'same_line_afc_exit_rows':same_rows,'all_destination_line2_afc_exit_rows':all_rows,'full_direction_train_count':len(target_dir_trains),'candidate_perturbed_train_count':len(candidate),'nonadjacent_selected_target_count':len(chosen),'eligible_stress_train_count':len(gaps_eval),'anchor_train_count':len(anchors),'template_station_count':len(offsets),'anchor_normal_headway_sec':anormal},'metrics':metrics,'paired_stress_details_without_ids':detail,'comparison':{'all_destination_ridge_vs_regular_reference120_gain':gain,'all_destination_ridge_vs_same_line_ridge_reference120_gain':transfer_mass_gain,'all_destination_ridge_error_wins_vs_regular':wins,'ties':ties,'losses':losses},'decision':decision,'scientific_interpretation':'This stress test asks whether passenger pulse timing contains realized train perturbation information precisely where regular interpolation is known to be wrong. The all-destination Line-2 pulse field includes passengers originating on other mapped rail lines and therefore provides a preliminary test of whether cross-line passenger mass strengthens arrival-event observability, but it does not yet model transfer-time propagation explicitly.','evidence_boundary':['Stress targets are selected from direct truth by a predeclared perturbation criterion; report together with random-holdout controls.','Target train identities and times are removed from inference and used only for evaluation.','AFC timestamps are minute-quantized; inferred train times are minute-resolution candidates.','All-destination pulse inclusion is not equivalent to explicit transfer modeling; explicit distributional transfer coupling belongs to R2.']}
+          Path('seoul_r1e_line2_perturbation_recovery_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SEOUL_R1E_CONCISE='+json.dumps({'decision':decision,'counts':result['counts'],'metrics':metrics,'comparison':result['comparison'],'details':detail},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.restore.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1e";F=seoul_r1e_line2_perturbation_recovery_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          test "$(stat -c '%s' "$F")" = "$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"
+          echo SEOUL_R1E_DURABLE_PASS
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

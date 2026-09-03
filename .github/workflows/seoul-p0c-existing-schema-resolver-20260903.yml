@@ -1,0 +1,129 @@
+name: Seoul P0C Existing Schema Resolver 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p0c-existing-schema-resolver-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore existing packages
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check openpyxl
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p0c"; cd "$RUNNER_TEMP/seoul-p0c"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260902/BMS_20260902.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/reference/tdata_code_table_10002.xlsx" codes.xlsx --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Resolve exact CSV contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0c"
+          python - <<'PY'
+          import csv, io, json, re, zipfile
+          from collections import Counter, defaultdict
+          from openpyxl import load_workbook
+
+          def enc(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def reader(z,n):
+              s=z.open(n); h=s.read(131072); s.close(); e=enc(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
+
+          out={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              for n in ('VW_KSCC_DX_CARD.csv','VW_KSCC_DV_CARD.csv'):
+                  f,e=reader(z,n); r=csv.DictReader(f); fields=r.fieldnames or []
+                  nonblank=Counter(); uniq={k:set() for k in fields}; examples={k:[] for k in fields}
+                  rows=0
+                  for row in r:
+                      rows+=1
+                      if n=='VW_KSCC_DX_CARD.csv' and rows>250000: break
+                      for k in fields:
+                          v=(row.get(k) or '').strip()
+                          if v:
+                              nonblank[k]+=1
+                              if len(uniq[k])<2000: uniq[k].add(v)
+                              if len(examples[k])<5 and v not in examples[k]: examples[k].append(v)
+                  f.close()
+                  out[n]={'encoding':e,'fields':fields,'rows_scanned':rows,'nonblank':dict(nonblank),'unique_counts_capped':{k:len(v) for k,v in uniq.items()},'value_examples':examples}
+
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              probes=[]
+              for idx in sorted(set([0,1,len(infos)//2,max(0,len(infos)-2),len(infos)-1])):
+                  inf=infos[idx]
+                  f,e=reader(z,inf.filename); rr=csv.reader(f)
+                  header=next(rr,[]); first=next(rr,[]); f.close()
+                  probes.append({'member':inf.filename,'encoding':e,'header':header,'field_count':len(header),'first_row_field_count':len(first)})
+              out['BMS']={'members':len(infos),'header_probes':probes}
+
+          wb=load_workbook('codes.xlsx',read_only=True,data_only=True)
+          mode_rows=[]; all_rows=[]
+          observed={'120','105','131','115','121','142','130','190','201','203','202','206','208','236','210','205','235','204','290','209','237','232','231'}
+          for ws in wb.worksheets:
+              for i,row in enumerate(ws.iter_rows(values_only=True),1):
+                  vals=['' if x is None else str(x).strip() for x in row]
+                  joined=' | '.join(vals)
+                  hit_codes=sorted(observed.intersection(vals))
+                  if hit_codes or any(k in joined for k in ('교통수단','지하철','도시철도','철도','버스')):
+                      rec={'sheet':ws.title,'row':i,'values':vals[:30],'observed_codes':hit_codes}
+                      all_rows.append(rec)
+                      if hit_codes: mode_rows.append(rec)
+          out['code_table']={'matching_rows':all_rows[:500],'observed_code_rows':mode_rows[:500]}
+          open('seoul_p0c_existing_schema_20260903.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print('P0C_CONCISE='+json.dumps({
+            'dx_fields':out['VW_KSCC_DX_CARD.csv']['fields'],
+            'dv_fields':out['VW_KSCC_DV_CARD.csv']['fields'],
+            'dv_unique_counts':out['VW_KSCC_DV_CARD.csv']['unique_counts_capped'],
+            'dv_examples':out['VW_KSCC_DV_CARD.csv']['value_examples'],
+            'bms_header_probes':out['BMS']['header_probes'],
+            'mode_code_rows':out['code_table']['observed_code_rows']
+          },ensure_ascii=False))
+          PY
+
+      - name: Store resolver output
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0c"
+          F=seoul_p0c_existing_schema_20260903.json
+          D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P0C_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

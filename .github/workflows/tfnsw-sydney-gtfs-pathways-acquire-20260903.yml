@@ -1,0 +1,167 @@
+name: TfNSW Sydney GTFS Pathways Acquire 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tfnsw-sydney-gtfs-pathways-acquire-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_URL: https://opendata.transport.nsw.gov.au/data/dataset/d1f68d4f-b778-44df-9823-cf2fa922e47f/resource/67974f14-01bf-47b7-bfa5-c7f2f8a950ca/download/full_greater_sydney_gtfs_static_0.zip
+      RELEASE_NOTES_URL: https://opendata.transport.nsw.gov.au/data/dataset/d1f68d4f-b778-44df-9823-cf2fa922e47f/resource/58e3bb35-717e-4336-b7d2-dc2225957261/download/tfnsw_gtfs_pathways_release_notes_v1.pdf
+      DRIVE_PATH: ResearchData/rail_transit/AU_SYD_TFNSW_PUBLIC_DATA/GTFS_PATHWAYS_CURRENT_20260903
+      OUT_ZIP: tfnsw_complete_gtfs_with_pathways_20260903.zip
+      OUT_NOTES: tfnsw_gtfs_pathways_release_notes_v1.pdf
+
+    steps:
+      - name: Check durable-storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone unzip
+          rclone version | head -n 2
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME" || { echo 'rclone remote not found'; exit 4; }
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download official TfNSW GTFS bundle and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 8 --retry-all-errors --connect-timeout 30 \
+            -A 'quiet-window-public-data-acquisition/1.0' \
+            "$SOURCE_URL" -o "$OUT_ZIP"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 \
+            -A 'quiet-window-public-data-acquisition/1.0' \
+            "$RELEASE_NOTES_URL" -o "$OUT_NOTES"
+          ls -lh "$OUT_ZIP" "$OUT_NOTES"
+
+      - name: Validate archive and required GTFS Pathways files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          unzip -t "$OUT_ZIP" >/tmp/unzip_test.log
+          tail -n 3 /tmp/unzip_test.log
+          NAMES="$(unzip -Z1 "$OUT_ZIP")"
+          for f in agency.txt stops.txt routes.txt trips.txt stop_times.txt pathways.txt levels.txt; do
+            printf '%s\n' "$NAMES" | grep -Fxq "$f" || { echo "missing required file: $f"; exit 10; }
+          done
+          echo 'required GTFS + pathways files present'
+
+      - name: Profile pathways and build manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          SHA="$(sha256sum "$OUT_ZIP" | awk '{print $1}')"
+          SIZE="$(stat -c '%s' "$OUT_ZIP")"
+          PATHWAY_LINES="$(unzip -p "$OUT_ZIP" pathways.txt | wc -l | tr -d ' ')"
+          LEVEL_LINES="$(unzip -p "$OUT_ZIP" levels.txt | wc -l | tr -d ' ')"
+          STOP_LINES="$(unzip -p "$OUT_ZIP" stops.txt | wc -l | tr -d ' ')"
+          PATHWAY_HEADER="$(unzip -p "$OUT_ZIP" pathways.txt | head -n 1 | tr -d '\r' || true)"
+          LEVEL_HEADER="$(unzip -p "$OUT_ZIP" levels.txt | head -n 1 | tr -d '\r' || true)"
+          cat > tfnsw_gtfs_pathways_20260903.manifest.json <<EOF
+          {
+            "dataset_id": "AU_SYD_TFNSW_GTFS_PATHWAYS_CURRENT_20260903",
+            "state": "VALIDATED_LOCAL",
+            "source": "Transport for NSW Open Data Hub",
+            "source_url": "$SOURCE_URL",
+            "source_resource_id": "67974f14-01bf-47b7-bfa5-c7f2f8a950ca",
+            "license": "Creative Commons Attribution",
+            "downloaded_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "filename": "$OUT_ZIP",
+            "size_bytes": $SIZE,
+            "sha256": "$SHA",
+            "required_files_verified": ["agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt", "pathways.txt", "levels.txt"],
+            "pathways_rows_including_header": $PATHWAY_LINES,
+            "levels_rows_including_header": $LEVEL_LINES,
+            "stops_rows_including_header": $STOP_LINES,
+            "pathways_header": "${PATHWAY_HEADER//\"/\\\"}",
+            "levels_header": "${LEVEL_HEADER//\"/\\\"}",
+            "historical_compatibility_note": "Current pathways geometry must be checked station-by-station before joining to 2018-2019 historical GTFS-RT."
+          }
+          EOF
+          cat tfnsw_gtfs_pathways_20260903.manifest.json
+
+      - name: Copy validated snapshot to Google Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          for f in "$OUT_ZIP" "$OUT_NOTES" tfnsw_gtfs_pathways_20260903.manifest.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$DRIVE_PATH/$f" \
+              --config "$CONFIG_FILE" \
+              --retries 8 --low-level-retries 20 --transfers 1 --checkers 4 \
+              --stats 30s --stats-one-line
+          done
+
+      - name: Verify remote sizes and mark ACQUIRED
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          for f in "$OUT_ZIP" "$OUT_NOTES"; do
+            LOCAL_SIZE="$(stat -c '%s' "$f")"
+            REMOTE_SIZE="$(rclone size "$REMOTE_NAME:$DRIVE_PATH/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"
+            test "$LOCAL_SIZE" = "$REMOTE_SIZE" || { echo "remote-size mismatch: $f local=$LOCAL_SIZE remote=$REMOTE_SIZE"; exit 20; }
+          done
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('tfnsw_gtfs_pathways_20260903.manifest.json')
+          d=json.loads(p.read_text())
+          d['state']='ACQUIRED'
+          d['durable_storage']={
+              'backend':'Google Drive via rclone',
+              'path':'ResearchData/rail_transit/AU_SYD_TFNSW_PUBLIC_DATA/GTFS_PATHWAYS_CURRENT_20260903/',
+              'verified_by':'remote_size'
+          }
+          p.write_text(json.dumps(d,indent=2),encoding='utf-8')
+          PY
+          rclone copyto tfnsw_gtfs_pathways_20260903.manifest.json \
+            "$REMOTE_NAME:$DRIVE_PATH/tfnsw_gtfs_pathways_20260903.manifest.json" \
+            --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          echo 'TfNSW GTFS Pathways snapshot acquired and verified.'
+
+      - name: Clean temporary storage configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

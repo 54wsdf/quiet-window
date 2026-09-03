@@ -1,0 +1,218 @@
+name: Seoul P1A Crosswalk Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1a-crosswalk-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore data
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p1a"; cd "$RUNNER_TEMP/seoul-p1a"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260902/BMS_20260902.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" transfer.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build station universes and quantify joins
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1a"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, re, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          RAIL_CODES={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              s=z.open(n); h=s.read(65536); s.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
+          def clean_header(h):
+              return unicodedata.normalize('NFKC',h.replace('\ufeff','')).strip().lower()
+          def norm_name(s,level=0):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip()
+              s=re.sub(r'\s+','',s)
+              if level>=1 and s.endswith('역'): s=s[:-1]
+              if level>=2: s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s)
+              return s
+          def match_stats(left:Counter,right_keys:set):
+              matched={k:v for k,v in left.items() if k in right_keys}
+              return {'unique_total':len(left),'unique_matched':len(matched),'unique_share':len(matched)/len(left) if left else None,'mass_total':sum(left.values()),'mass_matched':sum(matched.values()),'mass_share':sum(matched.values())/sum(left.values()) if left else None}
+
+          # Passenger station/support and rail-only transaction universe.
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f,e=zr(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f)
+              dv=[]
+              for row in r:
+                  dv.append({
+                    'serial_num':(row.get('SERIAL_NUM') or '').strip(),
+                    'out_stn_num':(row.get('OUT_STN_NUM') or '').strip(),
+                    'name':(row.get('STN_KR_NM') or '').strip(),
+                    'eng':(row.get('STN_ENG_NM') or '').strip(),
+                  })
+              f.close()
+              serial_to_names=defaultdict(set); out_to_names=defaultdict(set); name_to_serial=defaultdict(set); name_to_out=defaultdict(set)
+              for x in dv:
+                  if x['serial_num']: serial_to_names[x['serial_num']].add(x['name'])
+                  if x['out_stn_num']: out_to_names[x['out_stn_num']].add(x['name'])
+                  if x['name']:
+                      name_to_serial[norm_name(x['name'],0)].add(x['serial_num'])
+                      name_to_out[norm_name(x['name'],0)].add(x['out_stn_num'])
+
+              f,e=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              rail_rows=0; rail_psng=0.0; modes=Counter(); ride=Counter(); alight=Counter(); ride_all=Counter(); alight_all=Counter(); cards=set(); trnc=set(); trtr=Counter(); abnormal_alight=0; alight_after_36h=0
+              for row in r:
+                  mode=(row.get('TRNS_MNS_CD') or '').strip()
+                  if mode not in RAIL_CODES: continue
+                  rail_rows+=1; modes[mode]+=1
+                  try: rail_psng+=float(row.get('PSNG_NUM') or 0)
+                  except ValueError: pass
+                  a=(row.get('RIDE_BSST_ID') or '').strip(); b=(row.get('ALGH_BSST_ID') or '').strip()
+                  if a: ride[a]+=1
+                  if b: alight[b]+=1
+                  c=(row.get('TRCR_ID') or '').strip(); t=(row.get('TRNC_ID') or '').strip(); tf=(row.get('TRTR_FCNT') or '').strip()
+                  if c: cards.add(c)
+                  if t: trnc.add(t)
+                  if tf: trtr[tf]+=1
+                  rd=(row.get('RIDE_DTM') or '').strip(); ad=(row.get('ALGH_DTM') or '').strip()
+                  if rd and ad and len(rd)>=14 and len(ad)>=14:
+                      try:
+                          from datetime import datetime
+                          dt=(datetime.strptime(ad[:14],'%Y%m%d%H%M%S')-datetime.strptime(rd[:14],'%Y%m%d%H%M%S')).total_seconds()
+                          if dt<0: abnormal_alight+=1
+                          if dt>36*3600: alight_after_36h+=1
+                      except ValueError: pass
+              f.close()
+
+          dv_serial=set(serial_to_names); dv_out=set(out_to_names)
+          passenger_id_join={
+            'ride_to_dv_serial':match_stats(ride,dv_serial),
+            'ride_to_dv_out':match_stats(ride,dv_out),
+            'alight_to_dv_serial':match_stats(alight,dv_serial),
+            'alight_to_dv_out':match_stats(alight,dv_out),
+          }
+
+          # Service station universe from 96 deterministic snapshots; header is normalized.
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              idx=sorted(set([0,len(infos)-1]+[round(i*(len(infos)-1)/95) for i in range(96)])) if infos else []
+              station_id_names=defaultdict(set); station_name_ids=defaultdict(set); station_lines=defaultdict(set); arvl=Counter(); line_counts=Counter(); direction_counts=Counter(); train_ids=set(); rec_min=None; rec_max=None; sampled_rows=0
+              for i in idx:
+                  f,e=zr(z,infos[i].filename); rr=csv.DictReader(f)
+                  rr.fieldnames=[clean_header(x) for x in (rr.fieldnames or [])]
+                  for row in rr:
+                      sampled_rows+=1
+                      sid=(row.get('statn_id') or '').strip(); nm=(row.get('statn_nm') or '').strip(); line=(row.get('subway_id') or row.get('subway_cd') or '').strip(); up=(row.get('updn_line') or '').strip(); state=(row.get('arvl_cd') or '').strip(); tr=(row.get('btrain_no') or '').strip(); rec=(row.get('recptn_dt') or '').strip()
+                      if sid and nm: station_id_names[sid].add(nm); station_name_ids[norm_name(nm,0)].add(sid)
+                      if nm and line: station_lines[norm_name(nm,0)].add(line)
+                      if state: arvl[state]+=1
+                      if line: line_counts[line]+=1
+                      if up: direction_counts[up]+=1
+                      if tr: train_ids.add(tr)
+                      if rec:
+                          rec_min=rec if rec_min is None or rec<rec_min else rec_min
+                          rec_max=rec if rec_max is None or rec>rec_max else rec_max
+                  f.close()
+
+          service_names_exact=set(station_name_ids)
+          dv_names_exact=set(name_to_serial)
+          name_overlap={}
+          for level in (0,1,2):
+              dvset={norm_name(x['name'],level) for x in dv if x['name']}
+              svset={norm_name(n,level) for names in station_id_names.values() for n in names}
+              inter=dvset & svset
+              name_overlap[str(level)]={'dv_names':len(dvset),'service_names':len(svset),'intersection':len(inter),'dv_share':len(inter)/len(dvset) if dvset else None,'service_share':len(inter)/len(svset) if svset else None}
+
+          # Candidate direct ID joins: AFC station ID -> DV OUT_STN_NUM -> name -> service statn name.
+          def afc_to_service_via_dv(counter, key='out'):
+              mapped_mass=0; mapped_ids=0; ambiguous_mass=0; unresolved=[]; service_candidate_pairs=Counter()
+              for afcid,mass in counter.items():
+                  names=(out_to_names if key=='out' else serial_to_names).get(afcid,set())
+                  candidates=set()
+                  for nm in names:
+                      candidates |= station_name_ids.get(norm_name(nm,0),set())
+                      if not candidates: candidates |= station_name_ids.get(norm_name(nm,1),set())
+                  if candidates:
+                      mapped_mass+=mass; mapped_ids+=1
+                      if len(candidates)>1: ambiguous_mass+=mass
+                      for sid in candidates: service_candidate_pairs[(afcid,sid)]+=mass
+                  elif len(unresolved)<100: unresolved.append({'afc_station_id':afcid,'mass':mass,'dv_names':sorted(names)})
+              return {'afc_ids':len(counter),'mapped_ids':mapped_ids,'mapped_id_share':mapped_ids/len(counter) if counter else None,'mass':sum(counter.values()),'mapped_mass':mapped_mass,'mapped_mass_share':mapped_mass/sum(counter.values()) if counter else None,'ambiguous_mass':ambiguous_mass,'ambiguous_mass_share':ambiguous_mass/sum(counter.values()) if counter else None,'unresolved_examples':unresolved,'candidate_pairs':len(service_candidate_pairs)}
+          bridge_out_ride=afc_to_service_via_dv(ride,'out'); bridge_out_alight=afc_to_service_via_dv(alight,'out')
+          bridge_serial_ride=afc_to_service_via_dv(ride,'serial'); bridge_serial_alight=afc_to_service_via_dv(alight,'serial')
+
+          # Transfer file: preserve schema, build station-name universe from columns containing station markers.
+          raw=Path('transfer.csv').read_bytes(); te=detect(raw[:65536]); rr=csv.DictReader(io.StringIO(raw.decode(te,errors='replace'))); tf=rr.fieldnames or []
+          transfer_names=set(); transfer_rows=0
+          for row in rr:
+              transfer_rows+=1
+              for k in tf:
+                  v=(row.get(k) or '').strip()
+                  if v and ('역' in k or 'station' in k.lower()): transfer_names.add(norm_name(v,1))
+          dv_norm1={norm_name(x['name'],1) for x in dv if x['name']}; service_norm1={norm_name(n,1) for names in station_id_names.values() for n in names}
+          transfer_overlap={'rows':transfer_rows,'fields':tf,'names':len(transfer_names),'with_dv':len(transfer_names & dv_norm1),'with_service':len(transfer_names & service_norm1),'with_both':len(transfer_names & dv_norm1 & service_norm1)}
+
+          out={
+            'schema':'mppd-n1-seoul-p1a-crosswalk-qualification-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'rail_code_set':sorted(RAIL_CODES),'rail_rows':rail_rows,'rail_passenger_count_sum':rail_psng,'rail_mode_counts':dict(modes),'unique_rail_cards':len(cards),'unique_transfer_process_ids':len(trnc),'transfer_count_values':dict(trtr),'negative_ride_to_alight_rows':abnormal_alight,'ride_to_alight_over_36h_rows':alight_after_36h,
+            'dv':{'rows':len(dv),'serial_ids':len(dv_serial),'out_station_ids':len(dv_out),'unique_names':len(dv_names_exact),'duplicate_name_keys':sum(1 for k,v in name_to_out.items() if len(v)>1)},
+            'passenger_id_join':passenger_id_join,
+            'service_sample':{'basis':'96 evenly spaced BMS snapshots from service-content day 2026-09-01','sampled_snapshots':len(idx),'sampled_rows':sampled_rows,'station_ids':len(station_id_names),'station_names':len(service_names_exact),'train_ids':len(train_ids),'arvl_cd_counts':dict(arvl),'line_counts':dict(line_counts),'direction_counts':dict(direction_counts),'recptn_dt_min':rec_min,'recptn_dt_max':rec_max},
+            'name_overlap':name_overlap,
+            'afc_dv_service_bridge':{'using_out_stn_num':{'ride':bridge_out_ride,'alight':bridge_out_alight},'using_serial_num':{'ride':bridge_serial_ride,'alight':bridge_serial_alight}},
+            'transfer_overlap':transfer_overlap,
+            'qualification':{'station_crosswalk_ready_for_adapter': bridge_out_ride['mapped_mass_share'] is not None and bridge_out_ride['mapped_mass_share']>=0.90 and bridge_out_alight['mapped_mass_share']>=0.90,'service_schema_normalization':'strip trailing spaces, lowercase, remove UTF BOM','t5_pass':False,'t6_observed_genealogy':False}
+          }
+          Path('seoul_p1a_crosswalk_qualification_20260903.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1A_CONCISE='+json.dumps({'rail_rows':rail_rows,'rail_share_of_all_rows':rail_rows/9405874,'mode_counts':dict(modes),'ride_id_join':passenger_id_join['ride_to_dv_out'],'alight_id_join':passenger_id_join['alight_to_dv_out'],'service_sample':out['service_sample'],'name_overlap':name_overlap,'bridge_out_ride':bridge_out_ride,'bridge_out_alight':bridge_out_alight,'transfer_overlap':transfer_overlap,'qualification':out['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store qualification
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1a"
+          F=seoul_p1a_crosswalk_qualification_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P1A_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

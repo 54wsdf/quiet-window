@@ -1,0 +1,174 @@
+name: Seoul P1D1 Episode Event Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1d1-episode-event-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore BMS 20260830
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p1d1"; cd "$RUNNER_TEMP/p1d1"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Reconstruct AM episodes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1d1"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def h(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def parse(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except ValueError:return None
+          def qs(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'p10':q(.1),'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          pat=re.compile(r'subarr_(260829(\d{6}))')
+          obs=defaultdict(list); traincd_by_base=defaultdict(set); all_state=Counter();rows=0
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]; shard_times=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if not m:continue
+                  hh=m.group(2)
+                  if '070000'<=hh<'100000':infos.append(x);shard_times.append(datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S'))
+              shard_times.sort(); gaps=[(b-a).total_seconds() for a,b in zip(shard_times,shard_times[1:])]
+              for x in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[h(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      rows+=1;state=(row.get('arvl_cd') or '').strip();all_state[state]+=1
+                      if state not in {'0','1','2'}:continue
+                      t=parse(row.get('recptn_dt'));line=(row.get('subway_id') or '').strip();train=(row.get('btrain_no') or '').strip();station=(row.get('statn_id') or '').strip();tc=(row.get('train_cd') or '').strip()
+                      if not (t and line and train and station):continue
+                      base=(line,train,station); traincd_by_base[base].add(tc or '<blank>')
+                      # Prefer train_cd when nonblank; this can split repeated public train numbers.
+                      key=(line,train,tc or '<blank>',station)
+                      obs[key].append((t,state))
+                  f.close()
+
+          traincd_card=Counter(len(v) for v in traincd_by_base.values())
+          base_multitraincd=sum(1 for v in traincd_by_base.values() if len(v)>1)
+
+          # Segment observations by temporal gap. Test several gaps to prove robustness.
+          gap_results={}
+          selected_events=[]
+          for gap_limit in (120,300,600):
+              episodes=0;paired=[];arr_only=0;dep_only=0;enter_only=0;multi_pair_episodes=0;invalid_local=0;state_seq=Counter();episode_span=[]
+              events_for_gap=[]
+              for key,items in obs.items():
+                  items=sorted(items)
+                  chunks=[];cur=[];prev=None
+                  for item in items:
+                      if prev is not None and (item[0]-prev).total_seconds()>gap_limit:
+                          if cur:chunks.append(cur)
+                          cur=[]
+                      cur.append(item);prev=item[0]
+                  if cur:chunks.append(cur)
+                  for ep_i,ch in enumerate(chunks):
+                      episodes+=1;episode_span.append((ch[-1][0]-ch[0][0]).total_seconds())
+                      # Collapse consecutive duplicate states to a transition sequence.
+                      trans=[]
+                      for t,s in ch:
+                          if not trans or trans[-1][1]!=s:trans.append((t,s))
+                      state_seq['>'.join(s for _,s in trans[:10])]+=1
+                      pairs=[]
+                      for i,(ta,sa) in enumerate(trans):
+                          if sa!='1':continue
+                          for td,sd in trans[i+1:]:
+                              if sd=='2':
+                                  d=(td-ta).total_seconds()
+                                  if 0<=d<=300:pairs.append((ta,td,d));break
+                                  if d>300:break
+                      # Deduplicate overlapping pairs by arrival/departure time.
+                      uniq=[];seen=set()
+                      for p in pairs:
+                          k=(p[0],p[1])
+                          if k not in seen:seen.add(k);uniq.append(p)
+                      pairs=uniq
+                      if pairs:
+                          paired.extend(p[2] for p in pairs)
+                          if len(pairs)>1:multi_pair_episodes+=1
+                          line,train,tc,station=key
+                          for pair_i,(a,d,dwell) in enumerate(pairs):
+                              events_for_gap.append({'evidence_class':'DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE','subway_id':line,'btrain_no':train,'train_cd':tc,'statn_id':station,'episode_index':ep_i,'pair_index':pair_i,'arrival_detect_time':a.strftime('%Y%m%d%H%M%S'),'departure_detect_time':d.strftime('%Y%m%d%H%M%S'),'dwell_detect_seconds':dwell,'segmentation_gap_seconds':gap_limit})
+                      else:
+                          has1=any(s=='1' for _,s in trans);has2=any(s=='2' for _,s in trans);has0=any(s=='0' for _,s in trans)
+                          if has1:arr_only+=1
+                          elif has2:dep_only+=1
+                          elif has0:enter_only+=1
+              gap_results[str(gap_limit)]={'episodes':episodes,'paired_events':len(paired),'paired_dwell_sec':qs(paired),'arr_only_episodes':arr_only,'dep_only_episodes':dep_only,'enter_only_episodes':enter_only,'multi_pair_episodes':multi_pair_episodes,'episode_span_sec':qs(episode_span),'common_transition_sequences':dict(state_seq.most_common(30))}
+              if gap_limit==300:selected_events=events_for_gap
+
+          # Stability: selected paired-event count should not be hypersensitive to segmentation gap.
+          counts=[gap_results[str(g)]['paired_events'] for g in (120,300,600)]
+          relative_spread=(max(counts)-min(counts))/max(1,statistics.mean(counts))
+          selected=gap_results['300'];dwell=selected['paired_dwell_sec']
+          supported=bool(selected['paired_events']>=1000 and dwell and dwell['p99']<=300 and relative_spread<=0.10)
+
+          # Persist only the selected 300 s gap event candidates.
+          if selected_events:
+              with open('am_service_event_candidates_0700_1000.csv','w',encoding='utf-8',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(selected_events[0]));w.writeheader();w.writerows(selected_events)
+          summary={'schema':'mppd-n1-seoul-p1d1-episode-event-qualification-v1','window':'2026-08-29 07:00:00-10:00:00','archive_shards':len(infos),'snapshot_rows':rows,'poll_gap_sec':qs(gaps),'all_arvl_cd_counts':dict(all_state),'base_key_train_cd_cardinality':dict(traincd_card),'base_keys_with_multiple_train_cd':base_multitraincd,'gap_results':gap_results,'paired_event_count_relative_spread_120_300_600':relative_spread,'selected_gap_seconds':300,'selected_event_rows':len(selected_events),'evidence_class':'DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE','qualification':{'episode_reconstruction_supported':supported,'arrival_departure_detection_precision_bound':'approximately polling cadence; event time is first observed state transition, not physical track-circuit ATS timestamp','t5_pass':False,'t6_observed_genealogy':False}}
+          Path('seoul_p1d1_episode_event_qualification_20260903.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1D1_CONCISE='+json.dumps({'archive_shards':len(infos),'snapshot_rows':rows,'poll_gap_sec':summary['poll_gap_sec'],'base_key_train_cd_cardinality':summary['base_key_train_cd_cardinality'],'base_keys_with_multiple_train_cd':base_multitraincd,'gap_results':{g:{k:v for k,v in x.items() if k!='common_transition_sequences'} for g,x in gap_results.items()},'relative_spread':relative_spread,'selected_event_rows':len(selected_events),'qualification':summary['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store results
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1d1"
+          cpv(){ local s="$1" d="$2"; rclone copyto "$s" "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; local l r; l="$(stat -c '%s' "$s")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$l" = "$r"; }
+          cpv seoul_p1d1_episode_event_qualification_20260903.json 99_manifests/seoul_p1d1_episode_event_qualification_20260903.json
+          if [[ -f am_service_event_candidates_0700_1000.csv ]]; then cpv am_service_event_candidates_0700_1000.csv processed/service_events/20260829/am_service_event_candidates_0700_1000.csv; fi
+          echo SEOUL_P1D1_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,160 @@
+name: Seoul P2A3 Rail Transfer Movement Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a3-rail-transfer-movement-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a3"; cd "$RUNNER_TEMP/p2a3"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build rail-only movement shortlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a3"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
+          def digits(s):return ''.join(x for x in str(s or '') if x.isdigit())
+          def variants(s):
+              d=digits(s)
+              if not d:return set()
+              out={d,d.lstrip('0') or '0'}
+              if len(d)>=4:out|={d[-4:],d[-4:].zfill(4)}
+              else:out.add(d.zfill(4))
+              return out
+          def num(s):
+              try:return float(str(s or '').replace(',','').strip())
+              except:return None
+          def norm(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\s+','',s);s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def qs(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f,e=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              dv={}; idx=defaultdict(set)
+              for row in r:
+                  out=(row.get('OUT_STN_NUM') or '').strip();nm=(row.get('STN_KR_NM') or '').strip()
+                  if not out:continue
+                  dv[out]={'name':nm,'serial':(row.get('SERIAL_NUM') or '').strip()}
+                  for v in variants(out):idx[v].add(out)
+              f.close()
+
+          raw=Path('directional.csv').read_bytes();de=detect(raw[:262144]);dr=csv.DictReader(io.StringIO(raw.decode(de,errors='replace')));df=dr.fieldnames or []
+          sc=next(k for k in df if '환승시작 코드' in k);ec=next(k for k in df if '환승종료역 코드' in k);sl=next(k for k in df if k=='환승시작 호선');el=next(k for k in df if k=='환승종료 호선');sn=next(k for k in df if k=='환승시작역');en=next(k for k in df if k=='환승종료역');du=next(k for k in df if k=='소요시간')
+          directional=defaultdict(list)
+          for row in dr:
+              rec={'start_code':(row.get(sc) or '').strip(),'end_code':(row.get(ec) or '').strip(),'start_line':(row.get(sl) or '').strip(),'end_line':(row.get(el) or '').strip(),'start_name':(row.get(sn) or '').strip(),'end_name':(row.get(en) or '').strip(),'duration':(row.get(du) or '').strip()}
+              for a in variants(rec['start_code']):
+                  for b in variants(rec['end_code']):directional[(a,b)].append(rec)
+
+          def resolve(raw):
+              out=set()
+              for v in variants(raw):out|=idx.get(v,set())
+              return out
+
+          with zipfile.ZipFile('observed.zip') as z:
+              member=[n for n in z.namelist() if n.lower().endswith('.csv')][0];f,e=zr(z,member);r=csv.DictReader(f)
+              movement=defaultdict(lambda:{'count':0.0,'rows':0,'weighted':0.0,'w':0.0,'times':[],'hours':Counter(),'mode_pairs':Counter()});all_rows=0;rail_rows=0;rail_count=0.0
+              for row in r:
+                  all_rows+=1;fm=(row.get('하차_교통수단_코드') or '').strip();tm=(row.get('승차_교통수단_코드') or '').strip()
+                  if fm not in RAIL or tm not in RAIL:continue
+                  rail_rows+=1;a=(row.get('하차_정류장/역사_ID') or '').strip();b=(row.get('승차_정류장/역사_ID') or '').strip();c=num(row.get('환승_수_합'));t=num(row.get('환승_시간_평균'));h=(row.get('시간대') or '').strip()
+                  if not a or not b:continue
+                  m=movement[(a,b)];m['rows']+=1;m['mode_pairs'][(fm,tm)]+=1
+                  if c is not None:m['count']+=c;rail_count+=c
+                  if t is not None:
+                      m['times'].append(t)
+                      if c is not None and c>0:m['weighted']+=t*c;m['w']+=c
+                  if h:m['hours'][h]+=c if c is not None else 1
+              f.close()
+
+          ranked=[];resolved_count=0.0;dir_count=0.0
+          for (a,b),m in movement.items():
+              af=resolve(a);bt=resolve(b);rec={'raw_from_id':a,'raw_to_id':b,'observed_transfer_count':m['count'],'rows':m['rows'],'mode_pairs':{f'{x[0]}->{x[1]}':n for x,n in m['mode_pairs'].items()},'weighted_average_transfer_time':m['weighted']/m['w'] if m['w'] else (statistics.median(m['times']) if m['times'] else None),'time_stats':qs(m['times']),'top_hours':m['hours'].most_common(8),'from_candidates':sorted(af),'to_candidates':sorted(bt)}
+              if len(af)==1 and len(bt)==1:
+                  fo=next(iter(af));to=next(iter(bt));rec.update({'dv_resolved':True,'from_out_stn_num':fo,'to_out_stn_num':to,'from_name':dv[fo]['name'],'to_name':dv[to]['name']});resolved_count+=m['count']
+                  dirs=[]
+                  for av in variants(fo):
+                      for bv in variants(to):dirs.extend(directional.get((av,bv),[]))
+                  # Deduplicate identical direction definitions created by variant cartesian matching.
+                  seen=set();uniq=[]
+                  for d in dirs:
+                      k=(d['start_code'],d['end_code'],d['start_line'],d['end_line'],d['duration'])
+                      if k not in seen:seen.add(k);uniq.append(d)
+                  rec['directional_rows']=uniq;rec['directional_supported']=bool(uniq)
+                  if uniq:dir_count+=m['count']
+              else:rec['dv_resolved']=False;rec['directional_supported']=False
+              ranked.append(rec)
+          ranked.sort(key=lambda x:(-x['observed_transfer_count'],x['raw_from_id'],x['raw_to_id']))
+          strict=[x for x in ranked if x['dv_resolved'] and x['directional_supported']]
+          same=[x for x in strict if norm(x.get('from_name'))==norm(x.get('to_name')) and norm(x.get('from_name'))]
+          result={'schema':'mppd-n1-seoul-p2a3-rail-transfer-movement-profile-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'official_rail_codes':sorted(RAIL),'all_observed_rows':all_rows,'rail_to_rail_rows':rail_rows,'rail_movement_pairs':len(movement),'rail_transfer_count_total':rail_count,'dv_resolved_transfer_count':resolved_count,'dv_resolved_transfer_count_share':resolved_count/rail_count if rail_count else None,'directional_supported_transfer_count':dir_count,'directional_supported_transfer_count_share':dir_count/rail_count if rail_count else None,'top_rail_movements':ranked[:150],'top_strict_directional_rail_movements':strict[:100],'top_same_station_directional_rail_movements':same[:100],'evidence_boundary':'Rail-to-rail filter uses only officially decoded T-money rail mode codes. Counts/times remain aggregate movement observations, not individual train ancestry.'}
+          Path('seoul_p2a3_rail_transfer_movement_profile_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P2A3_CONCISE='+json.dumps({'all_rows':all_rows,'rail_rows':rail_rows,'rail_pairs':len(movement),'rail_count_total':rail_count,'dv_resolved_share':result['dv_resolved_transfer_count_share'],'directional_supported_share':result['directional_supported_transfer_count_share'],'top_strict':strict[:20]},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a3"
+          F=seoul_p2a3_rail_transfer_movement_profile_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P2A3_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

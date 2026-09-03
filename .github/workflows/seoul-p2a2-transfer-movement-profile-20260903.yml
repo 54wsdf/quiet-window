@@ -51,7 +51,7 @@ jobs:
               return 'cp949'
           def zr(z,n):
               f=z.open(n);h=f.read(262144);f.close();e=detect(h)
-              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
           def clean_id(s):return ''.join(x for x in str(s or '').strip() if x.isdigit())
           def id_variants(s):
               d=clean_id(s)
@@ -74,7 +74,6 @@ jobs:
               def q(p):return a[round((len(a)-1)*p)]
               return {'n':len(a),'min':a[0],'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
 
-          # T-money station support index.
           with zipfile.ZipFile('TAIMS.zip') as z:
               f,e=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
               dv={}; variant_to_out=defaultdict(set)
@@ -85,19 +84,16 @@ jobs:
                   for v in id_variants(out):variant_to_out[v].add(out)
               f.close()
 
-          # Directional transfer endpoint code -> line-pair rows.
           raw=Path('directional.csv').read_bytes();de=detect(raw[:262144]);dr=csv.DictReader(io.StringIO(raw.decode(de,errors='replace')));df=dr.fieldnames or []
           sc=next(k for k in df if '환승시작 코드' in k);ec=next(k for k in df if '환승종료역 코드' in k)
           sn=next(k for k in df if k=='환승시작역');en=next(k for k in df if k=='환승종료역')
           sl=next(k for k in df if k=='환승시작 호선');el=next(k for k in df if k=='환승종료 호선');dur=next(k for k in df if k=='소요시간')
-          directional=defaultdict(list);dir_endpoint_variants=defaultdict(set)
+          directional=defaultdict(list)
           for row in dr:
               a=(row.get(sc) or '').strip();b=(row.get(ec) or '').strip()
               rec={'start_code':a,'end_code':b,'start_name':(row.get(sn) or '').strip(),'end_name':(row.get(en) or '').strip(),'start_line':(row.get(sl) or '').strip(),'end_line':(row.get(el) or '').strip(),'duration':(row.get(dur) or '').strip()}
               for av in id_variants(a):
                   for bv in id_variants(b):directional[(av,bv)].append(rec)
-              for v in id_variants(a):dir_endpoint_variants[v].add(a)
-              for v in id_variants(b):dir_endpoint_variants[v].add(b)
 
           with zipfile.ZipFile('observed.zip') as z:
               member=[n for n in z.namelist() if n.lower().endswith('.csv')][0]
@@ -141,14 +137,12 @@ jobs:
                   dirs=[]
                   for av in id_variants(fo):
                       for bv in id_variants(to):dirs.extend(directional.get((av,bv),[]))
-                  # A paid-area metro interchange commonly has same passenger-facing station name, but retain all actual directional line-pair rows.
                   rec['directional_rows']=dirs[:100];rec['directional_supported']=bool(dirs)
                   if dirs:directional_count+=m['count']
               else:rec['directional_supported']=False
               ranked.append(rec)
           ranked.sort(key=lambda x:(-x['observed_transfer_count'],x['raw_from_id'],x['raw_to_id']))
           strict=[x for x in ranked if x['dv_resolved'] and x['directional_supported']]
-          # Prefer actual metro interchange movements: same normalized station name, directional line-pair support, meaningful observed count.
           same_station=[x for x in strict if norm_name(x.get('from_name')) and norm_name(x.get('from_name'))==norm_name(x.get('to_name'))]
 
           result={'schema':'mppd-n1-seoul-p2a2-transfer-movement-profile-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'observed_member':member,'rows':nrows,'fields':fields,'movement_pairs':len(movement),'id_resolution':exact_stats,'observed_transfer_count_total':movement_total,'dv_resolved_transfer_count':resolved_count,'dv_resolved_transfer_count_share':resolved_count/movement_total if movement_total else None,'directional_supported_transfer_count':directional_count,'directional_supported_transfer_count_share':directional_count/movement_total if movement_total else None,'top_movements':ranked[:100],'top_strict_directional_movements':strict[:100],'top_same_station_directional_movements':same_station[:100],'evidence_boundary':'Movement counts and average transfer times are aggregate observations. Directional table supplies line/car-door movement definitions; neither identifies individual train-to-train passenger ancestry.'}

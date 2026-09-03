@@ -1,0 +1,191 @@
+name: Seoul P3B5 Transfer-Time Dose Response 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b5-transfer-dose-response-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b5"; cd "$RUNNER_TEMP/p3b5"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Evaluate monotone transfer-time dose response
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b5"
+          python - <<'PY'
+          import csv,io,json,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          IN_LINE='1008';OUT_LINE='1002';IN_TRANSFER='1008000814';OUT_TRANSFER='1002000216'
+          GUARD=60; DOSES=[0,120,158,300]
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def mi(t):return t.hour*60+t.minute
+          def hist(rows,dose):return Counter(mi(r[dose]['darr']) for r in rows if r[dose] is not None)
+          def tv(a,b):
+              keys=set(a)|set(b);sa=sum(a.values());sb=sum(b.values())
+              return .5*sum(abs(a.get(k,0)/sa-b.get(k,0)/sb) for k in keys) if sa and sb else None
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          names={x['service_statn_id']:x.get('dv_name') for x in p1c['canonical_entries'] if x.get('service_statn_id')}
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+          inbound=defaultdict(list);outbound=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for ta,td in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          for oa,od in evs:
+                              if od<ta and 0<(ta-od).total_seconds()<=7200:
+                                  inbound[os].append((od,ta,tr));break
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for ta,td in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          for da,dd in evs:
+                              if da>td and 0<(da-td).total_seconds()<=7200:
+                                  outbound[ds].append((td,da,tr));break
+          for st in inbound:inbound[st]=sorted(set(inbound[st]))
+          for st in outbound:outbound[st]=sorted(set(outbound[st]))
+
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a['service_subway_id']!=IN_LINE or b['service_subway_id']!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and (t0.hour==7 or (t0.hour==8 and t0.minute<30))):continue
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  os=a['service_statn_id'];ds=b['service_statn_id']
+                  if os in inbound and ds in outbound:passengers.append((t0,t1,os,ds))
+              f.close()
+
+          def select(p,dose):
+              t0,t1,os,ds=p
+              ins=[x for x in inbound[os] if x[0]>=t0+timedelta(seconds=GUARD)]
+              if not ins:return None
+              idep,iarr,itr=min(ins,key=lambda x:(x[1],x[0],x[2]))
+              outs=[x for x in outbound[ds] if x[0]>=iarr+timedelta(seconds=dose)]
+              if not outs:return None
+              odep,darr,otr=min(outs,key=lambda x:(x[1],x[0],x[2]))
+              return {'iarr':iarr,'odep':odep,'darr':darr,'otrain':otr}
+
+          rows=[]
+          for p in passengers:
+              rec={'dest':p[3]}
+              for d in DOSES:rec[d]=select(p,d)
+              rows.append(rec)
+          common=[r for r in rows if all(r[d] is not None for d in DOSES)]
+          base_hist=hist(common,0)
+          dose_profiles={}
+          prev=None
+          monotonic_violations=0;service_change_monotonic_violations=0
+          for r in common:
+              arr=[r[d]['darr'] for d in DOSES]
+              if any(arr[i]>arr[i+1] for i in range(len(arr)-1)):monotonic_violations+=1
+              changed=[(r[d]['otrain'],r[d]['odep'])!=(r[0]['otrain'],r[0]['odep']) for d in DOSES]
+              if any(changed[i] and not changed[i+1] for i in range(len(changed)-1)):service_change_monotonic_violations+=1
+          for d in DOSES:
+              h=hist(common,d);added=[(r[d]['darr']-r[0]['darr']).total_seconds() for r in common];changed=[(r[d]['otrain'],r[d]['odep'])!=(r[0]['otrain'],r[0]['odep']) for r in common]
+              dose_profiles[str(d)]={'rows':len(common),'service_changed_share_vs_0':sum(changed)/len(common) if common else None,'added_destination_arrival_sec_vs_0':summ(added),'minute_distribution_tv_vs_0':tv(base_hist,h)}
+          robust_dest=[]
+          bydest=defaultdict(list)
+          for r in common:bydest[r['dest']].append(r)
+          for ds,rs in bydest.items():
+              if len(rs)<100:continue
+              bh=hist(rs,0);x={'destination_service_station_id':ds,'destination_name':names.get(ds),'rows':len(rs),'doses':{}}
+              for d in DOSES:
+                  hh=hist(rs,d);changed=sum((r[d]['otrain'],r[d]['odep'])!=(r[0]['otrain'],r[0]['odep']) for r in rs)/len(rs);added=[(r[d]['darr']-r[0]['darr']).total_seconds() for r in rs]
+                  x['doses'][str(d)]={'service_changed_share_vs_0':changed,'added_arrival_sec_median':q(added,.5),'minute_distribution_tv_vs_0':tv(bh,hh)}
+              robust_dest.append(x)
+          robust_dest.sort(key=lambda x:x['rows'],reverse=True)
+          tv_series=[dose_profiles[str(d)]['minute_distribution_tv_vs_0'] for d in DOSES]
+          change_series=[dose_profiles[str(d)]['service_changed_share_vs_0'] for d in DOSES]
+          delay_series=[dose_profiles[str(d)]['added_destination_arrival_sec_vs_0']['median'] for d in DOSES]
+          aggregate_monotone=all(tv_series[i]<=tv_series[i+1]+1e-12 for i in range(len(tv_series)-1)) and all(change_series[i]<=change_series[i+1]+1e-12 for i in range(len(change_series)-1)) and all(delay_series[i]<=delay_series[i+1]+1e-12 for i in range(len(delay_series)-1))
+          decision='TRANSFER_TIME_DOSE_RESPONSE_PASS' if monotonic_violations==0 and aggregate_monotone else 'TRANSFER_TIME_DOSE_RESPONSE_PARTIAL_OR_NONMONOTONE'
+          result={'schema':'mppd-n1-seoul-p3b5-transfer-time-dose-response-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'candidate':{'incoming_line':'1008','outgoing_line':'1002','station_ko':'잠실','station_en':'Jamsil'},'entry_guard_sec':GUARD,'transfer_time_doses_sec':DOSES,'all_candidate_rows':len(passengers),'common_all_doses_rows':len(common),'dose_profiles':dose_profiles,'passenger_level_arrival_monotonicity_violation_rows':monotonic_violations,'passenger_level_service_change_reversion_rows':service_change_monotonic_violations,'aggregate_dose_metrics_monotone':aggregate_monotone,'robust_destination_profiles_ge100':robust_dest,'decision':decision,'scientific_interpretation':'Increasing the imposed physical transfer-time lower bound progressively removes earlier outgoing services from each passenger candidate feasible set. A qualified dose response requires destination-best arrival opportunity to be nondecreasing passenger-by-passenger and aggregate service-change, arrival-delay and minute-distribution divergence metrics to increase monotonically with the transfer constraint.','evidence_boundary':['Dose values are counterfactual lower-bound constraints; only 158 seconds is the independently sourced Jamsil physical shortest-transfer value used as the main empirical constraint.','Destination-best opportunities are not passenger-to-train assignments.','No observed exit-pulse or T6 genealogy claim.']}
+          Path('seoul_p3b5_transfer_time_dose_response_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B5_CONCISE='+json.dumps({'common':len(common),'dose_profiles':dose_profiles,'arrival_monotonicity_violations':monotonic_violations,'service_change_reversions':service_change_monotonic_violations,'aggregate_monotone':aggregate_monotone,'robust_dest':robust_dest,'decision':decision},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b5"
+          F=seoul_p3b5_transfer_time_dose_response_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3B5_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

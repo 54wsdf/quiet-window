@@ -1,0 +1,155 @@
+name: Seoul P1D3 Fresh Status Event Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1d3-fresh-status-event-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore matched service
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p1d3"; cd "$RUNNER_TEMP/p1d3"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Reconstruct from fresh status observations only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1d3"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def parse(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except ValueError:return None
+          def qs(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'p10':q(.1),'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          pat=re.compile(r'subarr_(260829(\d{6}))')
+          # observations keyed by base key; each unique (time,state) carries minimum observed age across snapshots.
+          unique_obs=defaultdict(dict);age_all=[];age_direct=[];rows=0;direct_rows=0;future_rows=0;very_stale=0;shard_times=[]
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if not m:continue
+                  hh=m.group(2)
+                  if '070000'<=hh<'100000':
+                      st=datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S');infos.append((x,st));shard_times.append(st)
+              shard_times.sort();poll=[(b-a).total_seconds() for a,b in zip(shard_times,shard_times[1:])]
+              for x,st in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      rows+=1;t=parse(row.get('recptn_dt'))
+                      if not t:continue
+                      age=(st-t).total_seconds();age_all.append(age)
+                      if age<0:future_rows+=1
+                      if age>600:very_stale+=1
+                      state=(row.get('arvl_cd') or '').strip()
+                      if state not in {'0','1','2'}:continue
+                      direct_rows+=1;age_direct.append(age)
+                      line=(row.get('subway_id') or '').strip();train=(row.get('btrain_no') or '').strip();station=(row.get('statn_id') or '').strip()
+                      if not (line and train and station):continue
+                      key=(line,train,station);ok=(t,state)
+                      old=unique_obs[key].get(ok)
+                      if old is None or abs(age)<abs(old):unique_obs[key][ok]=age
+                  f.close()
+
+          def reconstruct(fresh_limit):
+              events=[];ages=[];dwell=[];key_pairs=Counter();boundary_time=0
+              for key,d in unique_obs.items():
+                  # Accept observation if it appears in a snapshot from 30 s before to fresh_limit after RECPTN_DT.
+                  items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=fresh_limit)
+                  trans=[]
+                  for t,s,a in items:
+                      if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+                  for i,(ta,sa,aa) in enumerate(trans):
+                      if sa!='1':continue
+                      found=None
+                      for td,sd,ad in trans[i+1:]:
+                          if sd=='1':break
+                          if sd=='2':
+                              dd=(td-ta).total_seconds()
+                              if 0<=dd<=300:found=(td,dd,ad)
+                              break
+                      if found:
+                          td,dd,ad=found
+                          # both event timestamps themselves must be inside bounded AM clock window
+                          if not (ta.date().isoformat()=='2026-08-29' and 7<=ta.hour<10 and td.date().isoformat()=='2026-08-29' and 7<=td.hour<10):
+                              boundary_time+=1;continue
+                          line,train,station=key
+                          events.append({'evidence_class':'FRESH_DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE','subway_id':line,'btrain_no':train,'statn_id':station,'arrival_detect_time':ta.strftime('%Y%m%d%H%M%S'),'departure_detect_time':td.strftime('%Y%m%d%H%M%S'),'dwell_detect_seconds':dd,'arrival_min_snapshot_age_seconds':aa,'departure_min_snapshot_age_seconds':ad,'freshness_limit_seconds':fresh_limit})
+                          ages.extend((aa,ad));dwell.append(dd);key_pairs[key]+=1
+              return {'events':events,'event_rows':len(events),'dwell':qs(dwell),'event_snapshot_age':qs(ages),'keys':len(key_pairs),'multi_cycle_keys':sum(1 for v in key_pairs.values() if v>1),'boundary_timestamp_pairs_dropped':boundary_time}
+
+          results={str(x):reconstruct(x) for x in (30,60,120,300)}
+          counts=[results[str(x)]['event_rows'] for x in (30,60,120,300)]
+          delta_60_120=abs(counts[2]-counts[1])/max(1,counts[2]);delta_120_300=abs(counts[3]-counts[2])/max(1,counts[3])
+          selected=results['120'];events=selected.pop('events')
+          # remove event lists from other sensitivity results before JSON serialization
+          for k in ('30','60','300'):results[k].pop('events')
+          if events:
+              with open('am_fresh_service_event_candidates_0700_1000.csv','w',encoding='utf-8',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(events[0]));w.writeheader();w.writerows(events)
+          supported=bool(selected['event_rows']>=3000 and delta_60_120<=0.15 and delta_120_300<=0.10 and selected['event_snapshot_age'] and selected['event_snapshot_age']['p99']<=120)
+          result={'schema':'mppd-n1-seoul-p1d3-fresh-status-event-qualification-v1','window':'2026-08-29 07:00:00-10:00:00','archive_shards':len(infos),'snapshot_rows':rows,'direct_state_rows':direct_rows,'poll_gap_sec':qs(poll),'all_row_snapshot_age_sec':qs(age_all),'direct_row_snapshot_age_sec':qs(age_direct),'future_timestamp_rows':future_rows,'rows_staler_than_600_sec':very_stale,'unique_base_keys':len(unique_obs),'freshness_sensitivity':results,'selected_freshness_limit_sec':120,'selected_event_rows':len(events),'selected_event_table':'am_fresh_service_event_candidates_0700_1000.csv','relative_delta_60_vs_120':delta_60_120,'relative_delta_120_vs_300':delta_120_300,'evidence_class':'FRESH_DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE','qualification':{'fresh_status_event_reconstruction_supported':supported,'t5_pass':False,'t6_observed_genealogy':False},'timestamp_boundary':'Events are direct status transition observation times with explicit freshness to snapshot polling; still not proprietary ATS track-circuit timestamps.'}
+          Path('seoul_p1d3_fresh_status_event_qualification_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1D3_CONCISE='+json.dumps({'snapshot_rows':rows,'direct_rows':direct_rows,'poll':result['poll_gap_sec'],'all_age':result['all_row_snapshot_age_sec'],'direct_age':result['direct_row_snapshot_age_sec'],'future_rows':future_rows,'stale600':very_stale,'sensitivity':results,'selected_events':len(events),'delta60_120':delta_60_120,'delta120_300':delta_120_300,'qualification':result['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store fresh-event result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1d3"
+          cpv(){ local s="$1" d="$2"; rclone copyto "$s" "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; local l r; l="$(stat -c '%s' "$s")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$l" = "$r"; }
+          cpv seoul_p1d3_fresh_status_event_qualification_20260903.json 99_manifests/seoul_p1d3_fresh_status_event_qualification_20260903.json
+          if [[ -f am_fresh_service_event_candidates_0700_1000.csv ]]; then cpv am_fresh_service_event_candidates_0700_1000.csv processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv; fi
+          echo SEOUL_P1D3_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

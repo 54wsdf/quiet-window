@@ -1,0 +1,251 @@
+name: Seoul P2A12B Composite Transfer Episode Semantics 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a12b-composite-transfer-episode-semantics-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore source packages
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq sqlite3
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a12b"; cd "$RUNNER_TEMP/p2a12b"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Reconstruct composite transfer episodes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a12b"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, re, sqlite3, zipfile
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          RID4=re.compile(r'^\d{4}$')
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); enc=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=enc,errors='replace',newline='')
+
+          def nd(v):
+              s=''.join(x for x in str(v or '') if x.isdigit())
+              return s if len(s)==14 and s.startswith('20') else None
+
+          def dt(v):
+              if not v: return None
+              try: return datetime.strptime(v,'%Y%m%d%H%M%S')
+              except: return None
+
+          def quant(vals,p):
+              if not vals: return None
+              vals=sorted(vals); i=min(len(vals)-1,max(0,round((len(vals)-1)*p)))
+              return vals[i]
+
+          station_name={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip(); nm=(row.get('STN_KR_NM') or '').strip()
+                  if sid: station_name[sid]=nm
+              f.close()
+
+          db=sqlite3.connect('legs.sqlite')
+          db.execute('PRAGMA journal_mode=OFF'); db.execute('PRAGMA synchronous=OFF'); db.execute('PRAGMA temp_store=FILE')
+          db.execute('CREATE TABLE legs(card TEXT,trnc TEXT,seq INTEGER,serial INTEGER,mode TEXT,ride_dt TEXT,ride_id TEXT,algh_dt TEXT,algh_id TEXT)')
+          batch=[]; all_rows=inserted=rail_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  all_rows+=1
+                  card=(row.get('TRCR_ID') or '').strip(); trnc=(row.get('TRNC_ID') or '').strip()
+                  if not card or not trnc: continue
+                  try: seq=int((row.get('TRTR_FCNT') or '').strip())
+                  except: seq=-1
+                  try: serial=int((row.get('SERIAL_NUM') or '0').strip() or 0)
+                  except: serial=0
+                  mode=(row.get('TRNS_MNS_CD') or '').strip(); rail_rows+=int(mode in RAIL); inserted+=1
+                  batch.append((card,trnc,seq,serial,mode,nd(row.get('RIDE_DTM')),(row.get('RIDE_BSST_ID') or '').strip(),nd(row.get('ALGH_DTM')),(row.get('ALGH_BSST_ID') or '').strip()))
+                  if len(batch)>=50000:
+                      db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch); batch.clear()
+              if batch: db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch)
+              f.close()
+          db.commit(); db.execute('CREATE INDEX ix_leg_order ON legs(card,trnc,ride_dt,serial)'); db.commit()
+
+          def analyze():
+              group_count=multi_group_count=raw_group_max=0
+              episode_count=episode_max=0; episode_len_hist=Counter()
+              transitions=rr=rb=br=bb=0
+              rr_same_id=rr_same_name=rr_diff_name=0
+              rr_gap=[]; rr_mode=Counter(); rr_pair=Counter(); seq_delta=Counter(); negative_gap=valid_gap=0
+
+              def finish_episode(ep):
+                  nonlocal episode_count,episode_max,transitions,rr,rb,br,bb,rr_same_id,rr_same_name,rr_diff_name,negative_gap,valid_gap
+                  if not ep: return
+                  episode_count+=1; episode_len_hist[str(len(ep))]+=1; episode_max=max(episode_max,len(ep))
+                  for a,b in zip(ep,ep[1:]):
+                      dseq=b[2]-a[2]; seq_delta[str(dseq)]+=1
+                      if dseq!=1: continue
+                      transitions+=1; ar=a[4] in RAIL; brl=b[4] in RAIL
+                      if ar and brl:
+                          rr+=1; rr_mode[f'{a[4]}->{b[4]}']+=1; rr_pair[f'{a[8]}->{b[6]}']+=1
+                          if a[8] and a[8]==b[6]: rr_same_id+=1
+                          na=station_name.get(a[8],''); nb=station_name.get(b[6],'')
+                          if na and nb:
+                              if na==nb: rr_same_name+=1
+                              else: rr_diff_name+=1
+                          ta=dt(a[7]); tb=dt(b[5])
+                          if ta and tb:
+                              valid_gap+=1; gap=(tb-ta).total_seconds()
+                              if gap<0: negative_gap+=1
+                              elif gap<=21600: rr_gap.append(gap)
+                      elif ar and not brl: rb+=1
+                      elif not ar and brl: br+=1
+                      else: bb+=1
+
+              def process_group(gr):
+                  nonlocal group_count,multi_group_count,raw_group_max
+                  if not gr: return
+                  group_count+=1; multi_group_count+=int(len(gr)>=2); raw_group_max=max(raw_group_max,len(gr))
+                  # Remove exact duplicate leg records inside the same card+transfer-process group.
+                  clean=[]; seen=set()
+                  for z in gr:
+                      sig=z[2:]
+                      if sig in seen: continue
+                      seen.add(sig); clean.append(z)
+                  clean.sort(key=lambda z:((z[5] or ''),z[3]))
+                  ep=[]; prev=None
+                  for z in clean:
+                      if prev is None:
+                          ep=[z]; prev=z; continue
+                      t0=dt(prev[5]); t1=dt(z[5])
+                      reset=(z[2]<=prev[2])
+                      backward=bool(t0 and t1 and t1<t0)
+                      biggap=bool(t0 and t1 and (t1-t0).total_seconds()>21600)
+                      if reset or backward or biggap:
+                          finish_episode(ep); ep=[z]
+                      else:
+                          ep.append(z)
+                      prev=z
+                  finish_episode(ep)
+
+              cur=None; gr=[]
+              sql="SELECT card,trnc,seq,serial,mode,ride_dt,ride_id,algh_dt,algh_id FROM legs ORDER BY card,trnc,COALESCE(ride_dt,''),serial"
+              for row in db.execute(sql):
+                  key=(row[0],row[1])
+                  if cur is None: cur=key
+                  if key!=cur:
+                      process_group(gr); gr=[]; cur=key
+                  gr.append(row)
+              process_group(gr)
+
+              return {
+                  'composite_groups':{'groups':group_count,'multi_row_groups':multi_group_count,'multi_row_group_share':multi_group_count/group_count if group_count else None,'max_raw_group_rows':raw_group_max},
+                  'episodes':{'count':episode_count,'max_episode_legs':episode_max,'episode_length_histogram':dict(episode_len_hist)},
+                  'strict_transitions':{'all':transitions,'rail_to_rail':rr,'rail_to_nonrail':rb,'nonrail_to_rail':br,'nonrail_to_nonrail':bb,'rail_to_rail_share':rr/transitions if transitions else None},
+                  'rail_to_rail':{'count':rr,'same_endpoint_id':rr_same_id,'same_endpoint_id_share':rr_same_id/rr if rr else None,'same_station_name':rr_same_name,'same_station_name_share':rr_same_name/rr if rr else None,'different_station_name':rr_diff_name,'different_station_name_share':rr_diff_name/rr if rr else None,'top_mode_pairs':rr_mode.most_common(30),'unique_station_pairs':len(rr_pair),'top_station_pairs':rr_pair.most_common(40),'valid_interleg_gap':valid_gap,'negative_gap':negative_gap,'gap_le_6h':{'n':len(rr_gap),'min_sec':min(rr_gap) if rr_gap else None,'p10_sec':quant(rr_gap,.1),'p50_sec':quant(rr_gap,.5),'p90_sec':quant(rr_gap,.9),'p99_sec':quant(rr_gap,.99),'max_sec':max(rr_gap) if rr_gap else None}},
+                  'sequence_delta_all_adjacent':dict(seq_delta),
+                  '_rr_pair_counter':rr_pair
+              }
+
+          a=analyze(); rr_pair=a.pop('_rr_pair_counter')
+
+          observed_rail_pairs=set(); observed_rows=0
+          with zipfile.ZipFile('observed.zip') as z:
+              mem=[x for x in z.namelist() if x.lower().endswith('.csv')][0]; f=zr(z,mem); r=csv.DictReader(f)
+              for row in r:
+                  observed_rows+=1
+                  x=(row.get('하차_정류장/역사_ID') or '').strip(); y=(row.get('승차_정류장/역사_ID') or '').strip()
+                  if RID4.fullmatch(x) and RID4.fullmatch(y): observed_rail_pairs.add((x,y))
+              f.close()
+          rr_pair_set={tuple(k.split('->',1)) for k in rr_pair}; inter=rr_pair_set & observed_rail_pairs
+          overlap_trans=sum(v for k,v in rr_pair.items() if tuple(k.split('->',1)) in observed_rail_pairs)
+
+          result={
+              'schema':'mppd-n1-seoul-p2a12b-composite-transfer-episode-semantics-v1',
+              'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+              'source_business_date':'2026-08-29',
+              'privacy_boundary':'TRCR_ID and TRNC_ID are used only inside the runner to form composite groups; no identifiers or passenger rows are logged/exported.',
+              'input':{'all_dx_rows':all_rows,'rows_with_composite_key':inserted,'official_rail_rows':rail_rows},
+              **a,
+              'episode_contract':'within TRCR_ID+TRNC_ID, split when TRTR_FCNT resets/decreases, ride time moves backward, or ride-time gap exceeds 6h; only adjacent seq+1 legs define strict transfer transitions',
+              'aggregate_structural_overlap':{
+                  'observed_aggregate_business_date':'2026-08-25','observed_rows':observed_rows,'observed_rail_pair_universe':len(observed_rail_pairs),
+                  'dx_strict_rr_pair_universe':len(rr_pair_set),'pair_intersection':len(inter),
+                  'dx_pair_overlap_share':len(inter)/len(rr_pair_set) if rr_pair_set else None,
+                  'observed_pair_overlap_share':len(inter)/len(observed_rail_pairs) if observed_rail_pairs else None,
+                  'strict_rr_transition_count_on_observed_pairs':overlap_trans,
+                  'strict_rr_transition_overlap_share':overlap_trans/a['rail_to_rail']['count'] if a['rail_to_rail']['count'] else None,
+                  'boundary':'Different dates; structural-semantic overlap only.'
+              },
+              'decision':None,
+              'evidence_boundary':[
+                  'Composite grouping and episode reconstruction do not identify train ancestry.',
+                  'A strict rail-to-rail card leg transition is a recorded transfer-processing transition at minute time resolution, not proof that all ordinary paid-area metro interchanges are separately tagged.',
+                  'The 2026-08-25 aggregate table is not same-day validation for 2026-08-29 DX_CARD.'
+              ]
+          }
+          realistic=(result['episodes']['max_episode_legs']<=20 and result['composite_groups']['groups']>100000)
+          ov=result['aggregate_structural_overlap']['strict_rr_transition_overlap_share'] or 0
+          if realistic and ov>=0.70: result['decision']='RECORDED_CARD_TRANSFER_PROCESS_SEMANTICS_QUALIFIED'
+          elif realistic: result['decision']='COMPOSITE_TRANSFER_EPISODES_QUALIFIED_AGGREGATE_OVERLAP_PARTIAL'
+          else: result['decision']='COMPOSITE_KEY_OR_EPISODE_CONTRACT_REQUIRES_FURTHER_REFINEMENT'
+
+          Path('seoul_p2a12b_composite_transfer_episode_semantics_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P2A12B_CONCISE='+json.dumps({
+              'composite_groups':result['composite_groups'],'episodes':result['episodes'],'strict_transitions':result['strict_transitions'],
+              'rail_to_rail':result['rail_to_rail'],'aggregate_structural_overlap':result['aggregate_structural_overlap'],'decision':result['decision']
+          },ensure_ascii=False))
+          db.close()
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a12b"
+          F=seoul_p2a12b_composite_transfer_episode_semantics_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P2A12B_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,145 @@
+name: Seoul P0B Schema Match 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p0b-schema-match-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare runtime
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check requests beautifulsoup4 openpyxl
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p0b"
+          cd "$RUNNER_TEMP/seoul-p0b"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS_20260902.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/reference/tdata_code_table_10002.xlsx" tdata_code_table_10002.xlsx --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Download service package matching passenger business date
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0b"
+          python - <<'PY'
+          import requests, zipfile, hashlib, json, os
+          from bs4 import BeautifulSoup
+          from datetime import datetime, timezone
+          landing='https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20007'
+          file_id='15457'; expected='BMS_20260830.zip'
+          s=requests.Session(); s.headers['User-Agent']='quiet-window-public-data-worker/1.0'
+          r=s.get(landing,timeout=60); r.raise_for_status(); soup=BeautifulSoup(r.text,'html.parser')
+          opt=soup.select_one(f'#filedata_selectbox option[value="{file_id}"]')
+          if not opt or opt.get_text(strip=True)!=expected: raise RuntimeError('public selector changed for BMS_20260830.zip')
+          with s.get(f'https://t-data.seoul.go.kr/dataprovide/download.do?id={file_id}',headers={'Referer':landing},stream=True,timeout=(30,3600)) as q:
+              q.raise_for_status()
+              with open(expected,'wb') as f:
+                  for b in q.iter_content(8*1024*1024):
+                      if b:f.write(b)
+          with zipfile.ZipFile(expected) as z:
+              if not z.infolist(): raise RuntimeError('empty BMS archive')
+          h=hashlib.sha256()
+          with open(expected,'rb') as f:
+              for b in iter(lambda:f.read(8*1024*1024),b''):h.update(b)
+          m={'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP','dataset_id':'KR_SEOUL_TDATA_BMS_REFERENCE_20260830','provider_landing_url':landing,'public_download_id':file_id,'provider_package_label_date':'2026-08-30','target_business_date':'2026-08-29','retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'original_filename':expected,'bytes':os.path.getsize(expected),'sha256':h.hexdigest(),'github_run_id':os.getenv('GITHUB_RUN_ID')}
+          open(expected+'.manifest.json','w',encoding='utf-8').write(json.dumps(m,ensure_ascii=False,indent=2))
+          print(json.dumps({'filename':expected,'bytes':m['bytes'],'sha256':m['sha256']},ensure_ascii=False))
+          PY
+
+      - name: Resolve actual headers, code mapping and package dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0b"
+          python - <<'PY'
+          import csv,io,json,re,zipfile
+          from collections import Counter
+          from openpyxl import load_workbook
+
+          def detect(raw):
+              for enc in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(enc); return enc
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def member_reader(z,name):
+              b=z.open(name); head=b.read(65536); b.close(); enc=detect(head)
+              return io.TextIOWrapper(z.open(name),encoding=enc,errors='replace',newline=''),enc
+
+          observed_modes={'120','105','131','115','121','142','130','190','201','203','202','206','208','236','210','205','235','204','290','209','237','232','231'}
+          wb=load_workbook('tdata_code_table_10002.xlsx',read_only=True,data_only=True)
+          code_matches=[]
+          for ws in wb.worksheets:
+              for ridx,row in enumerate(ws.iter_rows(values_only=True),start=1):
+                  vals=['' if v is None else str(v).strip() for v in row]
+                  if any(v in observed_modes for v in vals) or any(k in ' | '.join(vals) for k in ('교통수단','지하철','철도','도시철도')):
+                      code_matches.append({'sheet':ws.title,'row':ridx,'values':vals[:20]})
+
+          with zipfile.ZipFile('TAIMS_20260902.zip') as z:
+              f,enc=member_reader(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f); dv_fields=r.fieldnames or []
+              cardinal={k:set() for k in dv_fields}; nonblank=Counter()
+              for row in r:
+                  for k in dv_fields:
+                      v=(row.get(k) or '').strip()
+                      if v:
+                          nonblank[k]+=1
+                          if len(cardinal[k])<5000: cardinal[k].add(v)
+              f.close()
+              dv_summary={'encoding':enc,'fields':dv_fields,'nonblank_counts':dict(nonblank),'unique_counts_capped':{k:len(v) for k,v in cardinal.items()}}
+              f,enc=member_reader(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f); dx_fields=r.fieldnames or []; f.close()
+
+          stamp_re=re.compile(r'subarr_(\d{12})')
+          with zipfile.ZipFile('BMS_20260830.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              stamps=[stamp_re.search(x.filename).group(1) for x in infos if stamp_re.search(x.filename)]
+              first=infos[0].filename; last=infos[-1].filename
+              f,enc=member_reader(z,first); r=csv.reader(f); first_header=next(r,[]); f.close()
+              f,enc2=member_reader(z,last); r=csv.reader(f); last_header=next(r,[]); f.close()
+              bms={'members':len(infos),'stamp_min':min(stamps) if stamps else None,'stamp_max':max(stamps) if stamps else None,'date_counts':dict(Counter(s[:6] for s in stamps)),'first_member':first,'last_member':last,'first_header':first_header,'last_header':last_header,'first_encoding':enc,'last_encoding':enc2}
+
+          out={'schema':'mppd-n1-seoul-p0b-schema-match-v1','target_passenger_business_date':'2026-08-29','dx_fields':dx_fields,'dv_summary':dv_summary,'observed_mode_code_rows':code_matches,'bms_20260830':bms,'same_business_date_by_member_stamp':bms['date_counts']=={'260829':bms['members']}}
+          open('seoul_p0b_schema_match_20260903.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print('P0B_CONCISE='+json.dumps({'dx_fields':dx_fields,'dv_fields':dv_fields,'mode_code_rows':code_matches,'bms_members':bms['members'],'bms_stamp_min':bms['stamp_min'],'bms_stamp_max':bms['stamp_max'],'bms_date_counts':bms['date_counts'],'bms_header':first_header,'same_business_date_by_member_stamp':out['same_business_date_by_member_stamp']},ensure_ascii=False))
+          PY
+
+      - name: Store matched service and P0B profile
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0b"
+          copyv(){ local s="$1" d="$2"; rclone copyto "$s" "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; local l r; l="$(stat -c '%s' "$s")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$l" = "$r"; }
+          copyv BMS_20260830.zip service/20260830/BMS_20260830.zip
+          copyv BMS_20260830.zip.manifest.json 99_manifests/BMS_20260830.zip.manifest.json
+          copyv seoul_p0b_schema_match_20260903.json 99_manifests/seoul_p0b_schema_match_20260903.json
+          echo SEOUL_P0B_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

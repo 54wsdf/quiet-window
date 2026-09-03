@@ -1,0 +1,95 @@
+name: MBTA GTFS 2020 Transfer Pathways Probe 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mbta-gtfs2020-transfer-pathways-probe-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/boston_mbta/gtfs_2020_archive_probe
+      BASE: https://performancedata.mbta.com/lamp/gtfs_archive/2020
+
+    steps:
+      - name: Prepare tools and storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq file
+          python -m pip install --disable-pip-version-check pyarrow pandas
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Probe and download historical GTFS tables
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          printf 'table\thttp_status\tsize_bytes\trows\tcolumns\n' > probe.tsv
+          for t in pathways transfers stops routes trips stop_times feed_info; do
+            url="$BASE/$t.parquet"
+            code="$(curl -sSL -o /dev/null -w '%{http_code}' "$url")"
+            if [[ "$code" == 200 ]]; then
+              curl -fL --retry 5 --retry-all-errors "$url" -o "$t.parquet"
+              size="$(stat -c '%s' "$t.parquet")"
+              export TABLE="$t"
+              read rows cols < <(python - <<'PY'
+          import os, pyarrow.parquet as pq
+          p=pq.ParquetFile(os.environ['TABLE']+'.parquet')
+          print(p.metadata.num_rows, p.metadata.num_columns)
+          PY
+              )
+              printf '%s\t%s\t%s\t%s\t%s\n' "$t" "$code" "$size" "$rows" "$cols" >> probe.tsv
+            else
+              printf '%s\t%s\t\t\t\n' "$t" "$code" >> probe.tsv
+            fi
+          done
+          cat probe.tsv
+          python - <<'PY'
+          import json, pathlib, csv
+          rows=list(csv.DictReader(open('probe.tsv'),delimiter='\t'))
+          d={'dataset_id':'US_BOS_MBTA_GTFS_2020_TRANSFER_PATHWAYS_PROBE','state':'VALIDATED_LOCAL','base_url':'https://performancedata.mbta.com/lamp/gtfs_archive/2020','tables':rows}
+          for name in ('pathways','transfers'):
+              p=pathlib.Path(name+'.parquet')
+              if p.exists():
+                  import pyarrow.parquet as pq
+                  tab=pq.read_table(p)
+                  d[name+'_schema']=[str(x) for x in tab.schema]
+                  d[name+'_sample']=tab.slice(0,min(5,tab.num_rows)).to_pylist()
+          pathlib.Path('probe.json').write_text(json.dumps(d,indent=2,default=str),encoding='utf-8')
+          print(json.dumps(d,indent=2,default=str))
+          PY
+
+      - name: Store probe and available tables
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          for f in probe.tsv probe.json *.parquet; do
+            [[ -f "$f" ]] || continue
+            rclone copyto "$f" "$REMOTE_NAME:$ROOT_DRIVE/$f" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+            L="$(stat -c '%s' "$f")"; R="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          done
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

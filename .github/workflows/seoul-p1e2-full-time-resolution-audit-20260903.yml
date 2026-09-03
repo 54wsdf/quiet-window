@@ -1,0 +1,97 @@
+name: Seoul P1E2 Full Time Resolution Audit 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1e2-full-time-resolution-audit-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore passenger file
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p1e2"; cd "$RUNNER_TEMP/p1e2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Full rail timestamp-resolution audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1e2"
+          python - <<'PY'
+          import csv,io,json,zipfile
+          from collections import Counter
+          from datetime import datetime,timezone
+          from pathlib import Path
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          fields=['RIDE_DTM','ALGH_DTM','TRIP_DEPR_DTM','RIDE_DTM_H','ALGH_DTM_H','TRIP_DEPR_DTM_H']
+          stats={k:{'nonblank':0,'lengths':Counter(),'seconds':Counter(),'last2':Counter(),'example_lengths':Counter()} for k in fields}
+          rail_rows=0;all_rows=0;mode=Counter()
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  all_rows+=1;m=(row.get('TRNS_MNS_CD') or '').strip()
+                  if m not in RAIL:continue
+                  rail_rows+=1;mode[m]+=1
+                  for k in fields:
+                      v=(row.get(k) or '').strip()
+                      if not v:continue
+                      s=''.join(x for x in v if x.isdigit());x=stats[k];x['nonblank']+=1;x['lengths'][len(s)]+=1
+                      if len(s)>=2:x['last2'][s[-2:]]+=1
+                      if len(s)>=14:x['seconds'][s[12:14]]+=1
+              f.close()
+          out={}
+          for k,x in stats.items():
+              sec_total=sum(x['seconds'].values());last_total=sum(x['last2'].values())
+              out[k]={'nonblank':x['nonblank'],'coverage_share_of_rail':x['nonblank']/rail_rows if rail_rows else None,'digit_length_counts':dict(x['lengths']),'seconds_counts':dict(sorted(x['seconds'].items())),'seconds_unique':len(x['seconds']),'seconds_nonzero_share':sum(v for s,v in x['seconds'].items() if s!='00')/sec_total if sec_total else None,'last2_unique':len(x['last2']),'last2_nonzero_share':sum(v for s,v in x['last2'].items() if s!='00')/last_total if last_total else None}
+          result={'schema':'mppd-n1-seoul-p1e2-full-time-resolution-audit-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'all_rows':all_rows,'rail_rows':rail_rows,'mode_counts':dict(mode),'timestamp_fields':out,'strict_subminute_pass':any(v['seconds_unique']>=30 and (v['seconds_nonzero_share'] or 0)>=0.20 and v['coverage_share_of_rail']>=0.50 for k,v in out.items() if k in ('RIDE_DTM','ALGH_DTM','TRIP_DEPR_DTM')),'evidence_boundary':'A timestamp field qualifies as a possible sub-minute passenger observation only if it has broad second-of-minute support and substantial rail-row coverage. Hour/helper fields cannot substitute for observed tag time.'}
+          Path('seoul_p1e2_full_time_resolution_audit_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1E2_CONCISE='+json.dumps(result,ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1e2"
+          F=seoul_p1e2_full_time_resolution_audit_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P1E2_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,228 @@
+name: Seoul P3A1 Transfer Service Overlap Diagnosis 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3a1-transfer-service-overlap-diagnosis-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq sqlite3
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3a1"; cd "$RUNNER_TEMP/p3a1"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service_events.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Diagnose transfer-to-service overlap funnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a1"
+          python - <<'PY'
+          from __future__ import annotations
+          import bisect,csv,io,json,re,sqlite3,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT_TIERS={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); enc=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=enc,errors='replace',newline='')
+          def nd(v):
+              s=''.join(x for x in str(v or '') if x.isdigit())
+              return s if len(s)==14 and s.startswith('20') else None
+          def ts(v):
+              if not v:return None
+              try:return datetime.strptime(v,'%Y%m%d%H%M%S')
+              except:return None
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s);s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT_TIERS}
+
+          idname={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip();nm=(row.get('STN_KR_NM') or '').strip()
+                  if sid:idname[sid]=nm
+              f.close()
+
+          # Qualified AM service-event support universe.
+          event_keys=defaultdict(list); event_lines=Counter(); event_station_keys=Counter()
+          with open('service_events.csv',encoding='utf-8',newline='') as f:
+              r=csv.DictReader(f)
+              for row in r:
+                  line=(row.get('subway_id') or '').strip();station=(row.get('statn_id') or '').strip();dep=ts(row.get('departure_detect_time'))
+                  if not line or not station or not dep:continue
+                  event_keys[(line,station)].append(dep);event_lines[line]+=1;event_station_keys[(line,station)]+=1
+          for k in event_keys:event_keys[k]=sorted(set(event_keys[k]))
+          event_line_set={x for x,_ in event_keys}; event_key_set=set(event_keys)
+
+          db=sqlite3.connect('legs.sqlite');db.execute('PRAGMA journal_mode=OFF');db.execute('PRAGMA synchronous=OFF');db.execute('PRAGMA temp_store=FILE')
+          db.execute('CREATE TABLE legs(card TEXT,trnc TEXT,seq INTEGER,serial INTEGER,mode TEXT,ride_dt TEXT,ride_id TEXT,algh_dt TEXT,algh_id TEXT)')
+          batch=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  card=(row.get('TRCR_ID') or '').strip();trnc=(row.get('TRNC_ID') or '').strip()
+                  if not card or not trnc:continue
+                  try:seq=int((row.get('TRTR_FCNT') or '').strip())
+                  except:seq=-1
+                  try:serial=int((row.get('SERIAL_NUM') or '0').strip() or 0)
+                  except:serial=0
+                  batch.append((card,trnc,seq,serial,(row.get('TRNS_MNS_CD') or '').strip(),nd(row.get('RIDE_DTM')),(row.get('RIDE_BSST_ID') or '').strip(),nd(row.get('ALGH_DTM')),(row.get('ALGH_BSST_ID') or '').strip()))
+                  if len(batch)>=50000:
+                      db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch);batch.clear()
+              if batch:db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch)
+              f.close()
+          db.commit();db.execute('CREATE INDEX ix ON legs(card,trnc,ride_dt,serial)');db.commit()
+
+          funnel=Counter(); hour=Counter(); out_line=Counter(); out_key=Counter(); missing_line=Counter(); missing_key=Counter(); ref_available_line=Counter();
+          gap_secs=[];cur=None;gr=[]
+
+          def process(gr):
+              if not gr:return
+              clean=[];seen=set()
+              for z in gr:
+                  sig=z[2:]
+                  if sig in seen:continue
+                  seen.add(sig);clean.append(z)
+              clean.sort(key=lambda z:((z[5] or ''),z[3]))
+              episodes=[];ep=[];prev=None
+              for z in clean:
+                  if prev is None:ep=[z];prev=z;continue
+                  t0=ts(prev[5]);t1=ts(z[5]);reset=z[2]<=prev[2];back=bool(t0 and t1 and t1<t0);big=bool(t0 and t1 and (t1-t0).total_seconds()>21600)
+                  if reset or back or big:episodes.append(ep);ep=[z]
+                  else:ep.append(z)
+                  prev=z
+              if ep:episodes.append(ep)
+              for ep in episodes:
+                  for a,b in zip(ep,ep[1:]):
+                      if b[2]-a[2]!=1 or a[4] not in RAIL or b[4] not in RAIL:continue
+                      funnel['strict_rr']+=1
+                      na=idname.get(a[8],'');nb=idname.get(b[6],'')
+                      if not na or not nb or nn(na)!=nn(nb):continue
+                      funnel['same_station']+=1
+                      ca=cw.get(a[8]);cb=cw.get(b[6])
+                      if not ca or not cb:continue
+                      funnel['strict_crosswalk']+=1
+                      if ca['service_subway_id']==cb['service_subway_id']:continue
+                      funnel['crossline']+=1
+                      t0=ts(a[7]);t1=ts(b[5])
+                      if not t0 or not t1:continue
+                      gap=(t1-t0).total_seconds()
+                      if gap<0 or gap>3600:continue
+                      funnel['valid_gap']+=1;gap_secs.append(gap)
+                      h=t1.strftime('%H');hour[h]+=1
+                      line=cb['service_subway_id'];key=(line,cb['service_statn_id']);out_line[line]+=1;out_key[f'{line}|{cb["service_statn_id"]}|{cb.get("service_name","")}']+=1
+                      if line in event_line_set:funnel['outgoing_line_present']+=1
+                      else:missing_line[line]+=1
+                      if key in event_key_set:funnel['exact_service_key_present']+=1
+                      else:
+                          if line in event_line_set:missing_key[f'{line}|{cb["service_statn_id"]}|{cb.get("service_name","")}']+=1
+                          continue
+                      # Exact key is present. Now test clock-window and next departure availability separately.
+                      if t1.date().isoformat()=='2026-08-29' and 7<=t1.hour<10:
+                          funnel['within_service_event_clock_window']+=1
+                      else:continue
+                      deps=event_keys[key];i=bisect.bisect_left(deps,t1)
+                      if i<len(deps):
+                          funnel['reference_departure_available']+=1;ref_available_line[line]+=1
+
+          sql="SELECT card,trnc,seq,serial,mode,ride_dt,ride_id,algh_dt,algh_id FROM legs ORDER BY card,trnc,COALESCE(ride_dt,''),serial"
+          for row in db.execute(sql):
+              key=(row[0],row[1])
+              if cur is None:cur=key
+              if key!=cur:process(gr);gr=[];cur=key
+              gr.append(row)
+          process(gr)
+
+          # Decompose the 962 crossline transitions into bottleneck shares.
+          cross=funnel['crossline']
+          result={
+            'schema':'mppd-n1-seoul-p3a1-transfer-service-overlap-diagnosis-v1',
+            'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'service_event_layer':{
+              'window':'2026-08-29 07:00-10:00','qualified_event_keys':len(event_key_set),'qualified_lines':sorted(event_line_set),'event_rows':sum(event_lines.values()),'event_rows_by_line':dict(event_lines)
+            },
+            'funnel':dict(funnel),
+            'shares_of_crossline':{
+              'valid_gap':funnel['valid_gap']/cross if cross else None,
+              'outgoing_line_present':funnel['outgoing_line_present']/cross if cross else None,
+              'exact_service_key_present':funnel['exact_service_key_present']/cross if cross else None,
+              'within_service_event_clock_window':funnel['within_service_event_clock_window']/cross if cross else None,
+              'reference_departure_available':funnel['reference_departure_available']/cross if cross else None
+            },
+            'crossline_by_next_ride_hour':dict(sorted(hour.items())),
+            'crossline_by_outgoing_service_line':dict(out_line.most_common()),
+            'top_outgoing_service_keys':out_key.most_common(80),
+            'top_missing_outgoing_lines':missing_line.most_common(40),
+            'top_missing_exact_service_keys_on_present_lines':missing_key.most_common(80),
+            'reference_available_by_line':dict(ref_available_line),
+            'transfer_gap_sec':{'n':len(gap_secs),'p10':statistics.quantiles(gap_secs,n=10)[0] if len(gap_secs)>=10 else None,'median':statistics.median(gap_secs) if gap_secs else None,'p90':statistics.quantiles(gap_secs,n=10)[8] if len(gap_secs)>=10 else None},
+            'decision':None,
+            'evidence_boundary':['This diagnoses support coverage only; it does not infer train boarding.','P1D3 service events are bounded freshness-qualified status-transition observations, not complete proprietary ATS.','No passenger identifiers are exported.']
+          }
+          line_share=result['shares_of_crossline']['outgoing_line_present'] or 0;key_share=result['shares_of_crossline']['exact_service_key_present'] or 0;clock_share=result['shares_of_crossline']['within_service_event_clock_window'] or 0
+          if line_share<0.30:result['decision']='PRIMARY_BOTTLENECK_SERVICE_LINE_COVERAGE'
+          elif key_share < line_share*0.50:result['decision']='PRIMARY_BOTTLENECK_SERVICE_STATION_KEY_COVERAGE'
+          elif clock_share < key_share*0.50:result['decision']='PRIMARY_BOTTLENECK_AM_TIME_WINDOW'
+          else:result['decision']='MIXED_OR_REFERENCE_DEPARTURE_BOTTLENECK'
+          Path('seoul_p3a1_transfer_service_overlap_diagnosis_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3A1_CONCISE='+json.dumps({'service_event_layer':result['service_event_layer'],'funnel':result['funnel'],'shares':result['shares_of_crossline'],'by_hour':result['crossline_by_next_ride_hour'],'by_line':result['crossline_by_outgoing_service_line'],'missing_lines':result['top_missing_outgoing_lines'][:20],'missing_keys':result['top_missing_exact_service_keys_on_present_lines'][:20],'decision':result['decision']},ensure_ascii=False))
+          db.close()
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a1"
+          F=seoul_p3a1_transfer_service_overlap_diagnosis_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3A1_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

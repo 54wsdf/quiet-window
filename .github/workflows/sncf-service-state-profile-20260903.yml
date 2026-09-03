@@ -1,0 +1,160 @@
+name: SNCF Service State Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sncf-service-state-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      REALTIME_DRIVE: transport_data_lake/01_rail/FR_SNCF/03_realtime
+      CONTEXT_DRIVE: transport_data_lake/01_rail/FR_SNCF/05_disruptions_trackwork
+      OUT_DRIVE: transport_data_lake/01_rail/FR_SNCF/99_manifests/service_state_profile_20260903
+    steps:
+      - name: Restore frozen SNCF source packages
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq unzip
+          python -m pip install --disable-pip-version-check gtfs-realtime-bindings
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/sncf"; cd "$RUNNER_TEMP/sncf"
+          rclone copyto "$REMOTE_NAME:$REALTIME_DRIVE/sncf_s_tier_gtfsrt_trip_updates.zip" tu.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$REALTIME_DRIVE/sncf_s_tier_siri_estimated_timetable.zip" et.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$CONTEXT_DRIVE/sncf_s_tier_gtfsrt_service_alerts.zip" al.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$CONTEXT_DRIVE/sncf_s_tier_siri_situation_exchange.zip" sx.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          for f in tu et al sx; do mkdir -p "$f"; unzip -q "$f.zip" -d "$f"; done
+
+      - name: Profile native forecast, call and disruption semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sncf"
+          python - <<'PY'
+          from collections import Counter
+          from datetime import datetime
+          from pathlib import Path
+          import json, statistics
+          import xml.etree.ElementTree as ET
+          from google.transit import gtfs_realtime_pb2
+
+          def lname(e): return e.tag.split('}')[-1]
+          def tmap(e):
+              d={}
+              for x in e.iter():
+                  if x is e: continue
+                  k=lname(x)
+                  if x.text and x.text.strip() and k not in d:d[k]=x.text.strip()
+              return d
+          def dt(x):
+              if not x:return None
+              try:return datetime.fromisoformat(x.replace('Z','+00:00'))
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def stat(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+
+          # SIRI ET
+          et_file=Path('et/SNCF_SIRI_ET.xml'); root=ET.parse(et_file).getroot()
+          journeys=[]; calls=[]; field_counts=Counter()
+          for e in root.iter():
+              tag=lname(e)
+              if tag=='EstimatedVehicleJourney':
+                  d=tmap(e);journeys.append({'journey':d.get('DatedVehicleJourneyRef'),'line':d.get('LineRef'),'train':d.get('TrainNumberRef'),'recorded_at':d.get('RecordedAtTime')})
+              if tag in ('RecordedCall','EstimatedCall'):
+                  d=tmap(e)
+                  for k in ('AimedArrivalTime','ExpectedArrivalTime','ActualArrivalTime','AimedDepartureTime','ExpectedDepartureTime','ActualDepartureTime'):
+                      if d.get(k):field_counts[(tag,k)]+=1
+                  aa,ea,xa=dt(d.get('AimedArrivalTime')),dt(d.get('ExpectedArrivalTime')),dt(d.get('ActualArrivalTime'))
+                  ad,ed,xd=dt(d.get('AimedDepartureTime')),dt(d.get('ExpectedDepartureTime')),dt(d.get('ActualDepartureTime'))
+                  calls.append({'kind':tag,'stop':d.get('StopPointRef'),'expected_arrival_minus_aimed_sec':(ea-aa).total_seconds() if aa and ea else None,'expected_departure_minus_aimed_sec':(ed-ad).total_seconds() if ad and ed else None,'actual_arrival_present':xa is not None,'actual_departure_present':xd is not None})
+          arr=[x['expected_arrival_minus_aimed_sec'] for x in calls if x['expected_arrival_minus_aimed_sec'] is not None]
+          dep=[x['expected_departure_minus_aimed_sec'] for x in calls if x['expected_departure_minus_aimed_sec'] is not None]
+          arr_6h=[x for x in arr if abs(x)<=21600]; dep_6h=[x for x in dep if abs(x)<=21600]
+          et_prof={'vehicle_journeys':len(journeys),'unique_vehicle_journeys':len({x['journey'] for x in journeys if x['journey']}),'unique_lines':len({x['line'] for x in journeys if x['line']}),'unique_train_numbers':len({x['train'] for x in journeys if x['train']}),
+                   'calls':dict(Counter(x['kind'] for x in calls)),'unique_stop_refs':len({x['stop'] for x in calls if x['stop']}),'field_presence':{f'{a}.{b}':v for (a,b),v in field_counts.items()},
+                   'expected_minus_aimed_arrival_sec_all':stat(arr),'expected_minus_aimed_departure_sec_all':stat(dep),'expected_minus_aimed_arrival_sec_abs_le6h':stat(arr_6h),'expected_minus_aimed_departure_sec_abs_le6h':stat(dep_6h),
+                   'arrival_delta_abs_gt6h':sum(abs(x)>21600 for x in arr),'departure_delta_abs_gt6h':sum(abs(x)>21600 for x in dep),
+                   'actual_arrival_fields_present':sum(x['actual_arrival_present'] for x in calls),'actual_departure_fields_present':sum(x['actual_departure_present'] for x in calls),
+                   'state_decision':'FORECAST_SERVICE_WITH_PAST_AND_FUTURE_CALL_CONTAINERS; NO_DIRECT_ACTUAL_TIME_FIELD_IN_THIS_SNAPSHOT'}
+
+          # SIRI SX
+          sxroot=ET.parse('sx/SNCF_SIRI_SX.xml').getroot(); sits=[]
+          for e in sxroot.iter():
+              if lname(e)=='PtSituationElement': sits.append(tmap(e))
+          sx_prof={'situations':len(sits),'severity':dict(Counter(x.get('Severity') for x in sits)),'progress':dict(Counter(x.get('Progress') for x in sits)),'with_summary':sum(bool(x.get('Summary')) for x in sits),'with_description':sum(bool(x.get('Description')) for x in sits),'with_end_time':sum(bool(x.get('EndTime')) for x in sits),'state_decision':'SERVICE_CONTEXT'}
+
+          def pb_profile(fn,kind):
+              feed=gtfs_realtime_pb2.FeedMessage(); feed.ParseFromString(Path(fn).read_bytes())
+              entities=len(feed.entity); trips=set(); routes=set(); vehicles=set(); stops=set(); stop_updates=0; alerts=0; active_periods=0
+              arrival_times=[]; departure_times=[]; delays=[]; positions=0
+              for e in feed.entity:
+                  if e.HasField('trip_update'):
+                      tu=e.trip_update
+                      if tu.trip.trip_id: trips.add(tu.trip.trip_id)
+                      if tu.trip.route_id: routes.add(tu.trip.route_id)
+                      if tu.vehicle.id: vehicles.add(tu.vehicle.id)
+                      for s in tu.stop_time_update:
+                          stop_updates+=1
+                          if s.stop_id: stops.add(s.stop_id)
+                          if s.arrival.time: arrival_times.append(s.arrival.time)
+                          if s.departure.time: departure_times.append(s.departure.time)
+                          if s.arrival.delay: delays.append(s.arrival.delay)
+                          if s.departure.delay: delays.append(s.departure.delay)
+                  if e.HasField('vehicle'):
+                      vp=e.vehicle; positions+=1
+                      if vp.trip.trip_id: trips.add(vp.trip.trip_id)
+                      if vp.trip.route_id: routes.add(vp.trip.route_id)
+                      if vp.vehicle.id: vehicles.add(vp.vehicle.id)
+                      if vp.stop_id: stops.add(vp.stop_id)
+                  if e.HasField('alert'):
+                      alerts+=1; active_periods+=len(e.alert.active_period)
+                      for ie in e.alert.informed_entity:
+                          if ie.trip.trip_id:trips.add(ie.trip.trip_id)
+                          if ie.route_id:routes.add(ie.route_id)
+                          if ie.stop_id:stops.add(ie.stop_id)
+              return {'record_class':kind,'feed_header_timestamp':feed.header.timestamp,'entities':entities,'trip_ids':len(trips),'route_ids':len(routes),'vehicle_ids':len(vehicles),'stop_ids':len(stops),'stop_time_updates':stop_updates,'arrival_time_values':len(arrival_times),'departure_time_values':len(departure_times),'delay_values_nonzero_only_field_count':len(delays),'vehicle_position_entities':positions,'alert_entities':alerts,'alert_active_periods':active_periods}
+          tu_prof=pb_profile('tu/SNCF_GTFSRT_trip_updates.pb','GTFSRT_TRIP_UPDATES')
+          al_prof=pb_profile('al/SNCF_GTFSRT_service_alerts.pb','GTFSRT_SERVICE_ALERTS')
+
+          out={'schema':'sncf-service-state-profile.v1','dataset_id':'FR_SNCF_MULTI_SOURCE_RAIL_STACK','snapshot_acquired_utc':'2026-09-01T17:25Z',
+               'siri_estimated_timetable':et_prof,'siri_situation_exchange':sx_prof,'gtfsrt_trip_updates':tu_prof,'gtfsrt_service_alerts':al_prof,
+               'scientific_decision':'SNCF provides a strong FORECAST_SERVICE + SERVICE_CONTEXT snapshot. In this held SIRI ET snapshot, RecordedCall containers do not contain ActualArrivalTime/ActualDepartureTime, so they must not be promoted to DIRECT_REALIZED_SERVICE merely from the RecordedCall label.',
+               'next_gate':'Compare SIRI ET and GTFS-RT forecast identities/times and acquire repeated snapshots or an actual-performance product before planned-to-direct-realized boundary-motion claims.',
+               'evidence_state':'SNCF_FORECAST_AND_CONTEXT_LAYERS_QUALIFIED_DIRECT_REALIZED_NOT_ESTABLISHED'}
+          Path('sncf_service_state_profile.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8'); print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
+          PY
+
+      - name: Persist qualification result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sncf"
+          rclone copyto sncf_service_state_profile.json "$REMOTE_NAME:$OUT_DRIVE/sncf_service_state_profile.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

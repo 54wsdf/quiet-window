@@ -1,0 +1,268 @@
+name: Seoul P3A Recorded Transfer Connection Opportunity Pilot 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3a-recorded-transfer-connection-opportunity-pilot-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq sqlite3
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3a"; cd "$RUNNER_TEMP/p3a"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service_events.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build held-out transfer-to-service opportunity pilot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a"
+          python - <<'PY'
+          from __future__ import annotations
+          import bisect,csv,hashlib,io,json,math,re,sqlite3,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone,timedelta
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT_TIERS={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def nd(v):
+              s=''.join(x for x in str(v or '') if x.isdigit())
+              return s if len(s)==14 and s.startswith('20') else None
+          def ts(v):
+              if not v:return None
+              try:return datetime.strptime(v,'%Y%m%d%H%M%S')
+              except:return None
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s);s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def med(vals):return statistics.median(vals) if vals else None
+          def quant(vals,p):
+              if not vals:return None
+              vals=sorted(vals);return vals[min(len(vals)-1,max(0,round((len(vals)-1)*p)))]
+          def split_design(card):return hashlib.sha1(card.encode('utf-8')).digest()[0] < 128
+          def first_dep(events,t):
+              if not events:return None,None
+              times=[x[0] for x in events];i=bisect.bisect_left(times,t)
+              return (events[i],i) if i<len(events) else (None,None)
+          def tv(h1,h2):
+              keys=set(h1)|set(h2);a=sum(h1.values());b=sum(h2.values())
+              if not a or not b:return None
+              return .5*sum(abs(h1.get(k,0)/a-h2.get(k,0)/b) for k in keys)
+          def max_window(hist,width=5):
+              # minute-keyed histogram; return maximum sliding-width count
+              if not hist:return 0
+              vals=[]
+              for k,v in hist.items():vals.append((datetime.strptime(k,'%Y%m%d%H%M'),v))
+              vals.sort();best=0
+              for i,(t,_) in enumerate(vals):
+                  end=t+timedelta(minutes=width);s=0
+                  for tt,v in vals[i:]:
+                      if tt>=end:break
+                      s+=v
+                  best=max(best,s)
+              return best
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT_TIERS}
+
+          idname={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip();nm=(row.get('STN_KR_NM') or '').strip()
+                  if sid:idname[sid]=nm
+              f.close()
+
+          dep=defaultdict(list)
+          with open('service_events.csv',encoding='utf-8',newline='') as f:
+              r=csv.DictReader(f)
+              for row in r:
+                  t=ts(row.get('departure_detect_time'))
+                  if not t:continue
+                  key=((row.get('subway_id') or '').strip(),(row.get('statn_id') or '').strip())
+                  dep[key].append((t,(row.get('btrain_no') or '').strip()))
+          for k in dep:dep[k]=sorted(set(dep[k]))
+
+          db=sqlite3.connect('legs.sqlite');db.execute('PRAGMA journal_mode=OFF');db.execute('PRAGMA synchronous=OFF');db.execute('PRAGMA temp_store=FILE')
+          db.execute('CREATE TABLE legs(card TEXT,trnc TEXT,seq INTEGER,serial INTEGER,mode TEXT,ride_dt TEXT,ride_id TEXT,algh_dt TEXT,algh_id TEXT)')
+          batch=[];all_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  all_rows+=1;card=(row.get('TRCR_ID') or '').strip();trnc=(row.get('TRNC_ID') or '').strip()
+                  if not card or not trnc:continue
+                  try:seq=int((row.get('TRTR_FCNT') or '').strip())
+                  except:seq=-1
+                  try:serial=int((row.get('SERIAL_NUM') or '0').strip() or 0)
+                  except:serial=0
+                  batch.append((card,trnc,seq,serial,(row.get('TRNS_MNS_CD') or '').strip(),nd(row.get('RIDE_DTM')),(row.get('RIDE_BSST_ID') or '').strip(),nd(row.get('ALGH_DTM')),(row.get('ALGH_BSST_ID') or '').strip()))
+                  if len(batch)>=50000:db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch);batch.clear()
+              if batch:db.executemany('INSERT INTO legs VALUES (?,?,?,?,?,?,?,?,?)',batch)
+              f.close()
+          db.commit();db.execute('CREATE INDEX ix ON legs(card,trnc,ride_dt,serial)');db.commit()
+
+          design=[];evals=[];stats=Counter();cur=None;gr=[]
+          def process(gr):
+              if not gr:return
+              clean=[];seen=set()
+              for z in gr:
+                  sig=z[2:]
+                  if sig in seen:continue
+                  seen.add(sig);clean.append(z)
+              clean.sort(key=lambda z:((z[5] or ''),z[3]))
+              episodes=[];ep=[];prev=None
+              for z in clean:
+                  if prev is None:ep=[z];prev=z;continue
+                  t0=ts(prev[5]);t1=ts(z[5]);reset=z[2]<=prev[2];back=bool(t0 and t1 and t1<t0);big=bool(t0 and t1 and (t1-t0).total_seconds()>21600)
+                  if reset or back or big:episodes.append(ep);ep=[z]
+                  else:ep.append(z)
+                  prev=z
+              if ep:episodes.append(ep)
+              for ep in episodes:
+                  for a,b in zip(ep,ep[1:]):
+                      if b[2]-a[2]!=1 or a[4] not in RAIL or b[4] not in RAIL:continue
+                      stats['strict_rr']+=1
+                      na=idname.get(a[8],'');nb=idname.get(b[6],'')
+                      if not na or not nb or nn(na)!=nn(nb):continue
+                      stats['same_station']+=1
+                      ca=cw.get(a[8]);cb=cw.get(b[6])
+                      if not ca or not cb:continue
+                      stats['strict_crosswalk']+=1
+                      # primary: a true service-line change under the qualified crosswalk
+                      if ca['service_subway_id']==cb['service_subway_id']:continue
+                      stats['crossline']+=1
+                      t0=ts(a[7]);t1=ts(b[5])
+                      if not t0 or not t1:continue
+                      gap=(t1-t0).total_seconds()
+                      if gap<0 or gap>3600:continue
+                      if not (t0.date().isoformat()=='2026-08-29' and t1.date().isoformat()=='2026-08-29' and t0.hour>=7 and (t1.hour<9 or (t1.hour==9 and t1.minute<=50))):continue
+                      skey=(cb['service_subway_id'],cb['service_statn_id'])
+                      if skey not in dep:continue
+                      stats['service_supported']+=1
+                      rec={'card':a[0],'pair':(a[8],b[6],cb['service_subway_id'],cb['service_statn_id']),'station':nn(na),'out_line':cb['service_subway_id'],'service_key':skey,'t0':t0,'t1':t1,'gap':gap}
+                      (design if split_design(a[0]) else evals).append(rec)
+
+          sql="SELECT card,trnc,seq,serial,mode,ride_dt,ride_id,algh_dt,algh_id FROM legs ORDER BY card,trnc,COALESCE(ride_dt,''),serial"
+          for row in db.execute(sql):
+              key=(row[0],row[1])
+              if cur is None:cur=key
+              if key!=cur:process(gr);gr=[];cur=key
+              gr.append(row)
+          process(gr)
+
+          global_med=med([x['gap'] for x in design])
+          station_line=defaultdict(list);exact_pair=defaultdict(list)
+          for x in design:
+              station_line[(x['station'],x['out_line'])].append(x['gap']);exact_pair[x['pair']].append(x['gap'])
+          station_model={k:med(v) for k,v in station_line.items() if len(v)>=10}
+          pair_model={k:med(v) for k,v in exact_pair.items() if len(v)>=10}
+
+          model_names=['zero','fixed_120','design_global','design_station_line','design_exact_pair','observed_gap_oracle']
+          metrics={m:Counter() for m in model_names};abs_err={m:[] for m in model_names};signed_err={m:[] for m in model_names};hists={m:Counter() for m in model_names};ref_hist=Counter()
+          eval_ref=0
+          for x in evals:
+              events=dep[x['service_key']];ref,ref_i=first_dep(events,x['t1'])
+              if not ref:continue
+              eval_ref+=1;ref_hist[ref[0].strftime('%Y%m%d%H%M')]+=1
+              preds={
+                  'zero':0.0,
+                  'fixed_120':120.0,
+                  'design_global':global_med,
+                  'design_station_line':station_model.get((x['station'],x['out_line'])),
+                  'design_exact_pair':pair_model.get(x['pair']),
+                  'observed_gap_oracle':x['gap']
+              }
+              for m,g in preds.items():
+                  if g is None:metrics[m]['no_model']+=1;continue
+                  pred,pred_i=first_dep(events,x['t0']+timedelta(seconds=float(g)))
+                  if not pred:metrics[m]['no_departure']+=1;continue
+                  metrics[m]['n']+=1
+                  same=(pred[0]==ref[0] and pred[1]==ref[1]);metrics[m]['exact']+=int(same)
+                  d=(pred[0]-ref[0]).total_seconds();signed_err[m].append(d);abs_err[m].append(abs(d))
+                  metrics[m]['premature']+=int(d<0);metrics[m]['late']+=int(d>0);metrics[m]['same_departure_time']+=int(d==0)
+                  metrics[m]['index_abs_sum']+=abs(pred_i-ref_i)
+                  hists[m][pred[0].strftime('%Y%m%d%H%M')]+=1
+
+          outm={}
+          for m in model_names:
+              n=metrics[m]['n']
+              outm[m]={
+                  'n':n,'no_model':metrics[m]['no_model'],'no_departure':metrics[m]['no_departure'],
+                  'exact_service_opportunity_share':metrics[m]['exact']/n if n else None,
+                  'same_departure_time_share':metrics[m]['same_departure_time']/n if n else None,
+                  'premature_opportunity_share':metrics[m]['premature']/n if n else None,
+                  'late_opportunity_share':metrics[m]['late']/n if n else None,
+                  'median_abs_departure_error_sec':quant(abs_err[m],.5),'p90_abs_departure_error_sec':quant(abs_err[m],.9),
+                  'mean_abs_service_index_error':metrics[m]['index_abs_sum']/n if n else None,
+                  'opportunity_minute_hist_tv_vs_reference':tv(hists[m],ref_hist) if n else None,
+                  'max_5min_opportunity_count':max_window(hists[m],5) if n else None
+              }
+          reference_max5=max_window(ref_hist,5)
+          decision=None
+          candidate=outm['design_station_line'] if outm['design_station_line']['n']>=30 else outm['design_global']
+          zero=outm['zero']
+          if candidate['n']>=30 and zero['n']>=30 and candidate['exact_service_opportunity_share'] is not None and zero['exact_service_opportunity_share'] is not None:
+              gain=candidate['exact_service_opportunity_share']-zero['exact_service_opportunity_share']
+              if gain>=0.10:decision='TRANSFER_STATE_MATERIALLY_CHANGES_REALIZED_SERVICE_OPPORTUNITY'
+              elif gain>=0.03:decision='TRANSFER_STATE_HAS_BOUNDED_SERVICE_OPPORTUNITY_VALUE'
+              else:decision='NO_STRONG_TRANSFER_STATE_GAIN_IN_BOUNDED_PILOT'
+          else:decision='PILOT_SAMPLE_TOO_SMALL_FOR_DECISION'
+
+          result={'schema':'mppd-n1-seoul-p3a-recorded-transfer-connection-opportunity-pilot-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'window':'2026-08-29 07:00-09:50 transfer completion; service opportunities within freshness-qualified 07:00-10:00 event layer','evidence_class':'RECORDED_CARD_TRANSFER_PROCESS_TO_FRESH_DIRECT_OPERATIONAL_STATUS_SERVICE_OPPORTUNITY','design_eval_split':'deterministic SHA1(TRCR_ID) half split used internally; no identifiers exported','selection_counts':dict(stats),'sample':{'design_rows':len(design),'eval_rows_before_reference':len(evals),'eval_rows_with_reference_opportunity':eval_ref,'design_global_gap_median_sec':global_med,'station_line_models_n':len(station_model),'exact_pair_models_n':len(pair_model)},'models':outm,'reference':{'max_5min_opportunity_count':reference_max5,'opportunity_minute_bins':len(ref_hist)},'decision':decision,'interpretation':{'reference':'First freshness-qualified downstream service departure at the next-leg station after the observed next RIDE_DTM. This is a post-transfer feasible-service reference, not observed train boarding.','question':'Does representing transfer-process duration change which realized service is considered feasible relative to a zero-transfer baseline?','next_if_positive':'Propagate the improved service-opportunity layer to held-out downstream exit-wave timing in P3B.'},'evidence_boundary':['Observed next RIDE_DTM is used only to define the evaluation reference opportunity, never to calibrate eval transfer-gap models.','Design cohort only supplies learned gap medians.','A matched service opportunity is not proof that the passenger boarded that train.','Direct operational-status events are freshness-qualified observed status transitions, not proprietary ATS track-circuit timestamps.','This pilot concerns recorded card-transfer processes; it does not substitute for ordinary paid-area directional transfer physics.','No T6 train ancestry claim.']}
+          Path('seoul_p3a_recorded_transfer_connection_opportunity_pilot_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3A_CONCISE='+json.dumps({'selection_counts':result['selection_counts'],'sample':result['sample'],'models':result['models'],'reference':result['reference'],'decision':decision},ensure_ascii=False))
+          db.close()
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3a"
+          F=seoul_p3a_recorded_transfer_connection_opportunity_pilot_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3A_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

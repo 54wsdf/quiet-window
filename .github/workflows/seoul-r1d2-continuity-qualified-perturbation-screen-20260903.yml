@@ -1,0 +1,185 @@
+name: Seoul R1D2 Continuity-Qualified Perturbation Screen 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-r1d2-continuity-qualified-perturbation-screen-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore layers
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf";umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")";test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT";echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1d2";cd "$RUNNER_TEMP/r1d2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Screen only continuity-qualified local perturbations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1d2"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          START=datetime(2026,8,29,7);END=datetime(2026,8,29,10);FRESH=120
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();return io.TextIOWrapper(z.open(n),encoding=detect(h),errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit());return int(d) if d else None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p75':q(a,.75),'p90':q(a,.9),'p95':q(a,.95),'max':max(a)}
+          def pearson(x,y):
+              if len(x)<3:return 0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy) if vx>0 and vy>0 else 0
+          def classify(sts,seq):
+              p=sorted((seq[s],t.timestamp()) for s,t in sts.items() if s in seq and seq[s] is not None)
+              if len(p)<4:return None
+              c=pearson([x for x,y in p],[y for x,y in p]);return None if abs(c)<.35 else ('INC' if c>0 else 'DEC')
+          def cv(a):return statistics.pstdev(a)/statistics.mean(a) if len(a)>=2 and statistics.mean(a)>0 else None
+          def winlabel(t):
+              b=t.replace(minute=(t.minute//30)*30,second=0,microsecond=0);return b.strftime('%H:%M')+'-'+(b+timedelta(minutes=30)).strftime('%H:%M')
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          ent=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id') and x.get('service_statn_id')]
+          meta=defaultdict(dict);cw={}
+          for x in ent:meta[x['service_subway_id']][x['service_statn_id']]={'seq':seqnum(x.get('service_statn_sn')),'name':x.get('dv_name')};cw[x['out_stn_num']]=x
+
+          afc=Counter();afc_same=Counter();afc_st=defaultdict(set)
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')));t=dt(row.get('ALGH_DTM'))
+                  if not b or not t or not START<=t<END:continue
+                  line=b['service_subway_id'];afc[line]+=1;afc_st[line].add(b['service_statn_id']);afc_same[line]+=int(bool(a and a['service_subway_id']==line))
+              f.close()
+
+          pat=re.compile(r'subarr_(260829(\d{6}))');obs=defaultdict(dict);snapshot=0
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,sh in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      snapshot+=1;line=(row.get('subway_id') or '').strip();state=(row.get('arvl_cd') or '').strip()
+                      if line not in meta or state not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip()
+                      if not t or not tr or st not in meta[line]:continue
+                      age=(sh-t).total_seconds();key=(line,tr,st);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+
+          arrivals=[];dep=Counter()
+          for (line,tr,st),d in obs.items():
+              its=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in its:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':arrivals.append((line,tr,st,t))
+                  if START<=t<END and s=='2' and prev!='2':dep[line]+=1
+                  prev=s
+          trains=defaultdict(lambda:defaultdict(dict));arr_count=Counter()
+          for line,tr,st,t in arrivals:
+              old=trains[line][tr].get(st);trains[line][tr][st]=t if old is None or t<old else old;arr_count[line]+=1
+
+          profiles=[];windows=[]
+          for line,tmap in trains.items():
+              seq={s:v['seq'] for s,v in meta[line].items()};dirs={tr:classify(sts,seq) for tr,sts in tmap.items()};dirs={tr:d for tr,d in dirs.items() if d}
+              station_counts=[len(tmap[tr]) for tr in dirs]
+              for direction in ('INC','DEC'):
+                  trs=[tr for tr,d in dirs.items() if d==direction];cov=Counter(s for tr in trs for s in tmap[tr]);ref=cov.most_common(1)[0][0] if cov else None
+                  times=sorted(tmap[tr][ref] for tr in trs if ref in tmap[tr]) if ref else []
+                  raw_gaps=[(b-a).total_seconds() for a,b in zip(times,times[1:]) if 60<=(b-a).total_seconds()<=1800]
+                  normal=q(raw_gaps,.35) if raw_gaps else None
+                  residual=[];records=[];excluded=0
+                  if normal:
+                      local_cap=min(1800.0,max(600.0,2.75*normal))
+                      local_floor=max(60.0,0.25*normal)
+                      for i in range(1,len(times)-1):
+                          gp=(times[i]-times[i-1]).total_seconds();gn=(times[i+1]-times[i]).total_seconds()
+                          # Require both neighboring observations to form a locally plausible continuous sequence.
+                          if not (local_floor<=gp<=local_cap and local_floor<=gn<=local_cap):excluded+=1;continue
+                          e=abs(gp-gn)/2.0;residual.append(e);records.append((times[i],e,gp,gn))
+                  span=(times[-1]-times[0]).total_seconds() if len(times)>=2 else None
+                  expected=(span/normal+1) if span and normal else None
+                  coverage=(len(times)/expected) if expected and expected>0 else None
+                  row={'line':line,'direction':direction,'reference_station_id':ref,'reference_station_name':meta[line].get(ref,{}).get('name') if ref else None,'classified_train_count':len(trs),'reference_train_event_count':len(times),'arrival_event_count_line':arr_count[line],'departure_event_count_line':dep[line],'median_stations_per_classified_train':statistics.median(station_counts) if station_counts else None,'afc_exit_rows_0700_1000':afc[line],'afc_same_line_rows_0700_1000':afc_same[line],'afc_exit_station_count':len(afc_st[line]),'normal_headway_sec':normal,'reference_event_coverage_ratio_vs_normal_headway':coverage,'raw_headway_cv':cv(raw_gaps),'continuity_qualified_midpoint_tests':len(residual),'excluded_midpoint_tests_due_local_gaps':excluded,'continuity_qualified_regular_midpoint_error_sec':summ(residual),'error_gt60_share':sum(e>60 for e in residual)/len(residual) if residual else None,'error_gt120_share':sum(e>120 for e in residual)/len(residual) if residual else None}
+                  rsum=row['continuity_qualified_regular_midpoint_error_sec'];row['screen_score']=math.log1p(afc[line])*(rsum['p90'] if rsum else 0)*min(1.0,len(residual)/10)*min(1.0,coverage if coverage else 0)
+                  profiles.append(row)
+                  bw=defaultdict(list)
+                  for t,e,gp,gn in records:bw[winlabel(t)].append(e)
+                  for w,es in bw.items():
+                      if len(es)>=2:windows.append({'line':line,'direction':direction,'window':w,'reference_station_id':ref,'reference_station_name':row['reference_station_name'],'n_tests':len(es),'error_sec':summ(es),'error_gt60_share':sum(e>60 for e in es)/len(es),'afc_exit_rows_line':afc[line],'coverage_ratio':coverage})
+
+          profiles.sort(key=lambda x:(x['screen_score'],x['afc_exit_rows_0700_1000']),reverse=True)
+          windows.sort(key=lambda x:((x['error_sec']['p90'] or 0)*math.log1p(x['afc_exit_rows_line'])*min(1,x['n_tests']/4),x['n_tests']),reverse=True)
+          cand=[x for x in profiles if x['reference_train_event_count']>=10 and x['continuity_qualified_midpoint_tests']>=8 and x['afc_exit_rows_0700_1000']>=1000 and (x['reference_event_coverage_ratio_vs_normal_headway'] or 0)>=0.65 and x['continuity_qualified_regular_midpoint_error_sec'] and x['continuity_qualified_regular_midpoint_error_sec']['p90']>=60]
+          result={'schema':'seoul-r1d2-continuity-qualified-perturbation-screen-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'business_date':'2026-08-29','window':'07:00-10:00','method':'Corrected perturbation screening. A leave-one-train midpoint residual is computed only when both neighboring direct-arrival gaps are locally plausible relative to a robust normal headway. Large gaps likely caused by missing direct operational states are excluded rather than mislabeled as train perturbations.','snapshot_rows_scanned':snapshot,'profiles':profiles,'candidate_profiles':cand,'top_windows':windows[:30],'selection_rule':'Candidate requires >=10 reference events, >=8 continuity-qualified midpoint tests, >=1000 AFC exit rows, reference-event coverage >=0.65 of the normal-headway expectation, and p90 midpoint residual >=60s.','supersedes_diagnostic':'seoul_r1d_perturbation_case_screen_20260903.json ranking is not scientifically authoritative because it allowed residuals spanning large missing-observation gaps.','evidence_boundary':['This screen selects challenge regimes; it is not an AFC reconstruction result.','Random Line 8 holdout remains the regular-operation control.','AFC is minute-quantized.']}
+          Path('seoul_r1d2_continuity_qualified_perturbation_screen_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SEOUL_R1D2_SCREEN='+json.dumps({'candidate_count':len(cand),'top_candidates':cand[:15],'top_windows':windows[:15]},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.restore.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1d2";F=seoul_r1d2_continuity_qualified_perturbation_screen_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          test "$(stat -c '%s' "$F")" = "$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"
+          echo SEOUL_R1D2_SCREEN_DURABLE_PASS
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

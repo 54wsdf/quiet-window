@@ -1,0 +1,372 @@
+name: Seoul Line 8 AFC Hidden Arrival Probe 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-line8-afc-hidden-arrival-probe-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore canonical passenger, service and crosswalk layers
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing protected storage configuration'; exit 2; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1_line8"
+          cd "$RUNNER_TEMP/r1_line8"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          test -s TAIMS.zip && test -s BMS.zip && test -s p1c.json
+
+      - name: Reconstruct masked Line 8 arrivals from AFC pulse structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_line8"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, math, re, statistics, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          LINE='1008'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7,0,0)
+          END=datetime(2026,8,29,10,0,0)
+          MASK_START=datetime(2026,8,29,8,0,0)
+          MASK_END=datetime(2026,8,29,8,30,0)
+          FRESH=120
+          LAG_MINUTES=list(range(0,11))
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+
+          def hdr(s): return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try: return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except: return None
+
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              return int(d) if d else None
+
+          def minute_floor(t): return t.replace(second=0,microsecond=0)
+
+          def interval_distance_sec(t, minute_t):
+              lo=minute_t; hi=minute_t+timedelta(seconds=59)
+              if t<lo: return (lo-t).total_seconds()
+              if t>hi: return (t-hi).total_seconds()
+              return 0.0
+
+          def pearson(x,y):
+              if len(x)<3 or len(x)!=len(y): return 0.0
+              mx=sum(x)/len(x); my=sum(y)/len(y)
+              vx=sum((a-mx)**2 for a in x); vy=sum((b-my)**2 for b in y)
+              if vx<=0 or vy<=0: return 0.0
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy)
+
+          def robust_z(v, vals):
+              if not vals: return 0.0
+              med=statistics.median(vals)
+              mad=statistics.median([abs(x-med) for x in vals])
+              scale=max(1.0,1.4826*mad)
+              return (v-med)/scale
+
+          def quant(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+
+          def summary(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':quant(a,.5),'p90':quant(a,.9),'p99':quant(a,.99),'max':max(a)}
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          canonical=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in canonical}
+          stations={x['service_statn_id']:{'name':x.get('dv_name'),'seq':seqnum(x.get('service_statn_sn')),'out':x.get('out_stn_num')} for x in canonical}
+          order=[k for k,v in sorted(stations.items(),key=lambda kv:(kv[1]['seq'] is None,kv[1]['seq'] or 9999,kv[0]))]
+          pos={s:i for i,s in enumerate(order)}
+
+          # AFC minute histograms for unique-path same-line Line 8 passengers.
+          exit_hist=defaultdict(Counter)
+          entry_hist=defaultdict(Counter)
+          od_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL: continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID'))); b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b: continue
+                  t0=dt(row.get('RIDE_DTM')); t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or t1<t0 or (t1-t0).total_seconds()>10800: continue
+                  if not (START<=t0<END and START<=t1<END): continue
+                  os=a['service_statn_id']; ds=b['service_statn_id']
+                  if os==ds: continue
+                  # Line 8 is treated as a simple line here; all same-line OD pairs have a unique station-order path.
+                  entry_hist[os][minute_floor(t0)]+=1
+                  exit_hist[ds][minute_floor(t1)]+=1
+                  od_rows+=1
+              f.close()
+
+          # Direct operational arrival truth, used only for design calibration and held-out validation.
+          pat=re.compile(r'subarr_(260829(\d{6}))')
+          obs=defaultdict(dict); snapshot_rows=0; line_rows=0
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if not m: continue
+                  hh=m.group(2)
+                  if '070000'<=hh<'100000':
+                      st=datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S'); infos.append((x,st))
+              for x,st in infos:
+                  f=zr(z,x.filename); r=csv.DictReader(f); r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      snapshot_rows+=1
+                      if (row.get('subway_id') or '').strip()!=LINE: continue
+                      state=(row.get('arvl_cd') or '').strip()
+                      if state not in {'0','1','2'}: continue
+                      t=dt(row.get('recptn_dt')); train=(row.get('btrain_no') or '').strip(); station=(row.get('statn_id') or '').strip()
+                      if not t or not train or station not in stations: continue
+                      line_rows+=1
+                      age=(st-t).total_seconds(); sig=(t,state); key=(train,station)
+                      old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old): obs[key][sig]=age
+                  f.close()
+
+          truth=[]
+          for (train,station),d in obs.items():
+              items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH)
+              transitions=[]
+              for t,s,a in items:
+                  if not transitions or transitions[-1][1]!=s: transitions.append((t,s,a))
+              prev=None
+              for t,s,a in transitions:
+                  if START<=t<END and s=='1' and prev!='1': truth.append({'train':train,'station':station,'time':t,'age':a})
+                  prev=s
+          truth.sort(key=lambda x:(x['time'],x['station'],x['train']))
+          truth_by_station=defaultdict(list)
+          truth_by_train=defaultdict(dict)
+          for e in truth:
+              truth_by_station[e['station']].append(e)
+              # Keep earliest arrival per train-station if duplicate transition artifacts remain.
+              cur=truth_by_train[e['train']].get(e['station'])
+              if cur is None or e['time']<cur: truth_by_train[e['train']][e['station']]=e['time']
+
+          design_minutes=[START+timedelta(minutes=i) for i in range(int((END-START).total_seconds()/60)) if not (MASK_START<=START+timedelta(minutes=i)<MASK_END)]
+
+          # Learn station egress lag from non-masked direct arrivals only. This is nuisance calibration, not holdout leakage.
+          station_lag={}; lag_scores={}
+          for st in order:
+              th=Counter(minute_floor(e['time']) for e in truth_by_station.get(st,[]) if not (MASK_START<=e['time']<MASK_END))
+              eh=exit_hist.get(st,Counter())
+              scores=[]
+              for lag in LAG_MINUTES:
+                  xs=[];ys=[]
+                  for m in design_minutes:
+                      xs.append(th.get(m,0))
+                      ys.append(eh.get(m+timedelta(minutes=lag),0))
+                  scores.append((pearson(xs,ys),lag))
+              scores.sort(key=lambda x:(x[0],-x[1]),reverse=True)
+              best=scores[0] if scores else (0.0,0)
+              station_lag[st]=best[1]; lag_scores[st]={'best_lag_min':best[1],'best_corr':best[0],'all':{str(l):c for c,l in scores}}
+
+          # Learn design headway and adjacent-station running-time priors from non-masked truth only.
+          headway_by_station={}
+          for st in order:
+              ts=sorted(e['time'] for e in truth_by_station.get(st,[]) if not (MASK_START<=e['time']<MASK_END))
+              h=[(b-a).total_seconds() for a,b in zip(ts,ts[1:]) if 60<=(b-a).total_seconds()<=1200]
+              headway_by_station[st]=statistics.median(h) if h else 300.0
+
+          run_sec={}
+          for a,b in zip(order,order[1:]):
+              vals=[]
+              for tr,sts in truth_by_train.items():
+                  if a in sts and b in sts:
+                      d=(sts[b]-sts[a]).total_seconds()
+                      if 30<=abs(d)<=900: vals.append(d)
+              if vals: run_sec[(a,b)]=statistics.median(vals)
+
+          # Score AFC pulse intensity as candidate latent arrival evidence in the masked interval.
+          own_score=defaultdict(dict)
+          score_values={}
+          for st in order:
+              lag=station_lag.get(st,0)
+              eh=exit_hist.get(st,Counter())
+              vals=[]
+              for m in [MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]:
+                  vals.append(eh.get(m+timedelta(minutes=lag),0))
+              score_values[st]=vals[:] if vals else [0]
+              for i,m in enumerate([MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]):
+                  own_score[st][m]=robust_z(vals[i],vals)
+
+          # Add neighboring-station support using learned running-time priors: pulse + line continuity.
+          joint_score=defaultdict(dict)
+          mask_minutes=[MASK_START+timedelta(minutes=i) for i in range(int((MASK_END-MASK_START).total_seconds()/60))]
+          for st in order:
+              i=pos[st]
+              for m in mask_minutes:
+                  s=own_score[st].get(m,0.0)
+                  w=1.0
+                  if i>0:
+                      prev=order[i-1]; d=run_sec.get((prev,st))
+                      if d is not None:
+                          mp=m-timedelta(seconds=d); mp=minute_floor(mp)
+                          s+=0.5*own_score[prev].get(mp,0.0); w+=0.5
+                  if i+1<len(order):
+                      nxt=order[i+1]; d=run_sec.get((st,nxt))
+                      if d is not None:
+                          mn=m+timedelta(seconds=d); mn=minute_floor(mn)
+                          s+=0.5*own_score[nxt].get(mn,0.0); w+=0.5
+                  joint_score[st][m]=s/w
+
+          def nms_select(scores, k, min_sep_min=1):
+              chosen=[]
+              for m,v in sorted(scores.items(),key=lambda kv:(kv[1],-kv[0].timestamp()),reverse=True):
+                  if all(abs((m-x).total_seconds())>=60*min_sep_min for x in chosen):
+                      chosen.append(m)
+                      if len(chosen)>=k: break
+              return sorted(chosen)
+
+          predictions={'B1_FIXED_HEADWAY':defaultdict(list),'B3_AFC_PULSE':defaultdict(list),'B4_AFC_PULSE_LINE_CONTINUITY':defaultdict(list)}
+          for st in order:
+              h=max(90.0,headway_by_station.get(st,300.0))
+              k=max(1,round((MASK_END-MASK_START).total_seconds()/h))
+              # B1: extrapolate fixed headway from last visible design arrival before mask.
+              prior=[e['time'] for e in truth_by_station.get(st,[]) if e['time']<MASK_START]
+              if prior:
+                  t=max(prior)
+                  while t<MASK_END:
+                      t=t+timedelta(seconds=h)
+                      if MASK_START<=t<MASK_END: predictions['B1_FIXED_HEADWAY'][st].append(minute_floor(t))
+              predictions['B3_AFC_PULSE'][st]=nms_select(own_score[st],k,1)
+              predictions['B4_AFC_PULSE_LINE_CONTINUITY'][st]=nms_select(joint_score[st],k,1)
+
+          holdout_truth=defaultdict(list)
+          for st,evs in truth_by_station.items():
+              holdout_truth[st]=[e['time'] for e in evs if MASK_START<=e['time']<MASK_END]
+
+          def match_station(truth_times,pred_minutes,tol_sec):
+              pairs=[]; used=set()
+              for tt in sorted(truth_times):
+                  cand=[]
+                  for j,pm in enumerate(pred_minutes):
+                      if j in used: continue
+                      d=interval_distance_sec(tt,pm)
+                      if d<=tol_sec:cand.append((d,j,pm))
+                  if cand:
+                      d,j,pm=min(cand);used.add(j);pairs.append((tt,pm,d))
+              return pairs
+
+          metrics={}
+          for model,pby in predictions.items():
+              total_truth=sum(len(v) for v in holdout_truth.values()); total_pred=sum(len(v) for v in pby.values())
+              m60=[];m120=[];station_rows=[]
+              for st in order:
+                  tr=holdout_truth.get(st,[]); pr=pby.get(st,[])
+                  a=match_station(tr,pr,60); b=match_station(tr,pr,120)
+                  m60.extend(a);m120.extend(b)
+                  station_rows.append({'station_id':st,'station_name':stations[st]['name'],'truth_events':len(tr),'predicted_events':len(pr),'recall_60':len(a)/len(tr) if tr else None,'precision_60':len(a)/len(pr) if pr else None,'recall_120':len(b)/len(tr) if tr else None,'precision_120':len(b)/len(pr) if pr else None})
+              err60=[x[2] for x in m60];err120=[x[2] for x in m120]
+              metrics[model]={'holdout_truth_events':total_truth,'predicted_events':total_pred,'recall_60':len(m60)/total_truth if total_truth else None,'precision_60':len(m60)/total_pred if total_pred else None,'recall_120':len(m120)/total_truth if total_truth else None,'precision_120':len(m120)/total_pred if total_pred else None,'matched_error_sec_60':summary(err60),'matched_error_sec_120':summary(err120),'absolute_train_event_count_error':abs(total_pred-total_truth),'station_profiles':station_rows}
+
+          # Headway diagnostic in holdout, comparing median per-station headways where >=2 events exist.
+          for model,pby in predictions.items():
+              diffs=[]
+              for st in order:
+                  tt=sorted(holdout_truth.get(st,[]));pp=sorted(pby.get(st,[]))
+                  th=[(b-a).total_seconds() for a,b in zip(tt,tt[1:])];ph=[(b-a).total_seconds() for a,b in zip(pp,pp[1:])]
+                  if th and ph: diffs.append(abs(statistics.median(th)-statistics.median(ph)))
+              metrics[model]['median_station_headway_median_abs_error_sec']=statistics.median(diffs) if diffs else None
+
+          b1=metrics['B1_FIXED_HEADWAY'];b3=metrics['B3_AFC_PULSE'];b4=metrics['B4_AFC_PULSE_LINE_CONTINUITY']
+          pulse_gain=(b3['recall_120'] or 0)-(b1['recall_120'] or 0)
+          continuity_gain=(b4['recall_120'] or 0)-(b3['recall_120'] or 0)
+          decision='AFC_PULSE_CONTAINS_HIDDEN_ARRIVAL_INFORMATION' if (b3['recall_120'] or 0)>=(b1['recall_120'] or 0)+0.05 and (b3['precision_120'] or 0)>=0.35 else ('AFC_PULSE_SIGNAL_PRESENT_BUT_NOT_YET_STRONGER_THAN_HEADWAY_BASELINE' if (b3['recall_120'] or 0)>=0.30 else 'AFC_PULSE_HIDDEN_ARRIVAL_SIGNAL_WEAK_IN_FIRST_PROBE')
+
+          result={
+            'schema':'seoul-line8-afc-hidden-arrival-probe-v1',
+            'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'line':'1008',
+            'business_date':'2026-08-29',
+            'analysis_window':'07:00-10:00',
+            'masked_validation_window':'08:00-08:30',
+            'method_contract':'Direct operational arrivals inside the contiguous masked window are excluded from inference. Direct arrivals outside the mask are used only to calibrate station-level egress lag, headway and adjacent-station running-time nuisance priors. AFC exit pulse intensity inside the mask reconstructs hidden arrival events; B4 additionally uses neighboring-station pulse support under learned line-continuity travel-time priors.',
+            'afc':{'same_line_unique_path_rows':od_rows,'stations_with_exit_mass':sum(bool(v) for v in exit_hist.values())},
+            'direct_truth':{'snapshot_rows_scanned':snapshot_rows,'line_state_rows':line_rows,'fresh_arrival_events':len(truth),'masked_arrival_events':sum(len(v) for v in holdout_truth.values())},
+            'station_egress_lag_min':{st:station_lag.get(st) for st in order},
+            'station_egress_lag_correlation':{st:lag_scores.get(st,{}).get('best_corr') for st in order},
+            'adjacent_running_time_sec':{f'{a}->{b}':v for (a,b),v in run_sec.items()},
+            'metrics':metrics,
+            'comparison':{'B3_recall120_gain_vs_B1':pulse_gain,'B4_recall120_gain_vs_B3':continuity_gain},
+            'decision':decision,
+            'evidence_boundary':['AFC timestamps are minute-quantized; inferred arrivals are minute-resolution AFC_INFERRED_TRAIN_EVENT candidates, not observed ATS.','Station egress lags and headway/running-time priors are calibrated only outside the masked target window.','This first probe tests hidden arrival-event recoverability, not passenger-to-train assignment.','No card identifiers are exported or logged.']
+          }
+          Path('seoul_r1_line8_afc_hidden_arrival_probe_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          concise={'decision':decision,'afc_rows':od_rows,'truth':result['direct_truth'],'B1':{k:b1[k] for k in ('predicted_events','recall_60','precision_60','recall_120','precision_120','absolute_train_event_count_error','median_station_headway_median_abs_error_sec')},'B3':{k:b3[k] for k in ('predicted_events','recall_60','precision_60','recall_120','precision_120','absolute_train_event_count_error','median_station_headway_median_abs_error_sec')},'B4':{k:b4[k] for k in ('predicted_events','recall_60','precision_60','recall_120','precision_120','absolute_train_event_count_error','median_station_headway_median_abs_error_sec')},'comparison':result['comparison']}
+          print('SEOUL_R1_LINE8_CONCISE='+json.dumps(concise,ensure_ascii=False))
+          PY
+
+      - name: Store aggregate result durably
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.restore.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_line8"
+          F=seoul_r1_line8_afc_hidden_arrival_probe_20260903.json
+          D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"
+          R="$(rclone size "$D" --config "$CONFIG_FILE" --json | jq -r '.bytes')"
+          test "$L" = "$R"
+          echo SEOUL_R1_LINE8_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.restore.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

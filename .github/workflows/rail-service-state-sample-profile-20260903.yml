@@ -1,0 +1,132 @@
+name: Rail Service State Sample Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rail-service-state-sample-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      OUT_DRIVE: transport_data_lake/01_rail/99_manifests/service_state_evidence_atlas_20260903
+    steps:
+      - name: Prepare storage and restore one qualified service day
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check duckdb pandas
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/ss"
+          cd "$RUNNER_TEMP/ss"
+          declare -A paths
+          paths[metrolink_trip]='transport_data_lake/01_rail/US_CA_Metrolink/03_realtime/gtfsrt_io/trip_updates/2026-08-31'
+          paths[metrolink_vehicle]='transport_data_lake/01_rail/US_CA_Metrolink/03_realtime/gtfsrt_io/vehicle_positions/2026-08-31'
+          paths[septa_trip]='transport_data_lake/01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io/trip_updates/2026-08-31'
+          paths[septa_vehicle]='transport_data_lake/01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io/vehicle_positions/2026-08-31'
+          paths[septa_alert]='transport_data_lake/01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io/service_alerts/2026-08-31'
+          for k in metrolink_trip metrolink_vehicle septa_trip septa_vehicle septa_alert; do
+            mkdir -p "$k"
+            rclone copy "$REMOTE_NAME:${paths[$k]}" "$k" --config "$CONFIG_FILE" --include '*.parquet' --max-depth 1 --transfers 1 --retries 6 --low-level-retries 15
+            test "$(find "$k" -type f -name '*.parquet' | wc -l)" -ge 1
+          done
+
+      - name: Profile native service-state evidence semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ss"
+          python - <<'PY'
+          from __future__ import annotations
+          import json, math, re
+          from pathlib import Path
+          import duckdb
+
+          groups={
+            'metrolink_trip':('US_CA_METROLINK_GTFSRT_2026_ARCHIVE','TRIP_UPDATES'),
+            'metrolink_vehicle':('US_CA_METROLINK_GTFSRT_2026_ARCHIVE','VEHICLE_POSITIONS'),
+            'septa_trip':('US_PA_SEPTA_REGIONAL_RAIL_GTFSRT_2026_ARCHIVE','TRIP_UPDATES'),
+            'septa_vehicle':('US_PA_SEPTA_REGIONAL_RAIL_GTFSRT_2026_ARCHIVE','VEHICLE_POSITIONS'),
+            'septa_alert':('US_PA_SEPTA_REGIONAL_RAIL_GTFSRT_2026_ARCHIVE','SERVICE_ALERTS')}
+
+          def qi(c): return '"'+c.replace('"','""')+'"'
+          def profile(k,dataset,record_class):
+              fs=sorted(Path(k).glob('*.parquet')); glob=str(Path(k)/'*.parquet')
+              con=duckdb.connect(':memory:')
+              desc=con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob}',union_by_name=true)").fetchall()
+              cols=[r[0] for r in desc]; types={r[0]:r[1] for r in desc}
+              n=con.execute(f"SELECT count(*) FROM read_parquet('{glob}',union_by_name=true)").fetchone()[0]
+              candidates={
+                'trip':[c for c in cols if re.search(r'trip',c,re.I)],
+                'vehicle':[c for c in cols if re.search(r'vehicle',c,re.I)],
+                'route':[c for c in cols if re.search(r'route',c,re.I)],
+                'stop':[c for c in cols if re.search(r'stop',c,re.I)],
+                'timestamp':[c for c in cols if re.search(r'time|timestamp|epoch',c,re.I)],
+                'delay':[c for c in cols if re.search(r'delay',c,re.I)],
+                'position':[c for c in cols if re.search(r'lat|lon|bearing|speed|position',c,re.I)],
+                'alert':[c for c in cols if re.search(r'effect|cause|severity|active|informed|header|description',c,re.I)]}
+              card={}
+              for role,cs in candidates.items():
+                  z=[]
+                  for c in cs[:12]:
+                      q=qi(c)
+                      try:
+                          nonnull,approx=con.execute(f"SELECT count(*) FILTER(WHERE {q} IS NOT NULL),approx_count_distinct({q}) FROM read_parquet('{glob}',union_by_name=true)").fetchone()
+                          z.append({'column':c,'type':types[c],'nonnull_rows':int(nonnull),'nonnull_share':nonnull/n if n else None,'approx_distinct':int(approx or 0)})
+                      except Exception as e: z.append({'column':c,'type':types[c],'profile_error':str(e)[:200]})
+                  card[role]=z
+              # Generic numeric time range, without claiming semantics. Values in epoch-like ranges are separately exposed.
+              tr=[]
+              for c in candidates['timestamp'][:12]:
+                  q=qi(c)
+                  typ=types[c].upper()
+                  try:
+                      if any(x in typ for x in ('INT','DOUBLE','FLOAT','DECIMAL')):
+                          x=con.execute(f"SELECT min({q}),max({q}) FROM read_parquet('{glob}',union_by_name=true) WHERE {q} IS NOT NULL").fetchone()
+                          tr.append({'column':c,'native_min':x[0],'native_max':x[1],'type':types[c]})
+                      elif 'TIMESTAMP' in typ or 'DATE' in typ:
+                          x=con.execute(f"SELECT min({q}),max({q}) FROM read_parquet('{glob}',union_by_name=true) WHERE {q} IS NOT NULL").fetchone()
+                          tr.append({'column':c,'native_min':str(x[0]),'native_max':str(x[1]),'type':types[c]})
+                  except: pass
+              sample_shape=con.execute(f"SELECT count(DISTINCT filename) FROM read_parquet('{glob}',union_by_name=true,filename=true)").fetchone()[0]
+              out={'dataset_id':dataset,'source_group':k,'source_record_class':record_class,'source_date':'2026-08-31','files':[p.name for p in fs],'file_count':int(sample_shape),'rows':int(n),'columns':cols,'column_types':types,'identity_and_state_candidates':card,'native_time_ranges':tr,
+                   'qualification_state':'NATIVE_SCHEMA_PROFILED_EVENT_SEMANTICS_PENDING','hard_rule':'Candidate columns are not automatically canonical identity/time/event fields until source-specific semantics are qualified.'}
+              con.close(); return out
+
+          ps=[profile(k,*v) for k,v in groups.items()]
+          out={'schema':'rail-service-state-evidence-sample-profile.v1','service_date':'2026-08-31','profiles':ps,
+               'next_gate':['qualify feed timestamp versus event timestamp semantics','qualify trip/stop/vehicle identity scope','deduplicate repeated GTFS-RT snapshots into event/state trajectories without treating every snapshot row as an independent train event','separate FORECAST_SERVICE/DIRECT_STATE_SNAPSHOT/SERVICE_CONTEXT before planned-realized comparison'],
+               'evidence_state':'SERVICE_STATE_PROVIDER_NATIVE_SCHEMAS_PROFILED'}
+          Path('service_state_sample_profile.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
+          PY
+
+      - name: Persist safe schema profile
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ss"
+          rclone copyto service_state_sample_profile.json "$REMOTE_NAME:$OUT_DRIVE/service_state_sample_profile.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,196 @@
+name: Rail AFC Resolution Staircase 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rail-afc-resolution-staircase-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: ResearchData/rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      OUT_DRIVE: ResearchData/rail_transit/CN_HZ_Tianchi_2019/derived_resolution_staircase_20260903
+
+    steps:
+      - name: Prepare protected storage access
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/resolution"
+
+      - name: Profile every held AFC day under controlled time quantization
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/resolution"
+          mapfile -t FILES < <(rclone lsf "$REMOTE_NAME:$SOURCE_DRIVE" --config "$CONFIG_FILE" --files-only | grep -E '^record_2019-01-[0-9]{2}\.csv\.gz$' | sort)
+          test "${#FILES[@]}" -gt 0
+          printf '%s\n' "${FILES[@]}" > source_files.txt
+          for src in "${FILES[@]}"; do
+            echo "processing $src"
+            rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$src" input.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            SRC="$src" python - <<'PY'
+          from __future__ import annotations
+          import csv,gzip,json,math,os,statistics
+          from collections import Counter
+          from datetime import datetime
+          from pathlib import Path
+
+          src=os.environ['SRC']; RES=(5,15,30,60,300)
+          # user -> [count, first_event, second_event]. Raw identifiers never leave runner memory.
+          users={}
+          status=Counter(); lines=Counter(); pay=Counter(); seconds=Counter(); stations=set()
+          exact_exit=Counter(); qexit={d:Counter() for d in RES}; exit_total=0; rows=0; tmin=None; tmax=None
+          with gzip.open('input.csv.gz','rt',encoding='utf-8-sig',errors='strict',newline='') as f:
+              r=csv.DictReader(f)
+              cols=r.fieldnames
+              required={'time','lineID','stationID','status','userID'}
+              if not required.issubset(set(cols or [])):
+                  raise SystemExit(f'missing required columns: {required-set(cols or [])}')
+              for x in r:
+                  rows+=1
+                  try:t=datetime.strptime(x['time'],'%Y-%m-%d %H:%M:%S')
+                  except Exception as e: raise SystemExit(f'bad time at row {rows}: {e}')
+                  tmin=t if tmin is None or t<tmin else tmin; tmax=t if tmax is None or t>tmax else tmax
+                  s=x['status']; status[s]+=1; lines[x.get('lineID','')]+=1; pay[x.get('payType','')]+=1; stations.add(x['stationID']); seconds[t.second]+=1
+                  u=x['userID']; e=(t,s,x.get('lineID',''),x['stationID'])
+                  rec=users.get(u)
+                  if rec is None: users[u]=[1,e,None]
+                  elif rec[0]==1: rec[0]=2; rec[2]=e
+                  else: rec[0]+=1
+                  if s=='0':
+                      exit_total+=1; sod=t.hour*3600+t.minute*60+t.second; st=x['stationID']; exact_exit[(st,sod)]+=1
+                      for d in RES:qexit[d][(st,(sod//d)*d)]+=1
+
+          pair_seq=Counter(); valid=[]; exact2=0; cross=0
+          for rec in users.values():
+              if rec[0]!=2: continue
+              exact2+=1; a,b=rec[1],rec[2]
+              if b is None: continue
+              if b[0]<a[0]: a,b=b,a
+              pair_seq[(a[1],b[1])]+=1
+              if a[1]=='1' and b[1]=='0':
+                  dur=(b[0]-a[0]).total_seconds()
+                  if 0<=dur<=8*3600:
+                      valid.append((a,b,dur)); cross += int(a[2]!=b[2])
+
+          def qv(a,p):
+              if not a:return None
+              b=sorted(a); return b[round((len(b)-1)*p)]
+          rmetrics={}
+          for d in RES:
+              abs_err=[]; samebin=0
+              for a,b,dur in valid:
+                  sa=a[0].hour*3600+a[0].minute*60+a[0].second; sb=b[0].hour*3600+b[0].minute*60+b[0].second
+                  qa=(sa//d)*d; qb=(sb//d)*d
+                  abs_err.append(abs((qb-qa)-dur)); samebin += int(qa==qb)
+              groups=qexit[d]; vals=list(groups.values()); coll2=sum(n for n in vals if n>=2); coll5=sum(n for n in vals if n>=5); coll10=sum(n for n in vals if n>=10)
+              # TV between exact one-second exit field and the maximum-entropy uniform reconstruction within each observed d-second bin.
+              exact_nonzero_by_bin=Counter(); abs_sum=0.0
+              for (st,sod),c in exact_exit.items():
+                  key=(st,(sod//d)*d); total=groups[key]; q=total/d
+                  abs_sum += abs(c-q); exact_nonzero_by_bin[key]+=1
+              for key,nz in exact_nonzero_by_bin.items():
+                  q=groups[key]/d; abs_sum += (d-nz)*q
+              tv=0.5*abs_sum/exit_total if exit_total else None
+              rmetrics[str(d)]={
+                  'valid_two_event_trip_count':len(valid),
+                  'travel_time_floor_abs_error_sec':{'median':qv(abs_err,.5),'p90':qv(abs_err,.9),'p99':qv(abs_err,.99),'max':max(abs_err) if abs_err else None},
+                  'entry_exit_same_quantized_bin_share':samebin/len(valid) if valid else None,
+                  'exit_station_time_occupied_bins':len(vals),
+                  'exit_events_in_collision_bins_ge2_share':coll2/exit_total if exit_total else None,
+                  'exit_events_in_collision_bins_ge5_share':coll5/exit_total if exit_total else None,
+                  'exit_events_in_collision_bins_ge10_share':coll10/exit_total if exit_total else None,
+                  'exit_bin_count_median':qv(vals,.5),'exit_bin_count_p90':qv(vals,.9),'exit_bin_count_p99':qv(vals,.99),'exit_bin_count_max':max(vals) if vals else None,
+                  'uniform_within_bin_total_variation_from_exact_1s':tv,
+                  'travel_time_identification_interval_width_sec':2*(d-1)
+              }
+          out={
+              'schema':'rail-afc-resolution-staircase-day.v1','dataset_id':'CN_HZ_Tianchi_2019','source_file':src,
+              'columns':cols,'rows':rows,'time_min':str(tmin),'time_max':str(tmax),'status_counts':dict(status),'line_counts':dict(lines),'pay_type_counts':dict(pay),'station_count':len(stations),
+              'second_values_observed':len(seconds),'second_zero_share':seconds[0]/rows if rows else None,
+              'unique_user_count':len(users),'exact_two_event_users':exact2,'exact_two_event_status_sequence':{f'{a}->{b}':n for (a,b),n in pair_seq.items()},
+              'valid_1_to_0_two_event_trips':len(valid),'valid_1_to_0_cross_line_share':cross/len(valid) if valid else None,
+              'resolution_metrics':rmetrics,
+              'status_semantics_note':'The workflow reports empirical two-event ordering. Any interpretation of status 1/0 as entry/exit must be qualified from this ordering and source documentation, not hard-coded as observed semantics.',
+              'privacy_rule':'No userID/deviceID values are exported.'
+          }
+          Path(src.replace('.csv.gz','.resolution.json')).write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+            rm -f input.csv.gz
+          done
+
+          python - <<'PY'
+          import json,statistics
+          from pathlib import Path
+          days=[json.loads(p.read_text(encoding='utf-8')) for p in sorted(Path('.').glob('record_*.resolution.json'))]
+          def med(a): return statistics.median(a) if a else None
+          resolutions=sorted({k for d in days for k in d['resolution_metrics']},key=int)
+          agg={}
+          for r in resolutions:
+              a=[d['resolution_metrics'][r] for d in days]
+              agg[r]={
+                'days':len(a),
+                'median_travel_time_abs_error_sec':med([x['travel_time_floor_abs_error_sec']['median'] for x in a if x['travel_time_floor_abs_error_sec']['median'] is not None]),
+                'median_p90_travel_time_abs_error_sec':med([x['travel_time_floor_abs_error_sec']['p90'] for x in a if x['travel_time_floor_abs_error_sec']['p90'] is not None]),
+                'median_exit_collision_ge2_share':med([x['exit_events_in_collision_bins_ge2_share'] for x in a if x['exit_events_in_collision_bins_ge2_share'] is not None]),
+                'median_exit_collision_ge5_share':med([x['exit_events_in_collision_bins_ge5_share'] for x in a if x['exit_events_in_collision_bins_ge5_share'] is not None]),
+                'median_uniform_within_bin_tv_from_exact_1s':med([x['uniform_within_bin_total_variation_from_exact_1s'] for x in a if x['uniform_within_bin_total_variation_from_exact_1s'] is not None]),
+                'travel_time_identification_interval_width_sec':2*(int(r)-1)
+              }
+          seq={}
+          for d in days:
+              for k,v in d['exact_two_event_status_sequence'].items(): seq[k]=seq.get(k,0)+v
+          total_seq=sum(seq.values())
+          out={
+            'schema':'rail-afc-resolution-staircase-summary.v1','dataset_id':'CN_HZ_Tianchi_2019','days':len(days),'source_files':[d['source_file'] for d in days],
+            'total_rows':sum(d['rows'] for d in days),'total_valid_1_to_0_two_event_trips':sum(d['valid_1_to_0_two_event_trips'] for d in days),
+            'all_days_have_nonzero_second_support':all(d['second_values_observed']==60 for d in days),
+            'pooled_exact_two_event_status_sequence':seq,
+            'pooled_1_to_0_share_of_exact_two_event_sequences':seq.get('1->0',0)/total_seq if total_seq else None,
+            'resolution_summary':agg,
+            'evidence_state':'OBSERVED_AFC_RESOLUTION_DEGRADATION_PROFILE',
+            'claim_boundary':'This quantifies information loss induced by time quantization. It does not by itself establish train-event reconstruction accuracy.'
+          }
+          Path('resolution_staircase_summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist safe derived outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/resolution"
+          for f in *.resolution.json resolution_staircase_summary.json source_files.txt; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

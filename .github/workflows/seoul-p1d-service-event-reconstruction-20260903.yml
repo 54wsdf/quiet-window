@@ -1,0 +1,232 @@
+name: Seoul P1D Service Event Reconstruction 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1d-service-event-reconstruction-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore matched calendar-day service
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p1d"; cd "$RUNNER_TEMP/seoul-p1d"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS_20260830.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Full-scan snapshot states and reconstruct candidate ARR DEP events
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1d"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, gzip, io, json, re, statistics, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline=''),e
+          def hdr(s): return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def dt14(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              if len(d)<14:return None
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S')
+              except ValueError:return None
+          def sec(t): return int(t.timestamp()) if t else None
+
+          z=zipfile.ZipFile('BMS_20260830.zip')
+          infos=[x for x in z.infolist() if not x.is_dir()]
+          # Polling cadence from archive shard names.
+          pat=re.compile(r'subarr_(\d{12})')
+          shard_dt=[]
+          for inf in infos:
+              m=pat.search(inf.filename)
+              if m:
+                  try: shard_dt.append(datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S'))
+                  except ValueError: pass
+          shard_dt.sort()
+          poll_gaps=[(b-a).total_seconds() for a,b in zip(shard_dt,shard_dt[1:]) if (b-a).total_seconds()>=0]
+
+          # key=(subway_id,btrain_no,statn_id). Keep aggregate state evidence only.
+          states={}
+          train_station_sets=defaultdict(set); train_lines=defaultdict(Counter); statn_meta=defaultdict(lambda:{'names':Counter(),'seq':Counter(),'line':Counter()})
+          total_rows=0; direct_rows=0; all_state=Counter(); bad_recptn=0; blank_key=0
+          rec_min=None; rec_max=None
+
+          for j,inf in enumerate(infos):
+              f,e=zr(z,inf.filename); r=csv.DictReader(f); r.fieldnames=[hdr(x) for x in (r.fieldnames or [])]
+              for row in r:
+                  total_rows+=1
+                  line=(row.get('subway_id') or '').strip(); train=(row.get('btrain_no') or '').strip(); station=(row.get('statn_id') or '').strip(); state=(row.get('arvl_cd') or '').strip(); t=dt14(row.get('recptn_dt'))
+                  if t is None: bad_recptn+=1
+                  else:
+                      rec_min=t if rec_min is None or t<rec_min else rec_min; rec_max=t if rec_max is None or t>rec_max else rec_max
+                  if state:all_state[state]+=1
+                  if station:
+                      m=statn_meta[station]
+                      nm=(row.get('statn_nm') or '').strip(); sn=(row.get('statn_sn') or '').strip()
+                      if nm:m['names'][nm]+=1
+                      if sn:m['seq'][sn]+=1
+                      if line:m['line'][line]+=1
+                  if not (line and train and station and t):
+                      blank_key+=1; continue
+                  tk=(line,train); train_station_sets[tk].add(station); train_lines[train][line]+=1
+                  if state not in {'0','1','2'}:continue
+                  direct_rows+=1
+                  key=(line,train,station)
+                  x=states.get(key)
+                  if x is None:
+                      x={'line':line,'train':train,'station':station,'updn':Counter(),'state_times':defaultdict(list),'statn_sn':Counter(),'train_cd':Counter(),'train_line':Counter()}; states[key]=x
+                  x['state_times'][state].append(t)
+                  v=(row.get('updn_line') or '').strip()
+                  if v:x['updn'][v]+=1
+                  v=(row.get('statn_sn') or '').strip()
+                  if v:x['statn_sn'][v]+=1
+                  v=(row.get('train_cd') or '').strip()
+                  if v:x['train_cd'][v]+=1
+                  v=(row.get('train_line') or '').strip()
+                  if v:x['train_line'][v]+=1
+              f.close()
+          z.close()
+
+          records=[]; state_presence=Counter(); sequence=Counter(); dwell=[]; entry_to_arr=[]; state_span=Counter(); direct_occ=Counter()
+          for key,x in states.items():
+              t0=sorted(x['state_times'].get('0',[])); t1=sorted(x['state_times'].get('1',[])); t2=sorted(x['state_times'].get('2',[]))
+              if t0:state_presence['entering_0']+=1
+              if t1:state_presence['arrived_1']+=1
+              if t2:state_presence['departed_2']+=1
+              if t1 and t2:state_presence['arr_and_dep']+=1
+              for s,ts in x['state_times'].items(): direct_occ[s]+=len(ts)
+              enter=t0[0] if t0 else None; arr=t1[0] if t1 else None
+              # Departure candidate is first observed state-2 after arrival where possible; otherwise first state-2.
+              dep=None
+              if t2:
+                  if arr:
+                      after=[v for v in t2 if v>=arr]
+                      dep=after[0] if after else t2[0]
+                  else:dep=t2[0]
+              if enter and arr:
+                  d=(arr-enter).total_seconds()
+                  if d>=0:entry_to_arr.append(d)
+              valid_order=True
+              if enter and arr and enter>arr:valid_order=False
+              if arr and dep and arr>dep:valid_order=False
+              if enter and dep and enter>dep:valid_order=False
+              if valid_order:sequence['valid_order']+=1
+              else:sequence['invalid_order']+=1
+              if arr and dep:
+                  d=(dep-arr).total_seconds(); dwell.append(d)
+              # repeated-state temporal spans flag keys whose same direct state is observed over long windows
+              long_span=False
+              for s,ts in x['state_times'].items():
+                  if len(ts)>=2 and (max(ts)-min(ts)).total_seconds()>600: long_span=True
+              if long_span:state_span['state_span_over_600s']+=1
+              quality='DIRECT_ARR_DEP_ORDERED' if arr and dep and valid_order else ('DIRECT_ARR_ONLY' if arr else ('DIRECT_DEP_ONLY' if dep else 'DIRECT_ENTERING_ONLY'))
+              m=statn_meta[x['station']]
+              records.append({
+                'evidence_class':'DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE',
+                'subway_id':x['line'],'btrain_no':x['train'],'statn_id':x['station'],
+                'statn_name_mode':m['names'].most_common(1)[0][0] if m['names'] else '',
+                'statn_sn_mode':x['statn_sn'].most_common(1)[0][0] if x['statn_sn'] else '',
+                'updn_line_mode':x['updn'].most_common(1)[0][0] if x['updn'] else '',
+                'train_cd_mode':x['train_cd'].most_common(1)[0][0] if x['train_cd'] else '',
+                'entering_detect_time':enter.strftime('%Y%m%d%H%M%S') if enter else '',
+                'arrival_detect_time':arr.strftime('%Y%m%d%H%M%S') if arr else '',
+                'departure_detect_time':dep.strftime('%Y%m%d%H%M%S') if dep else '',
+                'state0_observations':len(t0),'state1_observations':len(t1),'state2_observations':len(t2),
+                'quality':quality,
+              })
+
+          # Train identity diagnostics.
+          station_counts=[len(v) for v in train_station_sets.values()]
+          train_number_multiline=sum(1 for tr,c in train_lines.items() if len(c)>1)
+          quality_counts=Counter(r['quality'] for r in records)
+          def qstats(a):
+              a=[float(x) for x in a if x==x]
+              if not a:return None
+              a.sort()
+              def q(p):return a[min(len(a)-1,max(0,round((len(a)-1)*p)))]
+              return {'n':len(a),'min':a[0],'p10':q(.1),'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+          dwell_nonneg=[x for x in dwell if x>=0]
+          dwell_plaus=[x for x in dwell if 0<=x<=600]
+
+          # Write derived candidate event table to durable storage; it contains public operational data only.
+          fields=list(records[0].keys()) if records else []
+          with gzip.open('service_event_candidates_20260829.csv.gz','wt',encoding='utf-8',newline='') as g:
+              w=csv.DictWriter(g,fieldnames=fields); w.writeheader(); w.writerows(records)
+
+          summary={
+            'schema':'mppd-n1-seoul-p1d-service-event-reconstruction-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'source':'BMS_20260830.zip','calendar_content_date':'2026-08-29','archive_members':len(infos),
+            'polling_gap_sec':qstats(poll_gaps),'row_recptn_dt_min':rec_min.strftime('%Y%m%d%H%M%S') if rec_min else None,'row_recptn_dt_max':rec_max.strftime('%Y%m%d%H%M%S') if rec_max else None,
+            'total_snapshot_rows':total_rows,'bad_recptn_rows':bad_recptn,'rows_without_full_line_train_station_time_key':blank_key,
+            'all_arvl_cd_counts':dict(all_state),'direct_state_rows_0_1_2':direct_rows,'direct_state_observation_counts':dict(direct_occ),
+            'train_station_keys_with_direct_state':len(states),'state_presence':dict(state_presence),'quality_counts':dict(quality_counts),
+            'ordering':dict(sequence),'long_repeated_state_span':dict(state_span),
+            'dwell_all_arr_dep_sec':qstats(dwell),'dwell_nonnegative_sec':qstats(dwell_nonneg),'dwell_plausible_0_600_sec':qstats(dwell_plaus),'plausible_dwell_share_of_arr_dep':len(dwell_plaus)/len(dwell) if dwell else None,
+            'entering_to_arrival_sec':qstats(entry_to_arr),
+            'train_line_instances':len(train_station_sets),'unique_btrain_no':len(train_lines),'btrain_no_seen_on_multiple_subway_ids':train_number_multiline,
+            'stations_per_train_line_instance':qstats(station_counts),
+            'candidate_event_rows':len(records),
+            'event_table':'service_event_candidates_20260829.csv.gz',
+            'evidence_boundary':'RECPTN_DT is status-record observation time. Extracted ARR/DEP are first observed direct state transitions and are DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE, not proprietary ATS timestamps.',
+            'qualification':{
+              'calendar_day_reconstruction_complete':True,
+              'polling_resolution_characterized':True,
+              'direct_state_sequence_characterized':True,
+              'service_day_0400_to_0359_complete':False,
+              'reason_service_day_incomplete':'Requires 2026-08-30 00:00-03:59 from next calendar service package.',
+              't5_pass':False,'t6_observed_genealogy':False
+            }
+          }
+          Path('seoul_p1d_service_event_reconstruction_20260903.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1D_CONCISE='+json.dumps({k:summary[k] for k in ['archive_members','polling_gap_sec','row_recptn_dt_min','row_recptn_dt_max','total_snapshot_rows','all_arvl_cd_counts','train_station_keys_with_direct_state','state_presence','quality_counts','ordering','dwell_nonnegative_sec','plausible_dwell_share_of_arr_dep','train_line_instances','unique_btrain_no','btrain_no_seen_on_multiple_subway_ids','stations_per_train_line_instance','candidate_event_rows','qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store summary and candidate event table
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p1d"
+          copyv(){ local s="$1" d="$2"; rclone copyto "$s" "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; local l r; l="$(stat -c '%s' "$s")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$d" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$l" = "$r"; }
+          copyv seoul_p1d_service_event_reconstruction_20260903.json 99_manifests/seoul_p1d_service_event_reconstruction_20260903.json
+          copyv service_event_candidates_20260829.csv.gz processed/service_events/20260829/service_event_candidates_20260829.csv.gz
+          echo SEOUL_P1D_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

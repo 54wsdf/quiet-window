@@ -1,0 +1,207 @@
+name: MBTA AFC Realized Events Bridge 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mbta-afc-realized-events-bridge-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dataset_id: US_BOS_MBTA_GATED_ENTRIES_HISTORICAL
+            item_id: 7859894afb5641ce91a2bb03599fdf5b
+            fallback_name: mbta_gated_station_entries_historical.bin
+            subdir: gated_entries_historical
+          - dataset_id: US_BOS_MBTA_RAPID_TRANSIT_EVENTS_2020
+            item_id: cb4cf52bafb1402b9b978a424ed4dd78
+            fallback_name: mbta_rapid_transit_events_2020.bin
+            subdir: rapid_transit_events_2020
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/boston_mbta
+      DATASET_ID: ${{ matrix.dataset_id }}
+      ITEM_ID: ${{ matrix.item_id }}
+      FALLBACK_NAME: ${{ matrix.fallback_name }}
+      SUBDIR: ${{ matrix.subdir }}
+
+    steps:
+      - name: Check durable storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'missing GDRIVE_RCLONE_CONFIG_B64'; exit 3; }
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone unzip jq file
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME" || { echo 'rclone remote not found'; exit 4; }
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch ArcGIS item metadata and public data payload
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          META_URL="https://www.arcgis.com/sharing/rest/content/items/$ITEM_ID?f=pjson"
+          DATA_URL="https://www.arcgis.com/sharing/rest/content/items/$ITEM_ID/data"
+          curl -fsSL --retry 6 --retry-all-errors "$META_URL" -o item_metadata.json
+          jq -e '.id == env.ITEM_ID and (.access == "public")' item_metadata.json >/dev/null
+          jq '{id,title,type,name,size,access,modified,licenseInfo,url}' item_metadata.json
+
+          NAME="$(jq -r '.name // empty' item_metadata.json)"
+          if [[ -z "$NAME" || "$NAME" == "null" ]]; then NAME="$FALLBACK_NAME"; fi
+          NAME="$(basename "$NAME" | tr -cd '[:alnum:]_.-')"
+          if [[ -z "$NAME" ]]; then NAME="$FALLBACK_NAME"; fi
+
+          curl -fL --retry 10 --retry-all-errors --connect-timeout 30 \
+            -A 'quiet-window-public-data-acquisition/1.0' \
+            "$DATA_URL" -o "$NAME"
+          test -s "$NAME"
+          FILE_DESC="$(file -b "$NAME")"
+          SIZE="$(stat -c '%s' "$NAME")"
+          SHA="$(sha256sum "$NAME" | awk '{print $1}')"
+          echo "payload=$RUNNER_TEMP/$NAME" >> "$GITHUB_OUTPUT"
+          echo "filename=$NAME" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "file_desc=$FILE_DESC" >> "$GITHUB_OUTPUT"
+          echo "downloaded $NAME size=$SIZE type=$FILE_DESC"
+
+      - name: Validate payload structure and inventory
+        id: validate
+        shell: bash
+        env:
+          PAYLOAD: ${{ steps.fetch.outputs.payload }}
+          FILENAME: ${{ steps.fetch.outputs.filename }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          DESC="$(file -b "$PAYLOAD")"
+          VALIDATION_TYPE=unknown
+          ROW_HINT=''
+          if [[ "$DESC" == *"Zip archive data"* ]]; then
+            unzip -t "$PAYLOAD" >/tmp/ziptest.log
+            unzip -Z1 "$PAYLOAD" | sed -n '1,200p' > payload_inventory.txt
+            VALIDATION_TYPE=zip
+            # Look for 2020 files or event/ridership CSVs without assuming exact names.
+            grep -Ei '2020|csv|event|entry|gated' payload_inventory.txt | head -n 50 || true
+          else
+            MIME="$(file -b --mime-type "$PAYLOAD")"
+            if [[ "$MIME" == text/* || "$DESC" == *"CSV"* || "$DESC" == *"text"* ]]; then
+              head -n 3 "$PAYLOAD" > payload_head.txt
+              # Reject ArcGIS/JSON error payloads masquerading as downloads.
+              if head -c 1 "$PAYLOAD" | grep -q '[{[]'; then
+                echo 'payload appears to be JSON, not the advertised downloadable dataset' >&2
+                cat payload_head.txt >&2
+                exit 12
+              fi
+              ROW_HINT="$(wc -l < "$PAYLOAD" | tr -d ' ')"
+              VALIDATION_TYPE=text
+            else
+              echo "unsupported or unexpected payload type: $DESC" >&2
+              exit 13
+            fi
+          fi
+          echo "validation_type=$VALIDATION_TYPE" >> "$GITHUB_OUTPUT"
+          echo "row_hint=$ROW_HINT" >> "$GITHUB_OUTPUT"
+
+      - name: Build acquisition manifest
+        shell: bash
+        env:
+          FILENAME: ${{ steps.fetch.outputs.filename }}
+          SIZE_BYTES: ${{ steps.fetch.outputs.size }}
+          SHA256: ${{ steps.fetch.outputs.sha }}
+          FILE_DESC: ${{ steps.fetch.outputs.file_desc }}
+          VALIDATION_TYPE: ${{ steps.validate.outputs.validation_type }}
+          ROW_HINT: ${{ steps.validate.outputs.row_hint }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import json, os, datetime
+          from pathlib import Path
+          meta=json.loads(Path('item_metadata.json').read_text())
+          d={
+            'dataset_id':os.environ['DATASET_ID'],
+            'state':'VALIDATED_LOCAL',
+            'provider':'MassDOT / MBTA ArcGIS Open Data',
+            'arcgis_item_id':os.environ['ITEM_ID'],
+            'metadata':{k:meta.get(k) for k in ['title','type','name','size','access','modified','licenseInfo','url']},
+            'source_data_url':f"https://www.arcgis.com/sharing/rest/content/items/{os.environ['ITEM_ID']}/data",
+            'downloaded_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'filename':os.environ['FILENAME'],
+            'size_bytes':int(os.environ['SIZE_BYTES']),
+            'sha256':os.environ['SHA256'],
+            'file_description':os.environ['FILE_DESC'],
+            'validation_type':os.environ['VALIDATION_TYPE'],
+            'row_hint':int(os.environ['ROW_HINT']) if os.environ.get('ROW_HINT') else None,
+          }
+          Path('manifest.json').write_text(json.dumps(d,indent=2),encoding='utf-8')
+          print(json.dumps(d,indent=2))
+          PY
+
+      - name: Store data and manifest in Google Drive and verify bytes
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          PAYLOAD: ${{ steps.fetch.outputs.payload }}
+          FILENAME: ${{ steps.fetch.outputs.filename }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          DEST="$ROOT_DRIVE/$SUBDIR"
+          for spec in "$PAYLOAD:$FILENAME" "item_metadata.json:item_metadata.json" "manifest.json:manifest.json"; do
+            SRC="${spec%%:*}"; DST="${spec#*:}"
+            rclone copyto "$SRC" "$REMOTE_NAME:$DEST/$DST" --config "$CONFIG_FILE" \
+              --retries 8 --low-level-retries 20 --transfers 1 --checkers 4 --stats 30s --stats-one-line
+            L="$(stat -c '%s' "$SRC")"
+            R="$(rclone size "$REMOTE_NAME:$DEST/$DST" --config "$CONFIG_FILE" --json | jq -r '.bytes')"
+            test "$L" = "$R" || { echo "remote-size mismatch: $DST local=$L remote=$R"; exit 20; }
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path('manifest.json'); d=json.loads(p.read_text())
+          d['state']='ACQUIRED'
+          d['durable_storage']={
+            'backend':'Google Drive via rclone',
+            'path':f"{os.environ['ROOT_DRIVE']}/{os.environ['SUBDIR']}/",
+            'verified_by':'remote_size'
+          }
+          p.write_text(json.dumps(d,indent=2),encoding='utf-8')
+          PY
+          rclone copyto manifest.json "$REMOTE_NAME:$DEST/manifest.json" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+
+      - name: Clean temporary configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

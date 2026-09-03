@@ -1,0 +1,227 @@
+name: Seoul P3C1 Held-Out Exit-Minute Relationship 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3c1-heldout-exit-minute-link-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3c1"; cd "$RUNNER_TEMP/p3c1"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Fit egress lag on design passengers and evaluate held-out exit minutes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3c1"
+          python - <<'PY'
+          import csv,hashlib,io,json,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          IN_LINE='1008'; OUT_LINE='1002'; IN_TRANSFER='1008000814'; OUT_TRANSFER='1002000216'
+          GUARD=60; PHYSICAL=158; LAGS=list(range(0,901,30)); MIN_DEST_DESIGN=20
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def design_split(card):return hashlib.sha1(card.encode('utf-8')).digest()[0] < 128
+          def interval_error(pred,obs):
+              lo=obs;hi=obs+timedelta(seconds=59)
+              if pred<lo:return (lo-pred).total_seconds()
+              if pred>hi:return (pred-hi).total_seconds()
+              return 0.0
+          def fit_lag(rows,key):
+              best=None
+              for lag in LAGS:
+                  errs=[interval_error(r[key]+timedelta(seconds=lag),r['exit']) for r in rows]
+                  score=(sum(errs),statistics.median(errs),lag)
+                  if best is None or score<best[0]:best=(score,lag)
+              return best[1] if best else None
+          def minute_key(t):return t.strftime('%H:%M')
+          def tv(a,b):
+              keys=set(a)|set(b);sa=sum(a.values());sb=sum(b.values())
+              return .5*sum(abs(a.get(k,0)/sa-b.get(k,0)/sb) for k in keys) if sa and sb else None
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          names={x['service_statn_id']:x.get('dv_name') for x in p1c['canonical_entries'] if x.get('service_statn_id')}
+
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+          inbound=defaultdict(list);outbound=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for ta,td in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          for oa,od in evs:
+                              if od<ta and 0<(ta-od).total_seconds()<=7200:
+                                  inbound[os].append((od,ta,tr));break
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for ta,td in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          for da,dd in evs:
+                              if da>td and 0<(da-td).total_seconds()<=7200:
+                                  outbound[ds].append((td,da,tr));break
+          for st in inbound:inbound[st]=sorted(set(inbound[st]))
+          for st in outbound:outbound[st]=sorted(set(outbound[st]))
+
+          def select(t0,os,ds,transfer):
+              ins=[x for x in inbound[os] if x[0]>=t0+timedelta(seconds=GUARD)]
+              if not ins:return None
+              idep,iarr,itr=min(ins,key=lambda x:(x[1],x[0],x[2]))
+              outs=[x for x in outbound[ds] if x[0]>=iarr+timedelta(seconds=transfer)]
+              if not outs:return None
+              odep,darr,otr=min(outs,key=lambda x:(x[1],x[0],x[2]))
+              return darr
+
+          rows=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  card=(row.get('TRCR_ID') or '').strip()
+                  if not card:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a['service_subway_id']!=IN_LINE or b['service_subway_id']!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and (t0.hour==7 or (t0.hour==8 and t0.minute<30))):continue
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  os=a['service_statn_id'];ds=b['service_statn_id']
+                  if os not in inbound or ds not in outbound:continue
+                  p0=select(t0,os,ds,0);pp=select(t0,os,ds,PHYSICAL)
+                  if p0 is None or pp is None:continue
+                  rows.append({'design':design_split(card),'dest':ds,'exit':t1,'zero':p0,'physical':pp})
+              f.close()
+
+          design=[r for r in rows if r['design']];evals=[r for r in rows if not r['design']]
+          bydest_design=defaultdict(list)
+          for r in design:bydest_design[r['dest']].append(r)
+
+          lag_models={}
+          for model in ('zero','physical'):
+              global_lag=fit_lag(design,model)
+              dest_lags={}
+              for ds,rs in bydest_design.items():
+                  if len(rs)>=MIN_DEST_DESIGN:dest_lags[ds]=fit_lag(rs,model)
+              lag_models[model]={'global_lag_sec':global_lag,'destination_lags_sec':dest_lags,'destination_specific_count':len(dest_lags),'destination_lags_at_upper_bound':sum(v==max(LAGS) for v in dest_lags.values())}
+
+          metrics={};errors={};predicted_times={}
+          for model in ('zero','physical'):
+              errs=[];within=Counter();preds=[];joint_pred=Counter();joint_obs=Counter();dest_eval=defaultdict(list)
+              for r in evals:
+                  lag=lag_models[model]['destination_lags_sec'].get(r['dest'],lag_models[model]['global_lag_sec'])
+                  pred=r[model]+timedelta(seconds=lag);err=interval_error(pred,r['exit']);errs.append(err);preds.append(pred)
+                  within['exact_minute']+=int(err==0);within['60']+=int(err<=60);within['120']+=int(err<=120);within['300']+=int(err<=300)
+                  joint_pred[(r['dest'],minute_key(pred))]+=1;joint_obs[(r['dest'],minute_key(r['exit']))]+=1
+                  dest_eval[r['dest']].append((pred,r['exit'],err))
+              dest_profiles=[]
+              for ds,rs in dest_eval.items():
+                  if len(rs)<20:continue
+                  ph=Counter(minute_key(x[0]) for x in rs);oh=Counter(minute_key(x[1]) for x in rs);es=[x[2] for x in rs]
+                  dest_profiles.append({'destination_service_station_id':ds,'destination_name':names.get(ds),'eval_rows':len(rs),'lag_sec':lag_models[model]['destination_lags_sec'].get(ds,lag_models[model]['global_lag_sec']),'exact_exit_minute_share':sum(e==0 for e in es)/len(es),'within_60_sec_share':sum(e<=60 for e in es)/len(es),'median_interval_error_sec':q(es,.5),'minute_distribution_total_variation':tv(ph,oh)})
+              dest_profiles.sort(key=lambda x:x['eval_rows'],reverse=True)
+              metrics[model]={'eval_rows':len(evals),'exact_exit_minute_share':within['exact_minute']/len(evals) if evals else None,'within_60_sec_share':within['60']/len(evals) if evals else None,'within_120_sec_share':within['120']/len(evals) if evals else None,'within_300_sec_share':within['300']/len(evals) if evals else None,'interval_error_sec':summ(errs),'joint_destination_minute_total_variation':tv(joint_pred,joint_obs),'destination_profiles_ge20':dest_profiles}
+              errors[model]=errs
+
+          wins=ties=losses=0;diff=[]
+          for ez,ep in zip(errors['zero'],errors['physical']):
+              if ep<ez:wins+=1
+              elif ep>ez:losses+=1
+              else:ties+=1
+              diff.append(ez-ep)
+          comparison={
+            'eval_rows':len(evals),'physical_error_wins':wins,'ties':ties,'physical_error_losses':losses,'physical_win_share_excluding_ties':wins/(wins+losses) if wins+losses else None,
+            'median_zero_minus_physical_interval_error_sec':q(diff,.5),'mean_zero_minus_physical_interval_error_sec':sum(diff)/len(diff) if diff else None,
+            'exact_exit_minute_share_gain':metrics['physical']['exact_exit_minute_share']-metrics['zero']['exact_exit_minute_share'],
+            'within_60_sec_share_gain':metrics['physical']['within_60_sec_share']-metrics['zero']['within_60_sec_share'],
+            'within_120_sec_share_gain':metrics['physical']['within_120_sec_share']-metrics['zero']['within_120_sec_share'],
+            'joint_destination_minute_tv_reduction':metrics['zero']['joint_destination_minute_total_variation']-metrics['physical']['joint_destination_minute_total_variation']
+          }
+          # Conservative decision: require physical model to improve at least two independent held-out metrics without worse median error.
+          improved=sum([comparison['within_60_sec_share_gain']>0,comparison['within_120_sec_share_gain']>0,comparison['joint_destination_minute_tv_reduction']>0,comparison['physical_error_wins']>comparison['physical_error_losses']])
+          median_better=(metrics['physical']['interval_error_sec']['median'] or 0) <= (metrics['zero']['interval_error_sec']['median'] or 0)
+          if len(evals)>=300 and improved>=2 and median_better:decision='HELD_OUT_EXIT_MINUTE_RELATIONSHIP_SUPPORTS_PHYSICAL_TRANSFER_MODEL'
+          elif len(evals)>=300:decision='HELD_OUT_EXIT_MINUTE_RELATIONSHIP_NO_CLEAR_PHYSICAL_TRANSFER_GAIN'
+          else:decision='HELD_OUT_EXIT_MINUTE_SAMPLE_TOO_SMALL'
+
+          result={'schema':'mppd-n1-seoul-p3c1-heldout-exit-minute-link-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'candidate':{'incoming_line':'1008','outgoing_line':'1002','station_ko':'잠실','station_en':'Jamsil','physical_shortest_transfer_sec':PHYSICAL},'entry_guard_sec':GUARD,'all_common_rows':len(rows),'design_rows':len(design),'evaluation_rows':len(evals),'split_contract':'Passenger cards are assigned wholly to design or evaluation by SHA-1 hash of TRCR_ID inside the runner. No card identifier is exported or logged.','egress_lag_contract':{'grid_sec':[min(LAGS),max(LAGS),30],'destination_specific_min_design_rows':MIN_DEST_DESIGN,'objective':'minimize summed distance between predicted exit time and the observed minute interval [ALGH_DTM, ALGH_DTM+59s] on design passengers','equal_flexibility':'No-transfer and physical-transfer models each receive the same global plus destination-specific egress-lag calibration rules.'},'lag_models':lag_models,'held_out_metrics':metrics,'paired_model_comparison':comparison,'decision':decision,'scientific_interpretation':'This test asks whether a destination-best realized service-opportunity field that includes the independently sourced physical transfer constraint has a stronger held-out relationship with recorded minute-quantized AFC exit timing than an otherwise identical no-transfer model, after both models receive equal destination-specific egress-lag calibration on disjoint design passengers. It remains a predictive relationship test, not passenger train assignment.','evidence_boundary':['ALGH_DTM is minute-quantized; evaluation uses the observed minute as a 60-second interval rather than false second precision.','Egress lag is a bounded nuisance parameter calibrated only on design passengers; it is not observed walking time.','The structurally unique line-pair interchange is not direct observation of individual route choice.','Destination-best service opportunities are not passenger-to-train assignments.','No T6 observed train-to-train genealogy claim.']}
+          Path('seoul_p3c1_heldout_exit_minute_link_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3C1_CONCISE='+json.dumps({'n':len(rows),'design':len(design),'eval':len(evals),'lags':lag_models,'zero':{k:metrics['zero'][k] for k in ('exact_exit_minute_share','within_60_sec_share','within_120_sec_share','within_300_sec_share','interval_error_sec','joint_destination_minute_total_variation')},'physical':{k:metrics['physical'][k] for k in ('exact_exit_minute_share','within_60_sec_share','within_120_sec_share','within_300_sec_share','interval_error_sec','joint_destination_minute_total_variation')},'comparison':comparison,'decision':decision,'zero_dest':metrics['zero']['destination_profiles_ge20'][:10],'physical_dest':metrics['physical']['destination_profiles_ge20'][:10]},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3c1"
+          F=seoul_p3c1_heldout_exit_minute_link_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3C1_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

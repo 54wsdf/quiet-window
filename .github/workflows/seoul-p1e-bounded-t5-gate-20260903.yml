@@ -1,0 +1,235 @@
+name: Seoul P1E Bounded T5 Gate 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1e-bounded-t5-gate-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p1e"; cd "$RUNNER_TEMP/p1e"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_local_transition_events_0700_1000.csv" events.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Evaluate temporal resolution and strict AM intersection
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1e"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, re, statistics, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def parse14(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              if len(d)<14:return None
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S')
+              except ValueError:return None
+          def qstats(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'p10':q(.1),'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          mapping={}
+          for x in p1c.get('canonical_entries',[]):
+              if x.get('tier') in STRICT:
+                  mapping[str(x['out_stn_num']).zfill(4)]={
+                    'service_statn_id':str(x['service_statn_id']),
+                    'service_subway_id':str(x['service_subway_id']),
+                    'tier':x['tier'],
+                    'dv_name':x.get('dv_name'),
+                  }
+
+          event_pairs=set(); event_by_pair=Counter(); event_times=[]
+          with open('events.csv','r',encoding='utf-8-sig',newline='') as f:
+              r=csv.DictReader(f)
+              for row in r:
+                  pair=(str(row.get('subway_id') or '').strip(),str(row.get('statn_id') or '').strip())
+                  if all(pair): event_pairs.add(pair); event_by_pair[pair]+=1
+                  for k in ('arrival_detect_time','departure_detect_time'):
+                      t=parse14(row.get(k));
+                      if t:event_times.append(t)
+
+          service_lines_with_events={x[0] for x in event_pairs}
+          strict_supported_mapping={k:v for k,v in mapping.items() if v['service_subway_id'] in service_lines_with_events}
+          mapped_pairs={(v['service_subway_id'],v['service_statn_id']) for v in strict_supported_mapping.values()}
+          mapped_pairs_with_events=mapped_pairs & event_pairs
+
+          # Directional transfer endpoints and movements, filtered only where both line-specific passenger station records
+          # map under strict P1C and both mapped service line/stations have qualified AM event candidates.
+          raw=Path('directional.csv').read_bytes();enc=detect(raw[:262144]);dr=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace')));fields=dr.fieldnames or []
+          sc=next(k for k in fields if '환승시작 코드' in k);ec=next(k for k in fields if '환승종료역 코드' in k)
+          sl=next(k for k in fields if k=='환승시작 호선');el=next(k for k in fields if k=='환승종료 호선')
+          sn=next(k for k in fields if k=='환승시작역');en=next(k for k in fields if k=='환승종료역')
+          dur=next(k for k in fields if k=='소요시간')
+          qualified_movements=[]; transfer_endpoint_codes=set(); transfer_all_endpoint_codes=set()
+          for row in dr:
+              a=z4(row.get(sc));b=z4(row.get(ec))
+              if a:transfer_all_endpoint_codes.add(a)
+              if b:transfer_all_endpoint_codes.add(b)
+              ma=strict_supported_mapping.get(a);mb=strict_supported_mapping.get(b)
+              if not (ma and mb):continue
+              pa=(ma['service_subway_id'],ma['service_statn_id']);pb=(mb['service_subway_id'],mb['service_statn_id'])
+              if pa not in event_pairs or pb not in event_pairs:continue
+              transfer_endpoint_codes.update((a,b))
+              qualified_movements.append({'start_out_stn_num':a,'end_out_stn_num':b,'start_name':(row.get(sn) or '').strip(),'end_name':(row.get(en) or '').strip(),'start_line_label':(row.get(sl) or '').strip(),'end_line_label':(row.get(el) or '').strip(),'duration':(row.get(dur) or '').strip(),'start_service_subway_id':ma['service_subway_id'],'start_service_statn_id':ma['service_statn_id'],'end_service_subway_id':mb['service_subway_id'],'end_service_statn_id':mb['service_statn_id']})
+
+          # Passenger AM scan. No passenger rows are persisted or logged.
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              total_rail=0;am_rail=0;am_psng=0.0;am_seconds=Counter();alight_seconds=Counter();minute_seconds_nonzero=0
+              strict_map_rows=0;strict_map_psng=0.0;event_supported_rows=0;event_supported_psng=0.0;transfer_endpoint_rows=0;transfer_endpoint_psng=0.0
+              cross_tier=Counter();station_rows=Counter();station_psng=Counter();five_sec=Counter();five_sec_event_supported=Counter();five_sec_transfer_endpoint=Counter()
+              cards=set();transfer_process=set();am_alight_in_window=0;strict_alight_in_window=0
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  total_rail+=1
+                  t=parse14(row.get('RIDE_DTM'))
+                  if not t or not (t.date().isoformat()=='2026-08-29' and 7<=t.hour<10):continue
+                  am_rail+=1
+                  try:p=float(row.get('PSNG_NUM') or 1)
+                  except:p=1.0
+                  am_psng+=p
+                  am_seconds[t.second]+=1
+                  if t.second!=0:minute_seconds_nonzero+=1
+                  out=z4(row.get('RIDE_BSST_ID'));m=strict_supported_mapping.get(out)
+                  if out:station_rows[out]+=1;station_psng[out]+=p
+                  card=(row.get('TRCR_ID') or '').strip();trnc=(row.get('TRNC_ID') or '').strip()
+                  if card:cards.add(card)
+                  if trnc:transfer_process.add(trnc)
+                  # Generic 5-second binning only; this is not the private Paper-B pulse detector.
+                  b=t.replace(second=(t.second//5)*5,microsecond=0).strftime('%Y%m%d%H%M%S')
+                  five_sec[(out,b)]+=p
+                  if m:
+                      strict_map_rows+=1;strict_map_psng+=p;cross_tier[m['tier']]+=1
+                      pair=(m['service_subway_id'],m['service_statn_id'])
+                      if pair in event_pairs:
+                          event_supported_rows+=1;event_supported_psng+=p;five_sec_event_supported[(out,b)]+=p
+                          if out in transfer_endpoint_codes:
+                              transfer_endpoint_rows+=1;transfer_endpoint_psng+=p;five_sec_transfer_endpoint[(out,b)]+=p
+                  at=parse14(row.get('ALGH_DTM'))
+                  if at:
+                      alight_seconds[at.second]+=1
+                      if at.date().isoformat()=='2026-08-29' and 7<=at.hour<10:
+                          am_alight_in_window+=1
+                          ao=z4(row.get('ALGH_BSST_ID'))
+                          if ao in strict_supported_mapping:strict_alight_in_window+=1
+              f.close()
+
+          sec_unique=sum(1 for s,c in am_seconds.items() if c>0)
+          second_resolution_pass=bool(sec_unique>=30 and minute_seconds_nonzero/max(1,am_rail)>=0.20)
+          five_vals=list(five_sec.values()); event_vals=list(five_sec_event_supported.values()); transfer_vals=list(five_sec_transfer_endpoint.values())
+          high5={str(k):sum(1 for v in event_vals if v>=k) for k in (2,3,5,10,20)}
+          high5_transfer={str(k):sum(1 for v in transfer_vals if v>=k) for k in (2,3,5,10,20)}
+
+          passenger_event_mass_share=event_supported_psng/am_psng if am_psng else None
+          passenger_transfer_endpoint_mass_share=transfer_endpoint_psng/am_psng if am_psng else None
+          strict_mass_share=strict_map_psng/am_psng if am_psng else None
+          qualified_transfer_pass=bool(len(qualified_movements)>=20 and len(transfer_endpoint_codes)>=10)
+          event_intersection_pass=bool(passenger_event_mass_share is not None and passenger_event_mass_share>=0.80 and len(mapped_pairs_with_events)>=100)
+          t5_pass=bool(second_resolution_pass and strict_mass_share is not None and strict_mass_share>=0.90 and event_intersection_pass and qualified_transfer_pass)
+
+          result={
+            'schema':'mppd-n1-seoul-p1e-bounded-t5-gate-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'bounded_window':'2026-08-29 07:00:00-10:00:00','evidence_tier_if_pass':'T5_PASSENGER_PULSE_COUPLED_BOUNDED_AM_WINDOW',
+            'passenger':{
+              'full_day_official_rail_rows':total_rail,'am_rail_rows':am_rail,'am_passenger_mass':am_psng,'unique_cards':len(cards),'unique_transfer_process_ids':len(transfer_process),
+              'ride_second_of_minute_counts':dict(sorted(am_seconds.items())),'ride_unique_second_values':sec_unique,'ride_nonzero_second_share':minute_seconds_nonzero/max(1,am_rail),'alight_second_of_minute_counts':dict(sorted(alight_seconds.items())),
+              'second_resolution_pass':second_resolution_pass,
+              'five_second_station_bins':len(five_vals),'five_second_mass_stats':qstats(five_vals),'event_supported_five_second_bins':len(event_vals),'event_supported_five_second_mass_stats':qstats(event_vals),'event_supported_bins_above_mass':high5,
+              'transfer_endpoint_five_second_bins':len(transfer_vals),'transfer_endpoint_five_second_mass_stats':qstats(transfer_vals),'transfer_endpoint_bins_above_mass':high5_transfer,
+              'pulse_detector_boundary':'Only generic 5-second bin concentration is evaluated in the public execution node. The private frozen Paper-B pulse detector is not copied into the public repository.'
+            },
+            'crosswalk':{
+              'strict_mapping_entries':len(mapping),'strict_service_supported_entries':len(strict_supported_mapping),'strict_mapped_am_rows':strict_map_rows,'strict_mapped_am_mass':strict_map_psng,'strict_am_mass_share':strict_mass_share,'tier_rows':dict(cross_tier)
+            },
+            'service':{
+              'qualified_am_event_rows':sum(event_by_pair.values()),'qualified_am_service_station_line_pairs':len(event_pairs),'strict_crosswalk_service_pairs':len(mapped_pairs),'strict_crosswalk_pairs_with_events':len(mapped_pairs_with_events),
+              'am_passenger_rows_at_event_supported_station_line':event_supported_rows,'am_passenger_mass_at_event_supported_station_line':event_supported_psng,'am_passenger_event_mass_share':passenger_event_mass_share,
+              'event_evidence_class':'DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE','timestamp_boundary':'approximately 10-second polling first-observed status transitions, not proprietary ATS timestamps'
+            },
+            'transfer':{
+              'directional_rows_total':sum(1 for _ in open('directional.csv',encoding=enc,errors='replace'))-1,'all_endpoint_codes':len(transfer_all_endpoint_codes),'qualified_directional_movements_with_both_service_sides':len(qualified_movements),'qualified_transfer_endpoint_codes':len(transfer_endpoint_codes),
+              'am_passenger_rows_entering_at_qualified_transfer_endpoint_station_records':transfer_endpoint_rows,'am_passenger_mass_at_qualified_transfer_endpoint_station_records':transfer_endpoint_psng,'am_passenger_transfer_endpoint_mass_share':passenger_transfer_endpoint_mass_share,
+              'qualified_movement_examples':qualified_movements[:100],
+              'boundary':'Directional transfer support is a local movement kernel/constraint. AFC entry at a transfer station is not interpreted as an observed transfer action; no individual train-to-train genealogy is claimed.'
+            },
+            'downstream_observation':{'am_alight_transactions_in_window':am_alight_in_window,'am_alight_transactions_with_strict_station_mapping':strict_alight_in_window},
+            'qualification':{
+              'fine_second_resolution_pass':second_resolution_pass,
+              'strict_crosswalk_mass_pass':bool(strict_mass_share is not None and strict_mass_share>=0.90),
+              'direct_operational_service_intersection_pass':event_intersection_pass,
+              'directional_transfer_service_intersection_pass':qualified_transfer_pass,
+              'bounded_am_t5_pass':t5_pass,
+              'full_service_day_t5_pass_claimed':False,
+              't6_observed_genealogy':False
+            }
+          }
+          Path('seoul_p1e_bounded_t5_gate_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1E_CONCISE='+json.dumps({
+            'am_rail_rows':am_rail,'am_passenger_mass':am_psng,'ride_unique_second_values':sec_unique,'ride_nonzero_second_share':minute_seconds_nonzero/max(1,am_rail),'second_resolution_pass':second_resolution_pass,
+            'strict_am_mass_share':strict_mass_share,'event_supported_mass_share':passenger_event_mass_share,'strict_pairs_with_events':len(mapped_pairs_with_events),'qualified_directional_movements':len(qualified_movements),'qualified_transfer_endpoint_codes':len(transfer_endpoint_codes),'five_second_event_bins_above_mass':high5,'transfer_endpoint_bins_above_mass':high5_transfer,'qualification':result['qualification']},ensure_ascii=False))
+          PY
+
+      - name: Store bounded T5 gate
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1e"
+          F=seoul_p1e_bounded_t5_gate_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P1E_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

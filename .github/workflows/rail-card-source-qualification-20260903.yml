@@ -1,0 +1,169 @@
+name: Rail Card Source Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rail-card-source-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: ResearchData/transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
+      OUT_DRIVE: ResearchData/transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/99_manifests/sptcc_raw_qualification_20260903
+
+    steps:
+      - name: Prepare protected storage access
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check duckdb
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/qual"
+
+      - name: Stream source files one-by-one and profile schema
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/qual"
+          for src in SPTCC-20160701.csv SPTCC-20160802.csv SPTCC-20160901.csv; do
+            echo "qualifying $src"
+            rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$src" "$src" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            sha256sum "$src" > "$src.sha256"
+            SRC="$src" python - <<'PY'
+          from __future__ import annotations
+          import json, os, re
+          from pathlib import Path
+          import duckdb
+
+          src=os.environ['SRC']
+          con=duckdb.connect(database=':memory:')
+          # Keep every native token as text during qualification. Scientific typing comes only after this audit.
+          con.execute("CREATE TABLE t AS SELECT * FROM read_csv_auto(?, header=true, all_varchar=true, sample_size=200000, ignore_errors=false)", [src])
+          cols=[r[0] for r in con.execute('DESCRIBE t').fetchall()]
+          row_count=con.execute('SELECT COUNT(*) FROM t').fetchone()[0]
+          def qi(s): return '"'+s.replace('"','""')+'"'
+          profiles=[]
+          for c in cols:
+              q=qi(c)
+              nonnull=con.execute(f"SELECT COUNT(*) FROM t WHERE {q} IS NOT NULL AND trim({q})<>''").fetchone()[0]
+              approx=con.execute(f"SELECT approx_count_distinct({q}) FROM t WHERE {q} IS NOT NULL AND trim({q})<>''").fetchone()[0]
+              minlen,maxlen=con.execute(f"SELECT min(length({q})), max(length({q})) FROM t WHERE {q} IS NOT NULL AND trim({q})<>''").fetchone()
+              lname=c.lower()
+              role=[]
+              if any(k in lname for k in ('time','date','datetime','timestamp')): role.append('TIME_CANDIDATE')
+              if any(k in lname for k in ('station','stop')): role.append('STATION_CANDIDATE')
+              if any(k in lname for k in ('line','route')): role.append('LINE_CANDIDATE')
+              if any(k in lname for k in ('status','state','entry','exit','inout')): role.append('EVENT_STATE_CANDIDATE')
+              if any(k in lname for k in ('user','card','passenger')): role.append('PASSENGER_ID_CANDIDATE')
+              if any(k in lname for k in ('device','gate','reader')): role.append('DEVICE_ID_CANDIDATE')
+              p={'column':c,'nonnull_rows':int(nonnull),'nonnull_share':nonnull/row_count if row_count else None,'approx_distinct':int(approx or 0),'min_length':minlen,'max_length':maxlen,'heuristic_roles':role}
+              if approx is not None and approx <= 32 and not any(x in role for x in ('PASSENGER_ID_CANDIDATE','DEVICE_ID_CANDIDATE')):
+                  vals=[r[0] for r in con.execute(f"SELECT DISTINCT {q} FROM t WHERE {q} IS NOT NULL AND trim({q})<>'' ORDER BY 1 LIMIT 32").fetchall()]
+                  p['low_cardinality_values']=vals
+              profiles.append(p)
+
+          time_candidates=[]
+          for c in cols:
+              lname=c.lower()
+              if not any(k in lname for k in ('time','date','datetime','timestamp')): continue
+              q=qi(c)
+              # Parse the common ISO-like layout without assuming it is the only valid source representation.
+              x=con.execute(f"""
+                SELECT
+                  count(*) FILTER (WHERE try_strptime({q}, '%Y-%m-%d %H:%M:%S') IS NOT NULL) AS parsed,
+                  min(try_strptime({q}, '%Y-%m-%d %H:%M:%S')),
+                  max(try_strptime({q}, '%Y-%m-%d %H:%M:%S')),
+                  count(DISTINCT extract(second FROM try_strptime({q}, '%Y-%m-%d %H:%M:%S'))) FILTER (WHERE try_strptime({q}, '%Y-%m-%d %H:%M:%S') IS NOT NULL),
+                  count(*) FILTER (WHERE try_strptime({q}, '%Y-%m-%d %H:%M:%S') IS NOT NULL AND extract(second FROM try_strptime({q}, '%Y-%m-%d %H:%M:%S'))=0)
+                FROM t
+              """).fetchone()
+              time_candidates.append({'column':c,'iso_second_parse_rows':int(x[0]),'iso_second_parse_share':x[0]/row_count if row_count else None,'parsed_min':str(x[1]) if x[1] else None,'parsed_max':str(x[2]) if x[2] else None,'distinct_second_values':int(x[3] or 0),'second_zero_share_of_all_rows':x[4]/row_count if row_count else None})
+
+          status_candidates=[]
+          for p in profiles:
+              if 'EVENT_STATE_CANDIDATE' in p['heuristic_roles'] or (p['approx_distinct']<=8 and any(v in [str(x) for x in p.get('low_cardinality_values',[])] for v in ('0','1'))):
+                  status_candidates.append({'column':p['column'],'approx_distinct':p['approx_distinct'],'values':p.get('low_cardinality_values')})
+
+          out={
+            'schema':'rail-card-source-qualification.v1',
+            'source_file':src,
+            'row_count':int(row_count),
+            'columns':cols,
+            'column_profiles':profiles,
+            'time_candidates':time_candidates,
+            'event_state_candidates':status_candidates,
+            'privacy_rule':'No passenger/card/device raw values are exported by this qualification workflow.',
+            'evidence_state':'SOURCE_SCHEMA_PROFILED_NOT_YET_SCIENTIFICALLY_INTERPRETED'
+          }
+          Path(src+'.profile.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+            rm -f "$src"
+          done
+
+          python - <<'PY'
+          import json, hashlib
+          from pathlib import Path
+          files=sorted(Path('.').glob('SPTCC-*.csv.profile.json'))
+          ps=[json.loads(p.read_text(encoding='utf-8')) for p in files]
+          schemas=[p['columns'] for p in ps]
+          times=[]
+          for p in ps:
+              times.extend(p['time_candidates'])
+          out={
+            'schema':'rail-card-source-cross-file-qualification.v1',
+            'dataset_id':'CN_SH_SPTCC_2016_DRIVE_STACK',
+            'files':[p['source_file'] for p in ps],
+            'row_counts':{p['source_file']:p['row_count'] for p in ps},
+            'total_rows_profiled':sum(p['row_count'] for p in ps),
+            'identical_column_schema':all(x==schemas[0] for x in schemas[1:]) if schemas else False,
+            'columns':schemas[0] if schemas and all(x==schemas[0] for x in schemas[1:]) else schemas,
+            'time_candidates':times,
+            'qualification_gate':{
+              'raw_files_present':len(ps)==3,
+              'schema_consistent':all(x==schemas[0] for x in schemas[1:]) if schemas else False,
+              'second_level_time_supported':any((x.get('distinct_second_values') or 0)>1 for x in times),
+              'scientific_semantics_qualified':False
+            },
+            'next_gate':'Interpret status/event semantics and passenger pairing only after source schema is established; do not promote inferred meanings automatically.',
+            'evidence_state':'RAW_SCHEMA_QUALIFICATION_COMPLETE_SEMANTIC_INTERPRETATION_PENDING'
+          }
+          Path('qualification_summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Persist qualification outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/qual"
+          for f in *.profile.json *.sha256 qualification_summary.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

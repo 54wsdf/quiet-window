@@ -1,0 +1,138 @@
+name: Seoul Service Transfer Fastlane 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-service-transfer-fastlane-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare runtime
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq file
+          python -m pip install --disable-pip-version-check requests beautifulsoup4 playwright
+          python -m playwright install --with-deps chromium >/tmp/playwright-install.log 2>&1
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire service and code-table files
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          export OUT="$RUNNER_TEMP/seoul-fastlane"; mkdir -p "$OUT"
+          python - <<'PY'
+          import hashlib,json,os,zipfile,re
+          from datetime import datetime,timezone
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          out=Path(os.environ['OUT']); root=os.environ['ROOT_DRIVE']
+          S=requests.Session(); S.headers['User-Agent']='quiet-window-public-data-worker/1.0'
+          def sha(p):
+              h=hashlib.sha256();
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
+              return h.hexdigest()
+          def get(data_id,file_id,expected,ds,role,coverage):
+              landing=f'https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id={data_id}'
+              r=S.get(landing,timeout=60); r.raise_for_status(); soup=BeautifulSoup(r.text,'html.parser')
+              if expected:
+                  opt=soup.select_one(f'#filedata_selectbox option[value="{file_id}"]')
+                  if not opt or opt.get_text(strip=True)!=expected: raise RuntimeError(f'selector changed: {expected}')
+              q=S.get(f'https://t-data.seoul.go.kr/dataprovide/download.do?id={file_id}',headers={'Referer':landing},stream=True,timeout=(30,1800)); q.raise_for_status()
+              cd=q.headers.get('content-disposition','')
+              name=expected or ('tdata_code_table_10002'+('.xlsx' if 'xlsx' in cd.lower() else '.bin'))
+              p=out/name
+              with p.open('wb') as f:
+                  for b in q.iter_content(8*1024*1024):
+                      if b:f.write(b)
+              head=p.read_bytes()[:16]
+              if p.stat().st_size<=0 or head.lstrip().lower().startswith((b'<html',b'<!doctype')): raise RuntimeError(f'bad payload: {name}')
+              if p.suffix=='.zip':
+                  if not head.startswith(b'PK'): raise RuntimeError(f'not zip: {name}')
+                  with zipfile.ZipFile(p) as z:
+                      if not z.infolist(): raise RuntimeError(f'empty zip: {name}')
+              m={'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP','dataset_id':ds,'provider_landing_url':landing,'public_download_id':file_id,'time_coverage':coverage,'evidence_role':role,'retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'original_filename':name,'bytes':p.stat().st_size,'sha256':sha(p),'github_run_id':os.getenv('GITHUB_RUN_ID')}
+              (p.with_name(name+'.manifest.json')).write_text(json.dumps(m,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('LOCAL='+json.dumps({'dataset_id':ds,'filename':name,'bytes':m['bytes'],'sha256':m['sha256']},ensure_ascii=False))
+          get('20007','15474','subarr_20260902.zip','KR_SEOUL_TDATA_SUBWAY_STATUS_20260902','direct_operational_subway_status','2026-09-02')
+          get('20007','15481','BMS_20260902.zip','KR_SEOUL_TDATA_BMS_REFERENCE_20260902','service_reference_companion','2026-09-02')
+          get('20006','10002',None,'KR_SEOUL_TDATA_MODE_CODE_TABLE','transport_mode_and_user_code_table','current code table')
+          PY
+          copy_one() { local src="$1" dest="$2"; rclone copyto "$src" "$REMOTE_NAME:$ROOT_DRIVE/$dest" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1; local l r; l="$(stat -c '%s' "$src")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$dest" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$l" = "$r"; }
+          copy_one "$OUT/subarr_20260902.zip" "service/20260902/subarr_20260902.zip"
+          copy_one "$OUT/BMS_20260902.zip" "service/20260902/BMS_20260902.zip"
+          CODE="$(find "$OUT" -maxdepth 1 -type f -name 'tdata_code_table_10002*' ! -name '*.manifest.json' | head -1)"; test -n "$CODE"
+          copy_one "$CODE" "reference/$(basename "$CODE")"
+          for m in "$OUT"/*.manifest.json; do copy_one "$m" "99_manifests/$(basename "$m")"; done
+
+      - name: Acquire transfer layers
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          export OUT="$RUNNER_TEMP/seoul-fastlane"; mkdir -p "$OUT"
+          python - <<'PY'
+          import hashlib,json,os,zipfile
+          from datetime import datetime,timezone
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          out=Path(os.environ['OUT'])
+          def sha(p):
+              h=hashlib.sha256();
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(8*1024*1024),b''):h.update(b)
+              return h.hexdigest()
+          def dl(page,landing,text,name,ds,role,coverage):
+              page.goto(landing,wait_until='domcontentloaded',timeout=120000)
+              a=page.locator('a').filter(has_text=text).first; a.wait_for(state='visible',timeout=120000)
+              with page.expect_download(timeout=180000) as di:a.click()
+              p=out/name; di.value.save_as(str(p)); head=p.read_bytes()[:16]
+              if p.stat().st_size<=0 or head.lstrip().lower().startswith((b'<html',b'<!doctype')):raise RuntimeError('bad payload '+name)
+              if p.suffix=='.zip':
+                  with zipfile.ZipFile(p) as z:
+                      if not z.infolist():raise RuntimeError('empty zip '+name)
+              m={'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP','dataset_id':ds,'provider_landing_url':landing,'public_ui_selector':{'visible_link_text':text},'time_coverage':coverage,'evidence_role':role,'retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'original_filename':name,'bytes':p.stat().st_size,'sha256':sha(p),'github_run_id':os.getenv('GITHUB_RUN_ID')}
+              (p.with_name(name+'.manifest.json')).write_text(json.dumps(m,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('LOCAL='+json.dumps({'dataset_id':ds,'filename':name,'bytes':m['bytes'],'sha256':m['sha256']},ensure_ascii=False))
+          with sync_playwright() as pw:
+              b=pw.chromium.launch(headless=True); c=b.new_context(accept_downloads=True)
+              dl(c.new_page(),'https://data.seoul.go.kr/dataList/OA-22521/F/1/datasetView.do','서울교통공사_수도권 도시철도 환승 데이터_20250317.csv','서울교통공사_수도권 도시철도 환승 데이터_20250317.csv','KR_SEOUL_METRO_DIRECTIONAL_TRANSFER_20250317','directional_car_door_transfer','2025-03-17 snapshot')
+              dl(c.new_page(),'https://data.seoul.go.kr/dataList/OA-21221/F/1/datasetView.do','kscc_dx_trnsf_path_sum_20260825.zip','kscc_dx_trnsf_path_sum_20260825.zip','KR_SEOUL_TRANSFER_OBSERVED_AGG_20260825','observed_transfer_count_time_aggregate','2026-08-25')
+              c.close(); b.close()
+          PY
+          copy_one() { local src="$1" dest="$2"; rclone copyto "$src" "$REMOTE_NAME:$ROOT_DRIVE/$dest" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1; local l r; l="$(stat -c '%s' "$src")"; r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$dest" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$l" = "$r"; }
+          copy_one "$OUT/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" "transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv"
+          copy_one "$OUT/kscc_dx_trnsf_path_sum_20260825.zip" "transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip"
+          for m in "$OUT"/*.manifest.json; do copy_one "$m" "99_manifests/$(basename "$m")"; done
+          echo FASTLANE_DURABLE_BYTES_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

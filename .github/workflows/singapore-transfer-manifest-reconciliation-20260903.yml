@@ -1,0 +1,66 @@
+name: Singapore Transfer Manifest Reconciliation 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/singapore-transfer-manifest-reconciliation-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      BASE_DRIVE: ResearchData/rail_transit/metro_transfer_time_benchmark/20260903/singapore_mrt
+      OUT_DRIVE: ResearchData/rail_transit/metro_transfer_time_benchmark/20260903/standardized_20260903
+    steps:
+      - name: Reconcile source workbook against manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check openpyxl
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          cd "$RUNNER_TEMP"
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/singapore_interchange_transfer_times_measured.xlsx" source.xlsx --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/manifest.json" manifest.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import openpyxl
+          m=json.loads(Path('manifest.json').read_text(encoding='utf-8'))
+          wb=openpyxl.load_workbook('source.xlsx',read_only=True,data_only=True)
+          ws=wb['Timing'] if 'Timing' in wb.sheetnames else wb[wb.sheetnames[0]]
+          rows=list(ws.iter_rows(values_only=True))
+          nonempty=[r for r in rows if any(x is not None and str(x).strip()!='' for x in r)]
+          header=[str(x).strip() if x is not None else '' for x in nonempty[0]]
+          idx={x:i for i,x in enumerate(header)}
+          col='Transfer time in seconds'
+          valid=0
+          if col in idx:
+              for r in nonempty[1:]:
+                  try: float(r[idx[col]]); valid+=1
+                  except: pass
+          declared=m.get('transfers_rows_including_header')
+          out={
+            'schema':'singapore-transfer-manifest-reconciliation.v1',
+            'dataset_id':m.get('dataset_id'),
+            'manifest_declared_rows_including_header':declared,
+            'worksheet_nonempty_rows_including_header':len(nonempty),
+            'worksheet_valid_numeric_transfer_rows':valid,
+            'consistent':declared==len(nonempty),
+            'decision':'SOURCE_MANIFEST_ROW_COUNT_CONFLICT' if declared!=len(nonempty) else 'ROW_COUNT_CONSISTENT',
+            'action':'Use workbook bytes as source data; preserve the manifest mismatch as provenance/data-governance evidence until source-side manifest is corrected. Do not alter source workbook rows to match the manifest.'
+          }
+          Path('singapore_transfer_manifest_reconciliation.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto singapore_transfer_manifest_reconciliation.json "$REMOTE_NAME:$OUT_DRIVE/singapore_transfer_manifest_reconciliation.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"

@@ -26,7 +26,7 @@ jobs:
           set -euo pipefail
           test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
-          python -m pip install --disable-pip-version-check requests beautifulsoup4 openpyxl
+          python -m pip install --disable-pip-version-check openpyxl
           CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
           printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
           REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
@@ -42,27 +42,23 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/seoul-p0b"
+          FILE_ID=15457
+          EXPECTED=BMS_20260830.zip
+          LANDING='https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20007'
+          URL="https://t-data.seoul.go.kr/dataprovide/download.do?id=$FILE_ID"
+          # FILE_ID=15457 <-> BMS_20260830.zip was resolved from the provider's public selector in the prior source-probe run.
+          curl -fL --retry 10 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+            -A 'quiet-window-public-data-worker/1.0' -e "$LANDING" "$URL" -o "$EXPECTED"
           python - <<'PY'
-          import requests, zipfile, hashlib, json, os
-          from bs4 import BeautifulSoup
+          import zipfile, hashlib, json, os
           from datetime import datetime, timezone
-          landing='https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20007'
-          file_id='15457'; expected='BMS_20260830.zip'
-          s=requests.Session(); s.headers['User-Agent']='quiet-window-public-data-worker/1.0'
-          r=s.get(landing,timeout=60); r.raise_for_status(); soup=BeautifulSoup(r.text,'html.parser')
-          opt=soup.select_one(f'#filedata_selectbox option[value="{file_id}"]')
-          if not opt or opt.get_text(strip=True)!=expected: raise RuntimeError('public selector changed for BMS_20260830.zip')
-          with s.get(f'https://t-data.seoul.go.kr/dataprovide/download.do?id={file_id}',headers={'Referer':landing},stream=True,timeout=(30,3600)) as q:
-              q.raise_for_status()
-              with open(expected,'wb') as f:
-                  for b in q.iter_content(8*1024*1024):
-                      if b:f.write(b)
+          expected='BMS_20260830.zip'
           with zipfile.ZipFile(expected) as z:
               if not z.infolist(): raise RuntimeError('empty BMS archive')
           h=hashlib.sha256()
           with open(expected,'rb') as f:
               for b in iter(lambda:f.read(8*1024*1024),b''):h.update(b)
-          m={'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP','dataset_id':'KR_SEOUL_TDATA_BMS_REFERENCE_20260830','provider_landing_url':landing,'public_download_id':file_id,'provider_package_label_date':'2026-08-30','target_business_date':'2026-08-29','retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'original_filename':expected,'bytes':os.path.getsize(expected),'sha256':h.hexdigest(),'github_run_id':os.getenv('GITHUB_RUN_ID')}
+          m={'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP','dataset_id':'KR_SEOUL_TDATA_BMS_REFERENCE_20260830','provider_landing_url':'https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id=20007','public_download_id':'15457','public_id_resolution':'audited public selector from source-probe run','provider_package_label_date':'2026-08-30','target_business_date':'2026-08-29','retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'original_filename':expected,'bytes':os.path.getsize(expected),'sha256':h.hexdigest(),'github_run_id':os.getenv('GITHUB_RUN_ID')}
           open(expected+'.manifest.json','w',encoding='utf-8').write(json.dumps(m,ensure_ascii=False,indent=2))
           print(json.dumps({'filename':expected,'bytes':m['bytes'],'sha256':m['sha256']},ensure_ascii=False))
           PY
@@ -92,7 +88,8 @@ jobs:
           for ws in wb.worksheets:
               for ridx,row in enumerate(ws.iter_rows(values_only=True),start=1):
                   vals=['' if v is None else str(v).strip() for v in row]
-                  if any(v in observed_modes for v in vals) or any(k in ' | '.join(vals) for k in ('교통수단','지하철','철도','도시철도')):
+                  joined=' | '.join(vals)
+                  if any(v in observed_modes for v in vals) or any(k in joined for k in ('교통수단','지하철','철도','도시철도')):
                       code_matches.append({'sheet':ws.title,'row':ridx,'values':vals[:20]})
 
           with zipfile.ZipFile('TAIMS_20260902.zip') as z:
@@ -119,7 +116,7 @@ jobs:
 
           out={'schema':'mppd-n1-seoul-p0b-schema-match-v1','target_passenger_business_date':'2026-08-29','dx_fields':dx_fields,'dv_summary':dv_summary,'observed_mode_code_rows':code_matches,'bms_20260830':bms,'same_business_date_by_member_stamp':bms['date_counts']=={'260829':bms['members']}}
           open('seoul_p0b_schema_match_20260903.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
-          print('P0B_CONCISE='+json.dumps({'dx_fields':dx_fields,'dv_fields':dv_fields,'mode_code_rows':code_matches,'bms_members':bms['members'],'bms_stamp_min':bms['stamp_min'],'bms_stamp_max':bms['stamp_max'],'bms_date_counts':bms['date_counts'],'bms_header':first_header,'same_business_date_by_member_stamp':out['same_business_date_by_member_stamp']},ensure_ascii=False))
+          print('P0B_CONCISE='+json.dumps({'dx_fields':dx_fields,'dv_fields':dv_fields,'dv_unique_counts':dv_summary['unique_counts_capped'],'mode_code_rows':code_matches,'bms_members':bms['members'],'bms_stamp_min':bms['stamp_min'],'bms_stamp_max':bms['stamp_max'],'bms_date_counts':bms['date_counts'],'bms_header':first_header,'same_business_date_by_member_stamp':out['same_business_date_by_member_stamp']},ensure_ascii=False))
           PY
 
       - name: Store matched service and P0B profile

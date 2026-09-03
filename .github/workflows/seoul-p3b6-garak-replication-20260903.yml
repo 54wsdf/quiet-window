@@ -1,0 +1,229 @@
+name: Seoul P3B6 Garak Market Replication 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b6-garak-replication-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replicate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b6"; cd "$RUNNER_TEMP/p3b6"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Replicate service-chain and transfer-gate effect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b6"
+          python - <<'PY'
+          import csv,io,json,math,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          IN_LINE='1008'; OUT_LINE='1003'; IN_TRANSFER='1008000817'; OUT_TRANSFER='1003000350'; PHYSICAL=89
+          GUARDS=[0,60,120]
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a); return b[round((len(b)-1)*p)]
+          def summ(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def minute_index(t): return t.hour*60+t.minute
+          def tv(a,b):
+              keys=set(a)|set(b); sa=sum(a.values()); sb=sum(b.values())
+              return .5*sum(abs(a.get(k,0)/sa-b.get(k,0)/sb) for k in keys) if sa and sb else None
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          names={x['service_statn_id']:x.get('dv_name') for x in p1c['canonical_entries'] if x.get('service_statn_id')}
+
+          # Fresh paired operational-status events, grouped into realized same-public-train-number station trajectories.
+          trains=defaultdict(lambda:defaultdict(list)); event_rows=0
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip(); st=(row.get('statn_id') or '').strip(); a=dt(row.get('arrival_detect_time')); d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:
+                      trains[(line,tr)][st].append((a,d)); event_rows+=1
+          for k in trains:
+              for st in trains[k]: trains[k][st]=sorted(set(trains[k][st]))
+
+          inbound=defaultdict(list); outbound=defaultdict(list); in_transfer_trains=set(); out_transfer_trains=set()
+          for (line,tr),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  in_transfer_trains.add(tr)
+                  for ta,td in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          for oa,od in evs:
+                              if od<ta and 0<(ta-od).total_seconds()<=7200:
+                                  inbound[os].append((od,ta,tr)); break
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  out_transfer_trains.add(tr)
+                  for ta,td in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          for da,dd in evs:
+                              if da>td and 0<(da-td).total_seconds()<=7200:
+                                  outbound[ds].append((td,da,tr)); break
+          for st in inbound: inbound[st]=sorted(set(inbound[st]))
+          for st in outbound: outbound[st]=sorted(set(outbound[st]))
+
+          # Passenger candidate population: structurally unique direct 8->3 interchange at Garak Market.
+          passengers=[]; funnel=Counter()
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL: continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID'))); b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a['service_subway_id']!=IN_LINE or b['service_subway_id']!=OUT_LINE: continue
+                  t0=dt(row.get('RIDE_DTM')); t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and (t0.hour==7 or (t0.hour==8 and t0.minute<30))): continue
+                  funnel['am_candidate']+=1
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800: continue
+                  funnel['valid_time']+=1
+                  os=a['service_statn_id']; ds=b['service_statn_id']
+                  if os in inbound: funnel['origin_segment_supported']+=1
+                  if ds in outbound: funnel['destination_segment_supported']+=1
+                  if os in inbound and ds in outbound:
+                      funnel['both_segments_supported']+=1
+                      passengers.append((t0,t1,os,ds))
+              f.close()
+
+          support_share=funnel['both_segments_supported']/funnel['valid_time'] if funnel['valid_time'] else 0
+          support_pass=bool(funnel['valid_time']>=500 and support_share>=0.70)
+
+          def select(p,guard,transfer):
+              t0,t1,os,ds=p
+              ins=[x for x in inbound[os] if x[0]>=t0+timedelta(seconds=guard)]
+              if not ins:return None
+              idep,iarr,itr=min(ins,key=lambda x:(x[1],x[0],x[2]))
+              outs=[x for x in outbound[ds] if x[0]>=iarr+timedelta(seconds=transfer)]
+              if not outs:return None
+              odep,darr,otr=min(outs,key=lambda x:(x[1],x[0],x[2]))
+              return {'idep':idep,'iarr':iarr,'itrain':itr,'odep':odep,'darr':darr,'otrain':otr,'exit_compatible':darr<=t1+timedelta(seconds=59)}
+
+          comparisons={}; scenario={}; bydest_primary=defaultdict(list)
+          for g in GUARDS:
+              base=[]; alt=[]
+              for p in passengers:
+                  base.append(select(p,g,0)); alt.append(select(p,g,PHYSICAL))
+              bchain=sum(x is not None for x in base); achain=sum(x is not None for x in alt)
+              both=0; lost=0; changed=0; minute_changed=0; added=[]; dep_shift=[]; monotonic=0; exit0=0; exitp=0; wait0=[]; waitp=[]
+              bh=Counter(); ah=Counter()
+              for p,b,a in zip(passengers,base,alt):
+                  if b is not None:
+                      exit0+=int(b['exit_compatible']); wait0.append((b['odep']-b['iarr']).total_seconds()); bh[minute_index(b['darr'])]+=1
+                  if a is not None:
+                      exitp+=int(a['exit_compatible']); waitp.append((a['odep']-a['iarr']).total_seconds()); ah[minute_index(a['darr'])]+=1
+                  if b is None: continue
+                  if a is None: lost+=1; continue
+                  both+=1
+                  c=(b['otrain'],b['odep'])!=(a['otrain'],a['odep']); changed+=int(c)
+                  minute_changed+=int(b['darr'].strftime('%H:%M')!=a['darr'].strftime('%H:%M'))
+                  da=(a['darr']-b['darr']).total_seconds(); added.append(da); dep_shift.append((a['odep']-b['odep']).total_seconds()); monotonic+=int(da<0)
+                  if g==60: bydest_primary[p[3]].append((b,a,c,da))
+              comparisons[str(g)]={
+                'baseline_chain_rows':bchain,'physical_chain_rows':achain,'both_chain_rows':both,'lost_chain_rows':lost,
+                'outgoing_service_changed_rows':changed,'outgoing_service_changed_share':changed/both if both else None,
+                'destination_arrival_minute_changed_share':minute_changed/both if both else None,
+                'added_destination_arrival_sec':summ(added),'outgoing_departure_shift_sec':summ(dep_shift),
+                'minute_distribution_total_variation':tv(bh,ah),'monotonicity_violation_rows':monotonic,
+                'baseline_transfer_wait_sec':summ(wait0),'physical_transfer_wait_sec':summ(waitp),
+                'baseline_exit_time_compatible_share':exit0/bchain if bchain else None,'physical_exit_time_compatible_share':exitp/achain if achain else None
+              }
+
+          robust=[]
+          for ds,rows in bydest_primary.items():
+              if len(rows)<50:continue
+              bh=Counter(minute_index(x[0]['darr']) for x in rows); ah=Counter(minute_index(x[1]['darr']) for x in rows)
+              adds=[x[3] for x in rows]; changed=sum(x[2] for x in rows)/len(rows)
+              robust.append({'destination_service_station_id':ds,'destination_name':names.get(ds),'rows':len(rows),'service_changed_share':changed,'added_arrival_sec_median':q(adds,.5),'minute_distribution_total_variation':tv(bh,ah)})
+          robust.sort(key=lambda x:x['rows'],reverse=True)
+
+          primary=comparisons['60']; effect=primary['outgoing_service_changed_share'] or 0
+          if not support_pass: decision='SECOND_INTERCHANGE_REPLICATION_SUPPORT_FAIL'
+          elif primary['monotonicity_violation_rows']!=0: decision='SECOND_INTERCHANGE_REPLICATION_METHOD_FAIL_NONMONOTONE'
+          elif effect>=0.20: decision='SECOND_INTERCHANGE_REPLICATION_PASS_MATERIAL_TRANSFER_GATE_EFFECT'
+          elif effect>=0.05: decision='SECOND_INTERCHANGE_REPLICATION_PASS_BOUNDED_TRANSFER_GATE_EFFECT'
+          else: decision='SECOND_INTERCHANGE_REPLICATION_WEAK_EFFECT'
+
+          result={
+            'schema':'mppd-n1-seoul-p3b6-garak-replication-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'candidate':{'incoming_line':'1008','outgoing_line':'1003','station_ko':'가락시장','station_en':'Garak Market','incoming_transfer_station_id':IN_TRANSFER,'outgoing_transfer_station_id':OUT_TRANSFER,'physical_shortest_transfer_sec':PHYSICAL},
+            'analysis_window':'AFC entry 2026-08-29 07:00-08:29; service events 07:00-10:00',
+            'service_event_rows_on_two_lines':event_rows,'incoming_transfer_unique_trains':len(in_transfer_trains),'outgoing_transfer_unique_trains':len(out_transfer_trains),'origin_stations_with_same_train_path_to_transfer':len(inbound),'destination_stations_with_same_train_path_from_transfer':len(outbound),
+            'passenger_funnel':dict(funnel),'both_segment_support_share':support_share,'same_train_segment_support_pass':support_pass,
+            'entry_guard_sensitivity_0_60_120_sec':comparisons,'primary_guard_sec':60,'primary_transfer_constraint_sec':PHYSICAL,
+            'robust_destination_profiles_ge50':robust,'decision':decision,
+            'scientific_interpretation':'This same-city second-interchange replication repeats the Jamsil evidence contract on a different interchange and outgoing line. It tests whether an independently sourced physical transfer-time lower bound changes destination-best realized service opportunities under a structurally unique direct-interchange candidate population.',
+            'evidence_boundary':['The structurally unique line-pair interchange is not individually observed route choice.','Same-public-train-number service segments are realized service support, not passenger-to-train assignment.','The 89-second value is a physical shortest-transfer lower bound, not an empirical walking-time distribution.','Public AFC times are minute-quantized.','No T6 observed train-to-train genealogy claim.']
+          }
+          Path('seoul_p3b6_garak_replication_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B6_CONCISE='+json.dumps({'funnel':dict(funnel),'support_share':support_share,'support_pass':support_pass,'primary':primary,'guards':comparisons,'robust':robust[:10],'decision':decision},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b6"
+          F=seoul_p3b6_garak_replication_20260903.json; D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')"; test "$L" = "$R"
+          echo SEOUL_P3B6_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,329 @@
+name: Seoul P0 Content Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p0-content-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare runtime and restore source files
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check openpyxl
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/seoul-p0"
+          cd "$RUNNER_TEMP/seoul-p0"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS_20260902.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260902/BMS_20260902.zip" BMS_20260902.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260902/subarr_20260902.zip" subarr_20260902.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/reference/tdata_code_table_10002.xlsx" tdata_code_table_10002.xlsx --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" transfer_directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" transfer_observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Profile schemas, dates, codes, station universes and service status
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, math, re, statistics, zipfile
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from openpyxl import load_workbook
+
+          ROOT=Path('.')
+
+          def detect_encoding(raw: bytes) -> str:
+              for enc in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:
+                      raw.decode(enc)
+                      return enc
+                  except UnicodeDecodeError:
+                      pass
+              return 'cp949'
+
+          def zip_member_reader(z: zipfile.ZipFile, name: str):
+              raw=z.open(name)
+              head=raw.read(65536)
+              enc=detect_encoding(head)
+              raw.close()
+              raw=z.open(name)
+              return io.TextIOWrapper(raw, encoding=enc, errors='replace', newline=''), enc
+
+          def parse_dt(s):
+              if not s: return None
+              s=str(s).strip().replace('-','').replace(':','').replace(' ','')
+              m=re.search(r'(20\d{12}|20\d{6})',s)
+              if m: return m.group(1)
+              return None
+
+          def minmax_add(cur, v):
+              if not v: return cur
+              a,b=cur
+              return (v if a is None or v<a else a, v if b is None or v>b else b)
+
+          def csv_header_from_zip(z,name):
+              f,enc=zip_member_reader(z,name)
+              try:
+                  r=csv.reader(f); row=next(r,[])
+                  return row,enc
+              finally: f.close()
+
+          # ---------- code table ----------
+          wb=load_workbook(ROOT/'tdata_code_table_10002.xlsx', read_only=True, data_only=True)
+          code={'sheets':[], 'keyword_rows':[]}
+          keywords=('교통수단','지하철','철도','도시철도','버스','TRNS_MNS','수단코드','사용자구분')
+          for ws in wb.worksheets:
+              code['sheets'].append({'title':ws.title,'max_row':ws.max_row,'max_column':ws.max_column})
+              for ridx,row in enumerate(ws.iter_rows(values_only=True),start=1):
+                  vals=['' if v is None else str(v).strip() for v in row]
+                  joined=' | '.join(vals)
+                  if any(k.lower() in joined.lower() for k in keywords):
+                      code['keyword_rows'].append({'sheet':ws.title,'row':ridx,'values':vals[:20]})
+          code['keyword_rows']=code['keyword_rows'][:500]
+
+          # ---------- TAIMS passenger + station support ----------
+          passenger={}
+          with zipfile.ZipFile(ROOT/'TAIMS_20260902.zip') as z:
+              names=z.namelist(); passenger['archive_members']=names
+              for target in ('VW_KSCC_DX_CARD.csv','VW_KSCC_DV_CARD.csv'):
+                  if target not in names: raise RuntimeError(f'missing {target}')
+              # Full transaction scan, aggregate only.
+              f,enc=zip_member_reader(z,'VW_KSCC_DX_CARD.csv')
+              r=csv.DictReader(f); fields=r.fieldnames or []
+              n=0; dates=Counter(); ride_mm=(None,None); alight_mm=(None,None)
+              modes=Counter(); ride_stops=set(); alight_stops=set(); trcr=set(); trnc=set(); trtr=Counter()
+              missing=Counter(); route_nonblank=0; psng_sum=0.0; psng_valid=0
+              interest=['STDR_DE','RIDE_DTM','ALGH_DTM','TRNS_MNS_CD','RIDE_BSST_ID','ALGH_BSST_ID','TRCR_ID','TRNC_ID','TRTR_FCNT','PSNG_NUM','ROUTE_ID']
+              for row in r:
+                  n+=1
+                  for k in interest:
+                      if not (row.get(k) or '').strip(): missing[k]+=1
+                  d=(row.get('STDR_DE') or '').strip()
+                  if d: dates[d]+=1
+                  ride_mm=minmax_add(ride_mm,parse_dt(row.get('RIDE_DTM')))
+                  alight_mm=minmax_add(alight_mm,parse_dt(row.get('ALGH_DTM')))
+                  m=(row.get('TRNS_MNS_CD') or '').strip()
+                  if m: modes[m]+=1
+                  a=(row.get('RIDE_BSST_ID') or '').strip(); b=(row.get('ALGH_BSST_ID') or '').strip()
+                  if a: ride_stops.add(a)
+                  if b: alight_stops.add(b)
+                  c=(row.get('TRCR_ID') or '').strip(); t=(row.get('TRNC_ID') or '').strip()
+                  if c: trcr.add(c)
+                  if t: trnc.add(t)
+                  tf=(row.get('TRTR_FCNT') or '').strip()
+                  if tf: trtr[tf]+=1
+                  if (row.get('ROUTE_ID') or '').strip(): route_nonblank+=1
+                  try:
+                      psng_sum+=float(row.get('PSNG_NUM') or 0); psng_valid+=1
+                  except ValueError: pass
+              f.close()
+              passenger['dx_card']={
+                  'encoding':enc,'fields':fields,'rows':n,'stdr_de_counts':dict(dates),
+                  'ride_dtm_minmax':ride_mm,'algh_dtm_minmax':alight_mm,
+                  'mode_counts':dict(modes),'ride_station_ids':len(ride_stops),'alight_station_ids':len(alight_stops),
+                  'unique_card_ids':len(trcr),'unique_transfer_process_ids':len(trnc),'transfer_count_values':dict(trtr),
+                  'route_id_nonblank_rows':route_nonblank,'passenger_count_sum':psng_sum,'passenger_count_parse_rows':psng_valid,
+                  'missing_counts':dict(missing),
+              }
+              # Station support table full scan.
+              f,enc=zip_member_reader(z,'VW_KSCC_DV_CARD.csv'); r=csv.DictReader(f); fields=r.fieldnames or []
+              n=0; station_ids=set(); line_values=Counter(); name_values=set(); support_dates=Counter(); missing=Counter()
+              for row in r:
+                  n+=1
+                  for k in fields:
+                      if not (row.get(k) or '').strip(): missing[k]+=1
+                  for k in ('BSST_ID','STTN_ID','STATN_ID','BLDN_ID'):
+                      v=(row.get(k) or '').strip()
+                      if v: station_ids.add(v)
+                  for k in ('LINE_CN','LINE_NM','ROUTE','SUBWAY_NM'):
+                      v=(row.get(k) or '').strip()
+                      if v: line_values[v]+=1
+                  for k in ('BSST_NM','STTN_NM','STATN_NM','BLDN_NM'):
+                      v=(row.get(k) or '').strip()
+                      if v: name_values.add(v)
+                  for k in ('STDR_DE','USE_DE','OPEN_DE','CLSD_DE'):
+                      v=(row.get(k) or '').strip()
+                      if v: support_dates[v]+=1
+              f.close()
+              passenger['dv_card']={'encoding':enc,'fields':fields,'rows':n,'station_ids_detected':len(station_ids),'station_names_detected':len(name_values),'line_value_counts':dict(line_values),'date_like_value_counts_top':dict(support_dates.most_common(50)),'missing_counts':dict(missing)}
+
+          # ---------- service package: member coverage + deterministic row samples ----------
+          service={}
+          ts_re=re.compile(r'subarr_(\d{12})')
+          with zipfile.ZipFile(ROOT/'BMS_20260902.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              stamps=[]
+              for x in infos:
+                  m=ts_re.search(x.filename)
+                  if m: stamps.append(m.group(1))
+              service['bms_archive']={'members':len(infos),'member_stamp_min':min(stamps) if stamps else None,'member_stamp_max':max(stamps) if stamps else None,'member_date_counts':dict(Counter(s[:6] for s in stamps))}
+              # evenly sample up to 48 shards plus first/last; aggregate rows only
+              if infos:
+                  idx=sorted(set([0,len(infos)-1]+[round(i*(len(infos)-1)/47) for i in range(48)]))
+              else: idx=[]
+              sample_infos=[infos[i] for i in idx]
+              s_rows=0; fields_union=[]; fields_seen=set(); rec_mm=(None,None); arvl=Counter(); lines=Counter(); dirs=Counter(); stations=set(); trains=set(); missing=Counter(); shard_stats=[]
+              for inf in sample_infos:
+                  f,enc=zip_member_reader(z,inf.filename); r=csv.DictReader(f); fields=r.fieldnames or []
+                  for fld in fields:
+                      if fld not in fields_seen: fields_seen.add(fld); fields_union.append(fld)
+                  local_n=0; local_mm=(None,None)
+                  for row in r:
+                      local_n+=1; s_rows+=1
+                      rec=parse_dt(row.get('RECPTN_DT')); rec_mm=minmax_add(rec_mm,rec); local_mm=minmax_add(local_mm,rec)
+                      v=(row.get('ARVL_CD') or '').strip();
+                      if v: arvl[v]+=1
+                      for k in ('SUBWAY_ID','SUBWAY_CD','TRAIN_LINE'):
+                          v=(row.get(k) or '').strip()
+                          if v: lines[f'{k}:{v}']+=1
+                      v=(row.get('UPDN_LINE') or '').strip()
+                      if v: dirs[v]+=1
+                      for k in ('STATN_ID','STATN_NM'):
+                          v=(row.get(k) or '').strip()
+                          if v: stations.add(f'{k}:{v}')
+                      v=(row.get('BTRAIN_NO') or '').strip()
+                      if v: trains.add(v)
+                      for k in ('RECPTN_DT','ARVL_CD','STATN_ID','STATN_NM','BTRAIN_NO','UPDN_LINE'):
+                          if not (row.get(k) or '').strip(): missing[k]+=1
+                  f.close(); shard_stats.append({'member':inf.filename,'rows':local_n,'recptn_dt_minmax':local_mm,'encoding':enc})
+              service['bms_sample_profile']={'sampled_shards':len(sample_infos),'sampled_rows':s_rows,'fields':fields_union,'recptn_dt_minmax':rec_mm,'arvl_cd_counts':dict(arvl),'line_counts_top':dict(lines.most_common(100)),'direction_counts':dict(dirs),'station_tokens':len(stations),'train_ids':len(trains),'missing_counts':dict(missing),'shard_stats':shard_stats}
+          with zipfile.ZipFile(ROOT/'subarr_20260902.zip') as z:
+              infos=[x for x in z.infolist() if not x.is_dir()]
+              stamps=[]
+              for x in infos:
+                  m=ts_re.search(x.filename)
+                  if m: stamps.append(m.group(1))
+              service['subarr_archive']={'members':len(infos),'member_stamp_min':min(stamps) if stamps else None,'member_stamp_max':max(stamps) if stamps else None,'member_date_counts':dict(Counter(s[:6] for s in stamps))}
+
+          # ---------- directional transfer ----------
+          raw=(ROOT/'transfer_directional.csv').read_bytes(); enc=detect_encoding(raw[:65536]); text=io.StringIO(raw.decode(enc,errors='replace'))
+          r=csv.DictReader(text); fields=r.fieldnames or []; n=0; stations=set(); start_lines=Counter(); dest_lines=Counter(); durations=[]; missing=Counter(); car_door_rows=0
+          duration_keys=[k for k in fields if any(x in k for x in ('시간','소요','time','TIME'))]
+          for row in r:
+              n+=1
+              vals={k:(row.get(k) or '').strip() for k in fields}
+              for k,v in vals.items():
+                  if not v: missing[k]+=1
+              for k in fields:
+                  if '역' in k and vals[k]: stations.add(vals[k])
+                  if '시작' in k and '호선' in k and vals[k]: start_lines[vals[k]]+=1
+                  if ('종료' in k or '도착' in k) and '호선' in k and vals[k]: dest_lines[vals[k]]+=1
+              if sum(bool(vals[k]) for k in fields if ('칸' in k or '차량' in k or '문' in k or '도어' in k))>=2: car_door_rows+=1
+              for k in duration_keys:
+                  v=vals[k]
+                  m=re.fullmatch(r'(\d+):(\d+)',v)
+                  if m: durations.append(int(m.group(1))*60+int(m.group(2)))
+                  elif v:
+                      try: durations.append(float(v))
+                      except ValueError: pass
+          transfer={'directional':{'encoding':enc,'fields':fields,'rows':n,'stations_detected':len(stations),'start_line_counts':dict(start_lines),'destination_line_counts':dict(dest_lines),'car_door_detail_rows':car_door_rows,'duration_n':len(durations),'duration_min':min(durations) if durations else None,'duration_median':statistics.median(durations) if durations else None,'duration_max':max(durations) if durations else None,'missing_counts':dict(missing)}}
+
+          # ---------- observed transfer aggregate ----------
+          with zipfile.ZipFile(ROOT/'transfer_observed.zip') as z:
+              names=[n for n in z.namelist() if n.lower().endswith('.csv')]; name=names[0]
+              f,enc=zip_member_reader(z,name); r=csv.DictReader(f); fields=r.fieldnames or []; n=0; dates=Counter(); stations=set(); user_types=Counter(); numeric_summary={}; missing=Counter()
+              nums={k:[] for k in fields if any(x in k.lower() for x in ('time','tm','cnt','count','인원','시간','환승'))}
+              for row in r:
+                  n+=1
+                  for k in fields:
+                      v=(row.get(k) or '').strip()
+                      if not v: missing[k]+=1
+                      if any(x in k for x in ('기준일','일자','DATE','DE')) and v: dates[v]+=1
+                      if any(x in k for x in ('정류장','역','STTN','BSST')) and v: stations.add(v)
+                      if any(x in k for x in ('사용자','USER')) and v: user_types[v]+=1
+                  for k in nums:
+                      v=(row.get(k) or '').strip()
+                      try:
+                          x=float(v); nums[k].append(x)
+                      except ValueError: pass
+              f.close()
+              for k,a in nums.items():
+                  if a: numeric_summary[k]={'n':len(a),'min':min(a),'median':statistics.median(a),'max':max(a)}
+              transfer['observed_aggregate']={'encoding':enc,'member':name,'fields':fields,'rows':n,'date_counts':dict(dates),'station_tokens':len(stations),'user_type_counts':dict(user_types),'numeric_summary':numeric_summary,'missing_counts':dict(missing)}
+
+          # ---------- integrated P0 gate ----------
+          dx=passenger['dx_card']; bp=service['bms_sample_profile']; ba=service['bms_archive']; sa=service['subarr_archive']
+          out={
+            'schema':'mppd-n1-seoul-p0-profile-v1',
+            'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'source_state':'PUBLIC_FILES_ALREADY_ACQUIRED_IN_DURABLE_STORAGE',
+            'passenger':passenger,
+            'service':service,
+            'code_table':code,
+            'transfer':transfer,
+            'qualification':{
+              'passenger_row_level_profile_complete':True,
+              'service_member_coverage_complete':True,
+              'service_row_profile_basis':'deterministic_even_shard_sample_not_full_row_scan',
+              'bms_subarr_member_stamp_agreement': ba.get('member_stamp_min')==sa.get('member_stamp_min') and ba.get('member_stamp_max')==sa.get('member_stamp_max') and ba.get('members')==sa.get('members'),
+              'passenger_dates':sorted(dx.get('stdr_de_counts',{})),
+              'passenger_ride_minmax':dx.get('ride_dtm_minmax'),
+              'passenger_alight_minmax':dx.get('algh_dtm_minmax'),
+              'service_member_stamp_minmax':[ba.get('member_stamp_min'),ba.get('member_stamp_max')],
+              'service_sample_recptn_dt_minmax':bp.get('recptn_dt_minmax'),
+              'same_date_overlap_not_yet_asserted':True,
+              'rail_mode_code_decision_pending_code_table_interpretation':True,
+              'station_crosswalk_pending':True,
+              't5_pass':False,
+              't6_observed_genealogy':False,
+            }
+          }
+          Path('seoul_p0_profile_20260903.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          concise={
+            'dx_rows':dx['rows'],'dx_dates':sorted(dx['stdr_de_counts']),'dx_ride_minmax':dx['ride_dtm_minmax'],'dx_alight_minmax':dx['algh_dtm_minmax'],'dx_mode_counts':dx['mode_counts'],
+            'dv_rows':passenger['dv_card']['rows'],'dv_station_ids':passenger['dv_card']['station_ids_detected'],
+            'bms_members':ba['members'],'bms_member_minmax':[ba['member_stamp_min'],ba['member_stamp_max']],'bms_member_dates':ba['member_date_counts'],
+            'bms_sample_rows':bp['sampled_rows'],'bms_recptn_minmax':bp['recptn_dt_minmax'],'arvl_cd_counts':bp['arvl_cd_counts'],'sample_train_ids':bp['train_ids'],
+            'subarr_members':sa['members'],'subarr_member_minmax':[sa['member_stamp_min'],sa['member_stamp_max']],
+            'code_keyword_rows':len(code['keyword_rows']),
+            'directional_transfer_rows':transfer['directional']['rows'],'directional_duration_n':transfer['directional']['duration_n'],
+            'observed_transfer_rows':transfer['observed_aggregate']['rows'],
+          }
+          print('P0_CONCISE='+json.dumps(concise,ensure_ascii=False))
+          PY
+
+      - name: Store P0 profile and verify durable bytes
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/seoul-p0"
+          F=seoul_p0_profile_20260903.json
+          DEST="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$DEST" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")"; R="$(rclone size "$DEST" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+          echo "SEOUL_P0_PROFILE_DURABLE_PASS bytes=$L"
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,153 @@
+name: Seoul P2A8 Line-Aware Transfer Calibration 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a8-line-aware-transfer-calibration-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a8"; cd "$RUNNER_TEMP/p2a8"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build strict station-line-pair calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a8"
+          python - <<'PY'
+          import csv,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+          RID=re.compile(r'^\d{4}$')
+          PREFIX_LINE={
+            '01':'1','02':'2','03':'3','04':'4','25':'5','26':'6','27':'7','28':'8','41':'9',
+            '42':'공항철도','43':'신분당선','44':'신림선','47':'우이신설경전철'
+          }
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def num(v):
+              try:return float(str(v or '').replace(',','').strip())
+              except:return None
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s);s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def dur(v):
+              s=str(v or '').strip();m=re.fullmatch(r'(\d+):(\d{1,2})',s)
+              if m:return int(m.group(1))*60+int(m.group(2))
+              return num(s)
+          def wq(vals,q):
+              a=sorted((float(v),float(w)) for v,w in vals if v is not None and w and w>0 and math.isfinite(float(v)))
+              if not a:return None
+              t=sum(w for _,w in a);target=t*q;c=0
+              for v,w in a:
+                  c+=w
+                  if c>=target:return v
+              return a[-1][0]
+
+          idname={}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  sid=(row.get('OUT_STN_NUM') or '').strip();nm=(row.get('STN_KR_NM') or '').strip()
+                  if RID.fullmatch(sid) and nm:idname[sid]=nm
+              f.close()
+
+          # Exact static direction key: normalized station movement + exact line direction.
+          raw=Path('directional.csv').read_bytes();enc=detect(raw[:262144]);r=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace')));F=r.fieldnames or []
+          static=defaultdict(list)
+          for row in r:
+              a=nn(row.get('환승시작역'));b=nn(row.get('환승종료역'));fl=(row.get('환승시작 호선') or '').strip();tl=(row.get('환승종료 호선') or '').strip();sec=dur(row.get('소요시간'))
+              if a and b and fl and tl and sec is not None:static[(a,b,fl,tl)].append(float(sec))
+
+          # Observed rail rows. Use only P1C-qualified high-confidence prefix->line identities.
+          agg=defaultdict(lambda:{'rows':0,'count':0.0,'tn':0.0,'tw':0.0,'hours':Counter(),'raw_pairs':set()})
+          rail_mass=resolved_mass=crossline_mass=0.0;rail_rows=resolved_rows=crossline_rows=0
+          prefix_pair_mass=Counter()
+          with zipfile.ZipFile('observed.zip') as z:
+              mem=[x for x in z.namelist() if x.lower().endswith('.csv')][0];f=zr(z,mem);r=csv.DictReader(f)
+              for row in r:
+                  a=(row.get('하차_정류장/역사_ID') or '').strip();b=(row.get('승차_정류장/역사_ID') or '').strip()
+                  if not(RID.fullmatch(a) and RID.fullmatch(b)):continue
+                  c=num(row.get('환승_수_합')) or 0.0;t=num(row.get('환승_시간_평균'));h=(row.get('시간대') or '').strip();rail_mass+=c;rail_rows+=1
+                  fl=PREFIX_LINE.get(a[:2]);tl=PREFIX_LINE.get(b[:2]);prefix_pair_mass[(a[:2],b[:2])]+=c
+                  na=idname.get(a);nb=idname.get(b)
+                  if not(fl and tl and na and nb):continue
+                  resolved_mass+=c;resolved_rows+=1
+                  if fl==tl:continue
+                  crossline_mass+=c;crossline_rows+=1
+                  k=(nn(na),nn(nb),fl,tl);x=agg[k];x['rows']+=1;x['count']+=c;x['raw_pairs'].add((a,b))
+                  if t is not None and c>0:x['tn']+=t*c;x['tw']+=c
+                  if h:x['hours'][h]+=c
+              f.close()
+
+          recs=[];matched_mass=ge_mass=0.0;ex=[];rat=[];obsq=[];shortq=[]
+          for (a,b,fl,tl),m in agg.items():
+              obs=m['tn']/m['tw'] if m['tw'] else None;secs=static.get((a,b,fl,tl),[]);mn=min(secs) if secs else None
+              z={'from_station_norm':a,'to_station_norm':b,'from_line':fl,'to_line':tl,'raw_code_pairs':sorted(f'{x}->{y}' for x,y in m['raw_pairs']),'observed_rows':m['rows'],'observed_transfer_count':m['count'],'observed_weighted_average_transfer_time_raw':obs,'top_hours':m['hours'].most_common(6),'static_candidate_rows':len(secs),'shortest_transfer_sec':mn,'static_duration_values_sec':sorted(set(secs))}
+              if mn is not None and obs is not None:
+                  z['observed_minus_shortest_raw']=obs-mn;z['observed_over_shortest_ratio']=obs/mn if mn>0 else None;matched_mass+=m['count'];obsq.append((obs,m['count']));shortq.append((mn,m['count']));ex.append((obs-mn,m['count']))
+                  if mn>0:rat.append((obs/mn,m['count']))
+                  if obs>=mn:ge_mass+=m['count']
+              recs.append(z)
+          recs.sort(key=lambda x:(-x['observed_transfer_count'],x['from_station_norm'],x['from_line'],x['to_line']));matched=[x for x in recs if x['shortest_transfer_sec'] is not None]
+          res={'schema':'mppd-n1-seoul-p2a8-line-aware-transfer-calibration-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'line_identity_contract':{'source':'P1C empirical OUT_STN_NUM-prefix line model learned from already resolved mappings','accepted_prefix_line_map':PREFIX_LINE,'boundary':'Only these high-confidence prefixes are used; unresolved prefixes are excluded rather than guessed.'},'coverage':{'all_rail_rows':rail_rows,'all_rail_transfer_mass':rail_mass,'line_resolved_rows':resolved_rows,'line_resolved_mass':resolved_mass,'line_resolved_mass_share':resolved_mass/rail_mass if rail_mass else None,'strict_crossline_rows':crossline_rows,'strict_crossline_mass':crossline_mass,'strict_crossline_mass_share_of_all_rail':crossline_mass/rail_mass if rail_mass else None,'strict_crossline_station_line_pairs':len(agg),'matched_station_line_pairs':len(matched),'matched_transfer_mass':matched_mass,'matched_mass_share_of_crossline_resolved':matched_mass/crossline_mass if crossline_mass else None,'observed_ge_shortest_mass_share':ge_mass/matched_mass if matched_mass else None},'calibration':{'observed_raw_p50':wq(obsq,.5),'observed_raw_p90':wq(obsq,.9),'shortest_sec_p50':wq(shortq,.5),'shortest_sec_p90':wq(shortq,.9),'excess_raw_p50':wq(ex,.5),'excess_raw_p90':wq(ex,.9),'ratio_p50':wq(rat,.5),'ratio_p90':wq(rat,.9)},'top_matched':matched[:150],'top_unmatched':[x for x in recs if x['shortest_transfer_sec'] is None][:100],'top_unresolved_prefix_pairs':[{ 'from_prefix':a,'to_prefix':b,'mass':m} for (a,b),m in prefix_pair_mass.most_common(50)],'interpretation':{'primary':'This is the first strict station x inferred-line-pair comparison. It avoids P2A7 mixing multiple line pairs under one station name.','unit_test':'If the observed numeric time is consistently comparable to the static MM:SS-derived seconds under this strict matching, that supports—but does not replace provider documentation for—the seconds interpretation.','scientific_role':'The difference between observed transfer-process time and shortest physical transfer duration is a candidate empirical transfer-delay kernel for minute-scale Seoul passenger-wave experiments.'},'evidence_boundary':['Prefix-derived line identity is retained only for P1C-qualified prefixes.','Aggregate transfer rows do not reveal individual passenger train ancestry.','Observed transfer-process time is not assumed to be pure walking time.','T6 observed genealogy remains unsupported.']}
+          Path('seoul_p2a8_line_aware_transfer_calibration_20260903.json').write_text(json.dumps(res,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('seoul_p2a8_matched_station_line_pairs_20260903.csv','w',encoding='utf-8',newline='') as f:
+              cols=['from_station_norm','to_station_norm','from_line','to_line','observed_transfer_count','observed_weighted_average_transfer_time_raw','shortest_transfer_sec','observed_minus_shortest_raw','observed_over_shortest_ratio'];w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
+              for x in matched:w.writerow({k:x.get(k) for k in cols})
+          print('P2A8_CONCISE='+json.dumps({'coverage':res['coverage'],'calibration':res['calibration'],'top_matched':matched[:15]},ensure_ascii=False))
+          PY
+
+      - name: Store outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a8"
+          for F in seoul_p2a8_line_aware_transfer_calibration_20260903.json seoul_p2a8_matched_station_line_pairs_20260903.csv; do
+            D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F";rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          done
+          echo SEOUL_P2A8_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -35,9 +35,9 @@ jobs:
           rclone copyto "$REMOTE_NAME:$BASE_DRIVE/gated_entries_historical/GSE_by_year.zip" GSE_by_year.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copyto "$REMOTE_NAME:$BASE_DRIVE/rapid_transit_events_2020/Events_2020.zip" Events_2020.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copyto "$REMOTE_NAME:$BASE_DRIVE/gtfs_2020_archive_probe/stops.parquet" stops.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
-          mkdir -p gse events
-          7z x -y GSE_by_year.zip -ogse '*GSE_2020.csv' >/tmp/7z-gse.log
+          mkdir -p events
           7z x -y Events_2020.zip -oevents '*.csv' >/tmp/7z-events.log
+          find events -type f -name '*.csv' -printf '%f\t%s\n' | sort | head -20
 
       - name: Build aggregate demand-realized-service matched panel
         shell: bash
@@ -46,14 +46,22 @@ jobs:
           cd "$RUNNER_TEMP"
           python - <<'PY'
           from __future__ import annotations
-          import json, math, re, statistics
+          import json, zipfile
           from pathlib import Path
           import duckdb, pandas as pd, pyarrow.parquet as pq
 
-          con=duckdb.connect(database=':memory:')
-          gse=str(next(Path('gse').rglob('*GSE_2020.csv')))
+          with zipfile.ZipFile('GSE_by_year.zip') as z:
+              candidates=[n for n in z.namelist() if n.endswith('GSE_2020.csv')]
+              if len(candidates)!=1:
+                  raise SystemExit(f'Expected exactly one GSE_2020.csv member, found {candidates}')
+              z.extract(candidates[0], 'gse_extract')
+              gse=str(Path('gse_extract')/candidates[0])
+
+          event_files=sorted(Path('events').rglob('*.csv'))
+          if not event_files: raise SystemExit('No realized-event CSVs extracted')
           event_glob=str(Path('events')/'**'/'*.csv')
-          # Historical stop IDs may repeat across feed versions. Only unique child->parent mappings are used.
+          con=duckdb.connect(database=':memory:')
+
           stops=pq.read_table('stops.parquet').to_pandas()
           sm=stops[['stop_id','parent_station']].dropna().astype(str)
           sm=sm[(sm.stop_id!='') & (sm.parent_station!='')]
@@ -63,23 +71,19 @@ jobs:
           mapdf=pd.DataFrame({'stop_id':list(unique_map),'parent_station':[unique_map[k] for k in unique_map]})
           con.register('stop_map',mapdf)
 
-          # Load aggregate gated entries. time_period is explicitly parsed, not assumed by row order.
           con.execute("CREATE TABLE g AS SELECT * FROM read_csv_auto(?, header=true, all_varchar=false, sample_size=-1)",[gse])
           gcols=[x[0] for x in con.execute('DESCRIBE g').fetchall()]
           required={'service_date','time_period','stop_id','route_or_line','gated_entries'}
           if not required.issubset(gcols): raise SystemExit(f'GSE schema mismatch {gcols}')
           con.execute("""
             CREATE TABLE gd AS
-            SELECT CAST(service_date AS DATE) service_date,
-                   stop_id,
-                   route_or_line,
+            SELECT CAST(service_date AS DATE) service_date, stop_id, route_or_line,
                    CAST(gated_entries AS DOUBLE) gated_entries,
                    TRY_CAST(regexp_extract(time_period, '(\\d{2}):(\\d{2})', 1) AS INTEGER)*2
                      + CASE WHEN TRY_CAST(regexp_extract(time_period, '(\\d{2}):(\\d{2})', 2) AS INTEGER)>=30 THEN 1 ELSE 0 END AS halfhour
             FROM g
           """)
 
-          # Read realized event files and map detailed routes to the same service families used by GSE.
           con.execute(f"CREATE VIEW e0 AS SELECT * FROM read_csv_auto('{event_glob}', header=true, union_by_name=true, all_varchar=true, filename=true)")
           ecols=[x[0] for x in con.execute('DESCRIBE e0').fetchall()]
           need={'service_date','route_id','stop_id','event_type','event_time_sec'}
@@ -88,15 +92,13 @@ jobs:
             CREATE TABLE ed AS
             SELECT CAST(e.service_date AS DATE) service_date,
                    m.parent_station stop_id,
-                   CASE
-                     WHEN e.route_id='Red' THEN 'Red Line'
-                     WHEN e.route_id='Blue' THEN 'Blue Line'
-                     WHEN e.route_id='Orange' THEN 'Orange Line'
-                     WHEN starts_with(e.route_id,'Green-') THEN 'Green Line'
-                     ELSE NULL END route_or_line,
+                   CASE WHEN e.route_id='Red' THEN 'Red Line'
+                        WHEN e.route_id='Blue' THEN 'Blue Line'
+                        WHEN e.route_id='Orange' THEN 'Orange Line'
+                        WHEN starts_with(e.route_id,'Green-') THEN 'Green Line'
+                        ELSE NULL END route_or_line,
                    floor(TRY_CAST(e.event_time_sec AS DOUBLE)/1800)::INTEGER halfhour,
-                   e.event_type,
-                   TRY_CAST(e.event_time_sec AS DOUBLE) event_time_sec
+                   e.event_type, TRY_CAST(e.event_time_sec AS DOUBLE) event_time_sec
             FROM e0 e JOIN stop_map m USING(stop_id)
             WHERE e.event_type IN ('ARR','DEP')
               AND TRY_CAST(e.event_time_sec AS DOUBLE)>=0
@@ -109,7 +111,6 @@ jobs:
                    count(*) FILTER(WHERE event_type='ARR') arrivals
             FROM ed WHERE route_or_line IS NOT NULL GROUP BY ALL
           """)
-          # Realized headways, preserving route family and parent station.
           con.execute("""
             CREATE TABLE hw AS
             WITH d AS (
@@ -118,7 +119,6 @@ jobs:
               FROM ed WHERE event_type='DEP' AND route_or_line IS NOT NULL)
             SELECT * FROM d WHERE headway_sec>0 AND headway_sec<=7200
           """)
-
           con.execute("""
             CREATE TABLE panel AS
             SELECT gd.service_date,gd.stop_id,gd.route_or_line,gd.halfhour,gd.gated_entries,
@@ -147,7 +147,6 @@ jobs:
             SELECT service_date::VARCHAR service_date,stop_id,route_or_line,halfhour,gated_entries,departures,entry_per_departure_proxy
             FROM panel WHERE departures>0 ORDER BY entry_per_departure_proxy DESC NULLS LAST LIMIT 50
           """).fetchdf().to_dict('records')
-          # Each station-line-halfhour cell gets a historical median baseline; deviations create reusable demand/service mismatch scenarios.
           con.execute("""
             CREATE TABLE baseline AS SELECT stop_id,route_or_line,halfhour,
               median(gated_entries) base_entries,median(departures) base_departures
@@ -165,8 +164,9 @@ jobs:
           """).fetchdf().to_dict('records')
 
           out={
-            'schema':'mbta-2020-demand-service-pressure.v1','dataset_id':'US_BOS_MBTA_2020_THREE_SOURCE_PROFILE',
+            'schema':'mbta-2020-demand-service-pressure.v2','dataset_id':'US_BOS_MBTA_2020_THREE_SOURCE_PROFILE',
             'evidence_class':'SAME_YEAR_AGGREGATE_ENTRY_DEMAND_PLUS_DIRECT_REALIZED_SERVICE_EVENTS',
+            'source_member':candidates[0],'event_csv_count':len(event_files),
             'panel':{'rows':int(summary[0]),'gated_entry_mass':float(summary[1] or 0),'rows_with_realized_departures':int(summary[2]),'gated_mass_with_realized_departures':float(summary[3] or 0),'matched_mass_share':float((summary[3] or 0)/(summary[1] or 1)),'positive_demand_no_departure_rows':int(summary[4]),'positive_demand_no_departure_mass':float(summary[5] or 0),'entry_per_departure_proxy':{'median':summary[6],'p90':summary[7],'p99':summary[8],'max':summary[9]}},
             'realized_departure_headway_sec':{'n':int(hw[0]),'median':hw[1],'p90':hw[2],'p99':hw[3],'max_capped_at_7200':hw[4]},
             'by_line':byline,'top_pressure_cells':top,'large_demand_ratio_cells':mismatch,
@@ -175,7 +175,6 @@ jobs:
             'claim_boundary':'The sources share service year/date and support repeated demand-versus-realized-service opportunity analysis. GSE is aggregate entry demand, so individual pulse genealogy and catch/miss are not observed.'
           }
           Path('mbta_2020_demand_service_pressure.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
-          # Safe public panel: aggregate station-line-halfhour only.
           con.execute("COPY panel TO 'mbta_2020_station_line_halfhour_panel.csv.gz' (HEADER, COMPRESSION GZIP)")
           print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
           PY

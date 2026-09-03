@@ -1,0 +1,140 @@
+name: Seoul P1D0 AM Event Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p1d0-am-event-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore BMS 20260830
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p1d0"; cd "$RUNNER_TEMP/p1d0"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Reconstruct 07:00 to 10:00 direct states
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1d0"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def h(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def parse(s):
+              d=''.join(x for x in str(s or '') if x.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except ValueError:return None
+          def qs(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'p10':q(.1),'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          pat=re.compile(r'subarr_(260829(\d{6}))')
+          with zipfile.ZipFile('BMS.zip') as z:
+              all_infos=[x for x in z.infolist() if not x.is_dir()]
+              infos=[]; shard_times=[]
+              for x in all_infos:
+                  m=pat.search(x.filename)
+                  if not m:continue
+                  hhmmss=m.group(2)
+                  if '070000'<=hhmmss<'100000':
+                      infos.append(x);shard_times.append(datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S'))
+              shard_times.sort(); gaps=[(b-a).total_seconds() for a,b in zip(shard_times,shard_times[1:])]
+              states=defaultdict(lambda:{'0':[],'1':[],'2':[],'name':Counter(),'line':Counter(),'updn':Counter()})
+              all_state=Counter();rows=0;direct=0;bad_time=0
+              for x in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[h(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      rows+=1
+                      state=(row.get('arvl_cd') or '').strip();all_state[state]+=1
+                      if state not in {'0','1','2'}:continue
+                      t=parse(row.get('recptn_dt'))
+                      if not t:bad_time+=1;continue
+                      line=(row.get('subway_id') or '').strip();train=(row.get('btrain_no') or '').strip();station=(row.get('statn_id') or '').strip()
+                      if not (line and train and station):continue
+                      direct+=1;k=(line,train,station);states[k][state].append(t)
+                      nm=(row.get('statn_nm') or '').strip();up=(row.get('updn_line') or '').strip()
+                      if nm:states[k]['name'][nm]+=1
+                      if line:states[k]['line'][line]+=1
+                      if up:states[k]['updn'][up]+=1
+                  f.close()
+
+          presence=Counter();quality=Counter();dwell=[];enter_arr=[];order=Counter();repeats=[]
+          for k,x in states.items():
+              t0=sorted(x['0']);t1=sorted(x['1']);t2=sorted(x['2'])
+              if t0:presence['0']+=1
+              if t1:presence['1']+=1
+              if t2:presence['2']+=1
+              if t1 and t2:presence['1_and_2']+=1
+              enter=t0[0] if t0 else None;arr=t1[0] if t1 else None
+              dep=None
+              if t2:
+                  aft=[v for v in t2 if not arr or v>=arr]
+                  dep=aft[0] if aft else t2[0]
+              valid=not((enter and arr and enter>arr) or (arr and dep and arr>dep) or (enter and dep and enter>dep))
+              order['valid' if valid else 'invalid']+=1
+              if arr and dep:dwell.append((dep-arr).total_seconds())
+              if enter and arr and arr>=enter:enter_arr.append((arr-enter).total_seconds())
+              q='ARR_DEP' if arr and dep and valid else ('ARR' if arr else ('DEP' if dep else 'ENTER'))
+              quality[q]+=1
+              for s in ('0','1','2'):
+                  if len(x[s])>1:repeats.append((max(x[s])-min(x[s])).total_seconds())
+
+          plausible=[x for x in dwell if 0<=x<=300]
+          summary={'schema':'mppd-n1-seoul-p1d0-am-event-qualification-v1','window':'2026-08-29 07:00:00-10:00:00','archive_shards':len(infos),'poll_gap_sec':qs(gaps),'snapshot_rows':rows,'all_arvl_cd_counts':dict(all_state),'direct_rows':direct,'bad_direct_time_rows':bad_time,'train_station_keys':len(states),'state_presence':dict(presence),'quality_counts':dict(quality),'ordering':dict(order),'dwell_sec':qs(dwell),'plausible_0_300_dwell_share':len(plausible)/len(dwell) if dwell else None,'enter_to_arrival_sec':qs(enter_arr),'repeat_state_span_sec':qs(repeats),'evidence_class':'DIRECT_OPERATIONAL_STATUS_EVENT_CANDIDATE','qualification':{'direct_state_event_reconstruction_supported':bool(presence['1_and_2']>=100 and order['invalid']/max(1,sum(order.values()))<0.05 and len(plausible)/max(1,len(dwell))>=0.80),'t5_pass':False,'t6_observed_genealogy':False}}
+          Path('seoul_p1d0_am_event_qualification_20260903.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P1D0_CONCISE='+json.dumps(summary,ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p1d0"
+          F=seoul_p1d0_am_event_qualification_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P1D0_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,119 @@
+name: Seoul P2A5 Observed Transfer Schema Audit 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a5-observed-transfer-schema-audit-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore observed transfer data
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a5"; cd "$RUNNER_TEMP/p2a5"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Audit real header and categorical semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a5"
+          python - <<'PY'
+          import csv,io,json,zipfile,re
+          from collections import Counter
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+
+          def zr(z,n):
+              f=z.open(n); head=f.read(262144); f.close(); enc=detect(head)
+              return io.TextIOWrapper(z.open(n),encoding=enc,errors='replace',newline=''),enc
+
+          with zipfile.ZipFile('observed.zip') as z:
+              member=[x for x in z.namelist() if x.lower().endswith('.csv')][0]
+              f,enc=zr(z,member); r=csv.DictReader(f); fields=r.fieldnames or []
+              stats={k:{'nonblank':0,'top':Counter(),'distinct_capped':set()} for k in fields}
+              rows=0
+              for row in r:
+                  rows+=1
+                  for k in fields:
+                      v=(row.get(k) or '').strip()
+                      if not v: continue
+                      s=stats[k]; s['nonblank']+=1
+                      if len(s['top'])<5000 or v in s['top']: s['top'][v]+=1
+                      if len(s['distinct_capped'])<20000: s['distinct_capped'].add(v)
+              f.close()
+
+          field_profile={}
+          for k,s in stats.items():
+              field_profile[k]={
+                  'nonblank':s['nonblank'],
+                  'nonblank_share':s['nonblank']/rows if rows else None,
+                  'distinct_capped':len(s['distinct_capped']),
+                  'top_values':s['top'].most_common(30)
+              }
+
+          candidate_fields=[k for k in fields if any(tok in k for tok in ('교통','수단','구분','코드','정류장','역사','노선','호선','환승','시간','날짜','ID'))]
+          result={
+              'schema':'mppd-n1-seoul-p2a5-observed-transfer-schema-audit-v1',
+              'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+              'member':member,
+              'encoding':enc,
+              'rows':rows,
+              'fields':fields,
+              'candidate_fields':candidate_fields,
+              'field_profile':field_profile,
+              'prior_failures':{
+                  'P2A3':'Rejected reuse of DX_CARD TRNS_MNS_CD values on this table; produced zero rail-to-rail rows.',
+                  'P2A4':'Rejected guessed headers 하차_교통수단_코드/승차_교통수단_코드 because they were absent from the actual table.'
+              },
+              'decision_rule':'Do not define rail-to-rail until the actual categorical columns and their value semantics are identified from this profile or provider documentation.'
+          }
+          Path('seoul_p2a5_observed_transfer_schema_audit_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          concise={'rows':rows,'encoding':enc,'fields':fields,'candidate_profiles':{k:field_profile[k] for k in candidate_fields}}
+          print('P2A5_CONCISE='+json.dumps(concise,ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a5"
+          F=seoul_p2a5_observed_transfer_schema_audit_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P2A5_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

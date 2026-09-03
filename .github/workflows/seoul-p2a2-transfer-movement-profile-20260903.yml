@@ -1,0 +1,178 @@
+name: Seoul P2A2 Transfer Movement Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a2-transfer-movement-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore passenger station support and transfer sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a2"; cd "$RUNNER_TEMP/p2a2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build observed transfer movement shortlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a2"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def clean_id(s):return ''.join(x for x in str(s or '').strip() if x.isdigit())
+          def id_variants(s):
+              d=clean_id(s)
+              if not d:return set()
+              out={d,d.lstrip('0') or '0'}
+              if len(d)>=4:out.add(d[-4:]);out.add(d[-4:].zfill(4))
+              if len(d)<=4:out.add(d.zfill(4))
+              return out
+          def num(s):
+              try:return float(str(s or '').replace(',','').strip())
+              except:return None
+          def norm_name(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\s+','',s)
+              s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def qstats(a):
+              a=sorted(float(x) for x in a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          # T-money station support index.
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f,e=zr(z,'VW_KSCC_DV_CARD.csv');r=csv.DictReader(f)
+              dv={}; variant_to_out=defaultdict(set)
+              for row in r:
+                  out=(row.get('OUT_STN_NUM') or '').strip();name=(row.get('STN_KR_NM') or '').strip()
+                  if not out:continue
+                  dv[out]={'out_stn_num':out,'name':name,'serial_num':(row.get('SERIAL_NUM') or '').strip()}
+                  for v in id_variants(out):variant_to_out[v].add(out)
+              f.close()
+
+          # Directional transfer endpoint code -> line-pair rows.
+          raw=Path('directional.csv').read_bytes();de=detect(raw[:262144]);dr=csv.DictReader(io.StringIO(raw.decode(de,errors='replace')));df=dr.fieldnames or []
+          sc=next(k for k in df if '환승시작 코드' in k);ec=next(k for k in df if '환승종료역 코드' in k)
+          sn=next(k for k in df if k=='환승시작역');en=next(k for k in df if k=='환승종료역')
+          sl=next(k for k in df if k=='환승시작 호선');el=next(k for k in df if k=='환승종료 호선');dur=next(k for k in df if k=='소요시간')
+          directional=defaultdict(list);dir_endpoint_variants=defaultdict(set)
+          for row in dr:
+              a=(row.get(sc) or '').strip();b=(row.get(ec) or '').strip()
+              rec={'start_code':a,'end_code':b,'start_name':(row.get(sn) or '').strip(),'end_name':(row.get(en) or '').strip(),'start_line':(row.get(sl) or '').strip(),'end_line':(row.get(el) or '').strip(),'duration':(row.get(dur) or '').strip()}
+              for av in id_variants(a):
+                  for bv in id_variants(b):directional[(av,bv)].append(rec)
+              for v in id_variants(a):dir_endpoint_variants[v].add(a)
+              for v in id_variants(b):dir_endpoint_variants[v].add(b)
+
+          with zipfile.ZipFile('observed.zip') as z:
+              member=[n for n in z.namelist() if n.lower().endswith('.csv')][0]
+              f,e=zr(z,member);r=csv.DictReader(f);fields=r.fieldnames or []
+              from_col='하차_정류장/역사_ID';to_col='승차_정류장/역사_ID';time_col='시간대';count_col='환승_수_합';avg_col='환승_시간_평균';date_col='기준_날짜'
+              movement=defaultdict(lambda:{'rows':0,'count':0.0,'times_weighted_num':0.0,'times_weight':0.0,'avg_samples':[],'hours':Counter(),'dates':Counter()})
+              raw_from=Counter();raw_to=Counter();nrows=0
+              for row in r:
+                  nrows+=1;a=(row.get(from_col) or '').strip();b=(row.get(to_col) or '').strip()
+                  if not a or not b:continue
+                  raw_from[a]+=1;raw_to[b]+=1
+                  c=num(row.get(count_col));t=num(row.get(avg_col));hour=(row.get(time_col) or '').strip();date=(row.get(date_col) or '').strip()
+                  m=movement[(a,b)];m['rows']+=1
+                  if c is not None:m['count']+=c
+                  if t is not None:
+                      m['avg_samples'].append(t)
+                      if c is not None and c>0:m['times_weighted_num']+=t*c;m['times_weight']+=c
+                  if hour:m['hours'][hour]+=c if c is not None else 1
+                  if date:m['dates'][date]+=1
+              f.close()
+
+          def resolve(raw):
+              outs=set()
+              for v in id_variants(raw):outs|=variant_to_out.get(v,set())
+              return outs
+          exact_stats={'from_unique':len(raw_from),'to_unique':len(raw_to)}
+          from_res={x:resolve(x) for x in raw_from};to_res={x:resolve(x) for x in raw_to}
+          exact_stats.update({
+            'from_unique_resolved':sum(bool(v) for v in from_res.values()),'to_unique_resolved':sum(bool(v) for v in to_res.values()),
+            'from_row_mass_resolved_share':sum(c for k,c in raw_from.items() if from_res[k])/sum(raw_from.values()),
+            'to_row_mass_resolved_share':sum(c for k,c in raw_to.items() if to_res[k])/sum(raw_to.values())
+          })
+
+          ranked=[];movement_total=sum(m['count'] for m in movement.values());resolved_count=0;directional_count=0
+          for (a,b),m in movement.items():
+              af=from_res[a];bt=to_res[b]
+              resolved=(len(af)==1 and len(bt)==1)
+              rec={'raw_from_id':a,'raw_to_id':b,'rows':m['rows'],'observed_transfer_count':m['count'],'weighted_average_transfer_time':m['times_weighted_num']/m['times_weight'] if m['times_weight'] else (statistics.median(m['avg_samples']) if m['avg_samples'] else None),'time_sample_stats':qstats(m['avg_samples']),'top_hours':m['hours'].most_common(8),'dates':dict(m['dates']),'from_out_candidates':sorted(af),'to_out_candidates':sorted(bt),'dv_resolved':resolved}
+              if resolved:
+                  fo=next(iter(af));to=next(iter(bt));rec['from_out_stn_num']=fo;rec['to_out_stn_num']=to;rec['from_name']=dv[fo]['name'];rec['to_name']=dv[to]['name'];resolved_count+=m['count']
+                  dirs=[]
+                  for av in id_variants(fo):
+                      for bv in id_variants(to):dirs.extend(directional.get((av,bv),[]))
+                  # A paid-area metro interchange commonly has same passenger-facing station name, but retain all actual directional line-pair rows.
+                  rec['directional_rows']=dirs[:100];rec['directional_supported']=bool(dirs)
+                  if dirs:directional_count+=m['count']
+              else:rec['directional_supported']=False
+              ranked.append(rec)
+          ranked.sort(key=lambda x:(-x['observed_transfer_count'],x['raw_from_id'],x['raw_to_id']))
+          strict=[x for x in ranked if x['dv_resolved'] and x['directional_supported']]
+          # Prefer actual metro interchange movements: same normalized station name, directional line-pair support, meaningful observed count.
+          same_station=[x for x in strict if norm_name(x.get('from_name')) and norm_name(x.get('from_name'))==norm_name(x.get('to_name'))]
+
+          result={'schema':'mppd-n1-seoul-p2a2-transfer-movement-profile-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'observed_member':member,'rows':nrows,'fields':fields,'movement_pairs':len(movement),'id_resolution':exact_stats,'observed_transfer_count_total':movement_total,'dv_resolved_transfer_count':resolved_count,'dv_resolved_transfer_count_share':resolved_count/movement_total if movement_total else None,'directional_supported_transfer_count':directional_count,'directional_supported_transfer_count_share':directional_count/movement_total if movement_total else None,'top_movements':ranked[:100],'top_strict_directional_movements':strict[:100],'top_same_station_directional_movements':same_station[:100],'evidence_boundary':'Movement counts and average transfer times are aggregate observations. Directional table supplies line/car-door movement definitions; neither identifies individual train-to-train passenger ancestry.'}
+          Path('seoul_p2a2_transfer_movement_profile_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P2A2_CONCISE='+json.dumps({'rows':nrows,'movement_pairs':len(movement),'id_resolution':exact_stats,'count_total':movement_total,'dv_resolved_count_share':result['dv_resolved_transfer_count_share'],'directional_supported_count_share':result['directional_supported_transfer_count_share'],'top_same_station_directional_movements':same_station[:20]},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a2"
+          F=seoul_p2a2_transfer_movement_profile_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P2A2_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

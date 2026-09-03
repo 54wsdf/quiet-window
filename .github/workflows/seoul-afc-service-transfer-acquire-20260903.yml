@@ -1,0 +1,209 @@
+name: Seoul AFC Service Transfer Acquire 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-afc-service-transfer-acquire-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare browser and storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq file unzip
+          python -m pip install --disable-pip-version-check playwright
+          python -m playwright install --with-deps chromium >/tmp/playwright-install.log 2>&1
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download public Seoul source files through published UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OUT="$RUNNER_TEMP/seoul-acquire"
+          mkdir -p "$OUT"
+          python - <<'PY'
+          import json, os, re, hashlib, zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+          out=Path(os.environ['OUT'])
+          results=[]
+
+          def sha256(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
+              return h.hexdigest()
+
+          def validate(p):
+              p=Path(p)
+              if not p.exists() or p.stat().st_size <= 0: raise RuntimeError(f'zero/missing file: {p.name}')
+              head=p.read_bytes()[:512].lower()
+              if b'<html' in head or b'<!doctype html' in head: raise RuntimeError(f'HTML error payload: {p.name}')
+              if p.suffix.lower()=='.zip':
+                  with zipfile.ZipFile(p) as z:
+                      bad=z.testzip()
+                      if bad: raise RuntimeError(f'bad zip member in {p.name}: {bad}')
+                      if not z.namelist(): raise RuntimeError(f'empty zip: {p.name}')
+
+          def record(p, *, dataset_id, landing_url, selector=None, coverage=None, evidence_role=None):
+              p=Path(p); validate(p)
+              m={
+                'schema':'quiet-window-acquisition-manifest-v1','state':'DOWNLOADED_TEMP',
+                'dataset_id':dataset_id,'provider_landing_url':landing_url,
+                'public_ui_selector':selector,'time_coverage':coverage,'evidence_role':evidence_role,
+                'retrieved_at_utc':datetime.now(timezone.utc).isoformat(),
+                'original_filename':p.name,'bytes':p.stat().st_size,'sha256':sha256(p),
+                'github_repository':os.environ.get('GITHUB_REPOSITORY'),
+                'github_run_id':os.environ.get('GITHUB_RUN_ID'),
+              }
+              mp=p.with_name(p.name+'.manifest.json'); mp.write_text(json.dumps(m,ensure_ascii=False,indent=2),encoding='utf-8')
+              results.append({'path':str(p),'manifest':str(mp),'dataset_id':dataset_id,'filename':p.name,'bytes':p.stat().st_size,'sha256':m['sha256'],'coverage':coverage,'evidence_role':evidence_role})
+
+          def tdata_download(page, data_id, option_value, expected_name, dataset_id, coverage, role):
+              url=f'https://t-data.seoul.go.kr/dataprovide/trafficdataviewfile.do?data_id={data_id}'
+              page.goto(url, wait_until='domcontentloaded', timeout=120000)
+              page.locator('#filedata_selectbox').select_option(value=str(option_value))
+              selected=page.locator('#filedata_selectbox option:checked').inner_text().strip()
+              if selected != expected_name: raise RuntimeError(f'T-Data selector mismatch: expected={expected_name} selected={selected}')
+              btn=page.get_by_role('button', name='다운로드')
+              with page.expect_download(timeout=120000) as di:
+                  btn.click()
+              dl=di.value
+              target=out/expected_name
+              dl.save_as(str(target))
+              record(target,dataset_id=dataset_id,landing_url=url,selector={'option_value':str(option_value),'option_text':selected},coverage=coverage,evidence_role=role)
+
+          def seoul_open_download(page, url, link_text, expected_name, dataset_id, coverage, role):
+              page.goto(url, wait_until='domcontentloaded', timeout=120000)
+              link=page.get_by_text(link_text, exact=False).first
+              link.wait_for(state='visible', timeout=120000)
+              with page.expect_download(timeout=120000) as di:
+                  link.click()
+              dl=di.value
+              target=out/expected_name
+              dl.save_as(str(target))
+              record(target,dataset_id=dataset_id,landing_url=url,selector={'visible_link_text':link_text},coverage=coverage,evidence_role=role)
+
+          with sync_playwright() as pw:
+              browser=pw.chromium.launch(headless=True)
+              context=browser.new_context(accept_downloads=True)
+              # Same-date fine passenger/service pair. Explicit subarr is preferred over the older BMS-only naming.
+              tdata_download(context.new_page(),20006,'15480','TAIMS_20260902.zip','KR_SEOUL_TDATA_CARD_20260902','2026-09-02','fine_passenger_card_bundle')
+              tdata_download(context.new_page(),20007,'15474','subarr_20260902.zip','KR_SEOUL_TDATA_SUBWAY_STATUS_20260902','2026-09-02','direct_operational_subway_status')
+              # Preserve same-date BMS companion/reference file because the provider publishes it alongside subarr.
+              tdata_download(context.new_page(),20007,'15481','BMS_20260902.zip','KR_SEOUL_TDATA_BMS_REFERENCE_20260902','2026-09-02','service_reference_companion')
+              # Official full transfer file; retain car/door detail from provider, not slim community mirrors.
+              seoul_open_download(context.new_page(),'https://data.seoul.go.kr/dataList/OA-22521/F/1/datasetView.do','서울교통공사_수도권 도시철도 환승 데이터_20250317.csv','서울교통공사_수도권 도시철도 환승 데이터_20250317.csv','KR_SEOUL_METRO_DIRECTIONAL_TRANSFER_20250317','2025-03-17 snapshot','directional_car_door_transfer')
+              # Observed aggregate transfer time/count validation layer.
+              seoul_open_download(context.new_page(),'https://data.seoul.go.kr/dataList/OA-21221/F/1/datasetView.do','kscc_dx_trnsf_path_sum_20260825.zip','kscc_dx_trnsf_path_sum_20260825.zip','KR_SEOUL_TRANSFER_OBSERVED_AGG_20260825','2026-08-25','observed_transfer_count_time_aggregate')
+              context.close(); browser.close()
+
+          summary={'state':'DOWNLOADED_TEMP','retrieved_at_utc':datetime.now(timezone.utc).isoformat(),'files':results}
+          (out/'acquisition_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'downloaded':[{'dataset_id':x['dataset_id'],'filename':x['filename'],'bytes':x['bytes'],'sha256':x['sha256']} for x in results]},ensure_ascii=False))
+          PY
+
+      - name: Inspect archive structure without logging passenger rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/seoul-acquire"
+          python - <<'PY'
+          import json, os, zipfile
+          from pathlib import Path
+          out=Path(os.environ.get('OUT',os.environ['RUNNER_TEMP']+'/seoul-acquire'))
+          inv={}
+          for p in out.glob('*.zip'):
+              with zipfile.ZipFile(p) as z:
+                  inv[p.name]=[{'name':i.filename,'bytes':i.file_size} for i in z.infolist()[:200]]
+          (out/'archive_inventory.json').write_text(json.dumps(inv,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:{'members':len(v),'first_names':[x['name'] for x in v[:20]]} for k,v in inv.items()},ensure_ascii=False))
+          PY
+
+      - name: Transfer to durable Google Drive and verify bytes
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/seoul-acquire"
+          copy_verified() {
+            local src="$1" dest="$2"
+            rclone copyto "$src" "$REMOTE_NAME:$ROOT_DRIVE/$dest" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1 --checkers 4
+            local l r
+            l="$(stat -c '%s' "$src")"
+            r="$(rclone size "$REMOTE_NAME:$ROOT_DRIVE/$dest" --config "$CONFIG_FILE" --json | jq -r '.bytes')"
+            test "$l" = "$r"
+          }
+          copy_verified "$OUT/TAIMS_20260902.zip" "passenger/20260902/TAIMS_20260902.zip"
+          copy_verified "$OUT/subarr_20260902.zip" "service/20260902/subarr_20260902.zip"
+          copy_verified "$OUT/BMS_20260902.zip" "service/20260902/BMS_20260902.zip"
+          copy_verified "$OUT/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" "transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv"
+          copy_verified "$OUT/kscc_dx_trnsf_path_sum_20260825.zip" "transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip"
+          copy_verified "$OUT/acquisition_summary.json" "99_manifests/acquisition_summary.json"
+          copy_verified "$OUT/archive_inventory.json" "99_manifests/archive_inventory.json"
+          for m in "$OUT"/*.manifest.json; do
+            [[ -f "$m" ]] || continue
+            copy_verified "$m" "99_manifests/$(basename "$m")"
+          done
+
+      - name: Mark durable manifests ACQUIRED
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/seoul-acquire"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'seoul-acquire'
+          mapping={
+            'TAIMS_20260902.zip':'passenger/20260902/TAIMS_20260902.zip',
+            'subarr_20260902.zip':'service/20260902/subarr_20260902.zip',
+            'BMS_20260902.zip':'service/20260902/BMS_20260902.zip',
+            '서울교통공사_수도권 도시철도 환승 데이터_20250317.csv':'transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv',
+            'kscc_dx_trnsf_path_sum_20260825.zip':'transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip',
+          }
+          for name,rel in mapping.items():
+            mp=out/(name+'.manifest.json')
+            d=json.loads(mp.read_text(encoding='utf-8')); d['state']='ACQUIRED'; d['durable_storage']={'backend':'Google Drive via rclone','path':os.environ['ROOT_DRIVE']+'/'+rel,'verified_by':'remote_size'}
+            mp.write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8')
+          s=json.loads((out/'acquisition_summary.json').read_text(encoding='utf-8')); s['state']='ACQUIRED'; s['durable_root']=os.environ['ROOT_DRIVE']; (out/'acquisition_summary.json').write_text(json.dumps(s,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          for m in "$OUT"/*.manifest.json; do
+            rclone copyto "$m" "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$(basename "$m")" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          done
+          rclone copyto "$OUT/acquisition_summary.json" "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/acquisition_summary.json" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          echo 'Seoul public bundle durable-store gate passed.'
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

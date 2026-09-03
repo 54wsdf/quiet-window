@@ -1,0 +1,187 @@
+name: Seoul P3B3 Feasible Service Opportunity Audit 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b3-feasible-service-opportunity-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b3"; cd "$RUNNER_TEMP/p3b3"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Evaluate transfer-gated earliest service opportunities
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b3"
+          python - <<'PY'
+          import bisect,csv,io,json,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          IN_LINE='1008';OUT_LINE='1002';IN_TRANSFER='1008000814';OUT_TRANSFER='1002000216'
+          TRANSFER_VALUES=[0,120,158,300];ENTRY_GUARDS=[0,60,120]
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def quant(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summarize(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':quant(a,.5),'p90':quant(a,.9),'p99':quant(a,.99),'max':max(a)}
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+
+          # Realized segment opportunity dictionaries.
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  train=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();arr=dt(row.get('arrival_detect_time'));dep=dt(row.get('departure_detect_time'))
+                  if train and st and arr and dep:trains[(line,train)][st].append((arr,dep))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+          inbound=defaultdict(list);outbound=defaultdict(list)
+          for (line,train),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for ta,td in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          for oa,od in evs:
+                              if od<ta and 0<(ta-od).total_seconds()<=7200:
+                                  inbound[os].append((od,ta,train));break
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for ta,td in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          for da,dd in evs:
+                              if da>td and 0<(da-td).total_seconds()<=7200:
+                                  outbound[ds].append((td,da,train));break
+          for st in inbound:inbound[st]=sorted(set(inbound[st]))
+          for st in outbound:outbound[st]=sorted(set(outbound[st]))
+
+          # Passenger candidate rows only; no identifiers exported.
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a['service_subway_id']!=IN_LINE or b['service_subway_id']!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and (t0.hour==7 or (t0.hour==8 and t0.minute<30))):continue
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  os=a['service_statn_id'];ds=b['service_statn_id']
+                  if os not in inbound or ds not in outbound:continue
+                  passengers.append((t0,t1,os,ds))
+              f.close()
+
+          # Evaluate earliest incoming service after entry guard, then first destination-compatible outgoing service after transfer constraint.
+          scenario={};detail={}
+          for guard in ENTRY_GUARDS:
+              for tv in TRANSFER_VALUES:
+                  key=f'g{guard}_t{tv}';c=Counter();arr_delay=[];wait=[];train_idx=[];arr_minutes=Counter();records=[]
+                  for t0,t1,os,ds in passengers:
+                      ins=inbound[os];in_times=[x[0] for x in ins];ii=bisect.bisect_left(in_times,t0+timedelta(seconds=guard))
+                      if ii>=len(ins):c['no_incoming']+=1;continue
+                      idep,iarr,itrain=ins[ii]
+                      outs=outbound[ds];out_times=[x[0] for x in outs];threshold=iarr+timedelta(seconds=tv);oi=bisect.bisect_left(out_times,threshold)
+                      if oi>=len(outs):c['no_outgoing']+=1;continue
+                      odep,darr,otrain=outs[oi];c['chain']+=1
+                      w=(odep-iarr).total_seconds();wait.append(w);train_idx.append(oi)
+                      compatible=darr<=t1+timedelta(seconds=59)
+                      c['exit_time_compatible']+=int(compatible);c['exit_time_incompatible']+=int(not compatible)
+                      arr_minutes[darr.strftime('%H:%M')]+=1
+                      records.append((idep,iarr,itrain,odep,darr,otrain,oi,compatible))
+                  n=c['chain'];scenario[key]={'passenger_rows':len(passengers),'chain_rows':n,'chain_share':n/len(passengers) if passengers else None,'exit_time_compatible_rows':c['exit_time_compatible'],'exit_time_compatible_share':c['exit_time_compatible']/n if n else None,'no_incoming_rows':c['no_incoming'],'no_outgoing_rows':c['no_outgoing'],'transfer_wait_sec':summarize(wait),'predicted_destination_arrival_minute_top20':dict(arr_minutes.most_common(20))};detail[key]=records
+
+          # Paired comparison against zero-transfer at the same entry guard.
+          comparisons={}
+          for guard in ENTRY_GUARDS:
+              base=detail[f'g{guard}_t0']
+              # Re-evaluate paired by passenger index because missing chains can change list lengths; do direct loop.
+              for tv in [120,158,300]:
+                  changed=0;same=0;lost=0;added=[];index_shift=[];nbase=0;nboth=0;minute_changed=0
+                  for t0,t1,os,ds in passengers:
+                      ins=inbound[os];ii=bisect.bisect_left([x[0] for x in ins],t0+timedelta(seconds=guard))
+                      if ii>=len(ins):continue
+                      idep,iarr,itrain=ins[ii];outs=outbound[ds];times=[x[0] for x in outs]
+                      i0=bisect.bisect_left(times,iarr);it=bisect.bisect_left(times,iarr+timedelta(seconds=tv))
+                      if i0>=len(outs):continue
+                      nbase+=1
+                      if it>=len(outs):lost+=1;continue
+                      nboth+=1;b=outs[i0];x=outs[it]
+                      if b[2]!=x[2] or b[0]!=x[0]:changed+=1
+                      else:same+=1
+                      added.append((x[1]-b[1]).total_seconds());index_shift.append(it-i0);minute_changed+=int(b[1].strftime('%H:%M')!=x[1].strftime('%H:%M'))
+                  comparisons[f'g{guard}_t0_vs_t{tv}']={'baseline_chain_rows':nbase,'both_chain_rows':nboth,'lost_chain_rows':lost,'outgoing_service_changed_rows':changed,'outgoing_service_changed_share':changed/nboth if nboth else None,'predicted_destination_minute_changed_rows':minute_changed,'predicted_destination_minute_changed_share':minute_changed/nboth if nboth else None,'added_destination_arrival_sec':summarize(added),'outgoing_service_index_shift':summarize(index_shift)}
+
+          primary=comparisons['g60_t0_vs_t158']
+          decision='PHYSICAL_TRANSFER_GATE_MATERIALLY_CHANGES_SERVICE_OPPORTUNITY' if (primary['outgoing_service_changed_share'] or 0)>=0.20 else ('PHYSICAL_TRANSFER_GATE_HAS_BOUNDED_SERVICE_OPPORTUNITY_EFFECT' if (primary['outgoing_service_changed_share'] or 0)>=0.05 else 'PHYSICAL_TRANSFER_GATE_SMALL_EFFECT_IN_BOUNDED_EARLIEST_OPPORTUNITY_SCENARIO')
+          result={'schema':'mppd-n1-seoul-p3b3-feasible-service-opportunity-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'candidate':{'incoming_line':'1008','outgoing_line':'1002','station_ko':'잠실','station_en':'Jamsil','physical_shortest_transfer_sec':158},'analysis_window':'AFC entry 2026-08-29 07:00-08:29; service events 07:00-10:00','qualified_passenger_rows':len(passengers),'scenario_definition':'For each passenger candidate, choose the earliest same-train incoming service segment available after a fixed gate-entry guard, then choose the first destination-compatible same-train outgoing service segment whose Jamsil departure is no earlier than incoming Jamsil arrival plus the transfer-time constraint. This is an earliest service-opportunity scenario, not passenger train assignment.','scenarios':scenario,'paired_transfer_comparisons':comparisons,'primary_comparison':'entry guard 60 s; transfer 0 s versus physical shortest-transfer lower bound 158 s','decision':decision,'evidence_boundary':['Public AFC times are minute-quantized; entry guards are sensitivity assumptions, not observed platform-access times.','The 158-second transfer is a physical shortest lower bound for recommended directional movement, not an empirical walking-time distribution.','Earliest service opportunity is not observed passenger train assignment.','Exit-time compatibility only checks that predicted train arrival does not occur after the recorded exit minute plus 59 seconds; it does not model egress walking time.','No T6 observed train-to-train passenger genealogy claim.']}
+          Path('seoul_p3b3_feasible_service_opportunity_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B3_CONCISE='+json.dumps({'n':len(passengers),'primary':primary,'decision':decision,'scenario_g60_t0':scenario['g60_t0'],'scenario_g60_t158':scenario['g60_t158'],'sensitivity_0':comparisons['g0_t0_vs_t158'],'sensitivity_120':comparisons['g120_t0_vs_t158']},ensure_ascii=False))
+          PY
+
+      - name: Store audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b3"
+          F=seoul_p3b3_feasible_service_opportunity_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3B3_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

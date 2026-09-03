@@ -1,0 +1,112 @@
+name: Rail Service State Snapshot Dedup 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rail-service-state-snapshot-dedup-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dedup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      OUT_DRIVE: transport_data_lake/01_rail/99_manifests/service_state_evidence_atlas_20260903
+    steps:
+      - name: Restore one service day
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check duckdb pandas
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/dedup"; cd "$RUNNER_TEMP/dedup"
+          declare -A p
+          p[ml_tu]='transport_data_lake/01_rail/US_CA_Metrolink/03_realtime/gtfsrt_io/trip_updates/2026-08-31'
+          p[ml_vp]='transport_data_lake/01_rail/US_CA_Metrolink/03_realtime/gtfsrt_io/vehicle_positions/2026-08-31'
+          p[sp_tu]='transport_data_lake/01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io/trip_updates/2026-08-31'
+          p[sp_vp]='transport_data_lake/01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io/vehicle_positions/2026-08-31'
+          p[sp_al]='transport_data_lake/01_rail/US_PA_SEPTA/03_realtime/gtfsrt_io/service_alerts/2026-08-31'
+          for k in ml_tu ml_vp sp_tu sp_vp sp_al; do mkdir -p "$k"; rclone copy "$REMOTE_NAME:${p[$k]}" "$k" --config "$CONFIG_FILE" --include '*.parquet' --max-depth 1 --transfers 1 --retries 6 --low-level-retries 15; done
+
+      - name: Quantify repeated snapshots and cross-feed identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dedup"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import duckdb
+          con=duckdb.connect(':memory:')
+          def path(k): return str(Path(k)/'*.parquet')
+          for k in ('ml_tu','ml_vp','sp_tu','sp_vp','sp_al'):
+              con.execute(f"CREATE VIEW {k} AS SELECT * FROM read_parquet('{path(k)}',union_by_name=true)")
+          def polling(view):
+              x=con.execute(f'''WITH f AS (SELECT DISTINCT feed_timestamp FROM {view} WHERE feed_timestamp IS NOT NULL),
+                d AS (SELECT feed_timestamp-lag(feed_timestamp) OVER(ORDER BY feed_timestamp) dt FROM f)
+                SELECT count(*),quantile_cont(dt,.5),quantile_cont(dt,.9),max(dt) FROM d WHERE dt>0''').fetchone()
+              return {'positive_intervals':int(x[0]),'median_sec':x[1],'p90_sec':x[2],'max_sec':x[3]}
+          def overlap(a,b):
+              x=con.execute(f'''WITH a AS (SELECT DISTINCT trip_id FROM {a} WHERE trip_id IS NOT NULL),b AS (SELECT DISTINCT trip_id FROM {b} WHERE trip_id IS NOT NULL)
+                SELECT (SELECT count(*) FROM a),(SELECT count(*) FROM b),(SELECT count(*) FROM a JOIN b USING(trip_id))''').fetchone()
+              return {'trip_ids_a':int(x[0]),'trip_ids_b':int(x[1]),'intersection':int(x[2]),'a_share':x[2]/x[0] if x[0] else None,'b_share':x[2]/x[1] if x[1] else None}
+          ml_key=con.execute('''WITH k AS (SELECT trip_id,stop_sequence,count(*) n_snapshots,count(DISTINCT feed_timestamp) n_feed_times,
+            count(DISTINCT arrival_time) n_arrival_predictions,count(DISTINCT departure_time) n_departure_predictions,
+            max(arrival_time)-min(arrival_time) arrival_prediction_range_sec,max(departure_time)-min(departure_time) departure_prediction_range_sec
+            FROM ml_tu WHERE trip_id IS NOT NULL AND stop_sequence IS NOT NULL GROUP BY 1,2)
+            SELECT count(*),quantile_cont(n_snapshots,.5),quantile_cont(n_snapshots,.9),quantile_cont(n_arrival_predictions,.5),quantile_cont(n_arrival_predictions,.9),
+              quantile_cont(arrival_prediction_range_sec,.5),quantile_cont(arrival_prediction_range_sec,.9),max(arrival_prediction_range_sec) FROM k''').fetchone()
+          sp_key=con.execute('''WITH k AS (SELECT trip_id,stop_sequence,count(*) n_snapshots,count(DISTINCT feed_timestamp) n_feed_times,
+            count(DISTINCT arrival_delay) n_delay_values,max(arrival_delay)-min(arrival_delay) delay_range_sec
+            FROM sp_tu WHERE trip_id IS NOT NULL AND stop_sequence IS NOT NULL GROUP BY 1,2)
+            SELECT count(*),quantile_cont(n_snapshots,.5),quantile_cont(n_snapshots,.9),quantile_cont(n_delay_values,.5),quantile_cont(n_delay_values,.9),
+              quantile_cont(delay_range_sec,.5),quantile_cont(delay_range_sec,.9),max(delay_range_sec) FROM k''').fetchone()
+          # Vehicle snapshots per trip, and provider-reported state coverage.
+          def vp(view):
+              x=con.execute(f'''WITH k AS (SELECT trip_id,count(*) n_snapshots,count(DISTINCT timestamp) n_state_times,count(DISTINCT vehicle_id) n_vehicles,
+                count(DISTINCT stop_id) n_stops FROM {view} WHERE trip_id IS NOT NULL GROUP BY 1)
+                SELECT count(*),quantile_cont(n_snapshots,.5),quantile_cont(n_snapshots,.9),max(n_snapshots),
+                  quantile_cont(n_state_times,.5),quantile_cont(n_stops,.5),max(n_vehicles) FROM k''').fetchone()
+              return {'trips':int(x[0]),'snapshots_per_trip_p50':x[1],'p90':x[2],'max':int(x[3]),'distinct_state_times_p50':x[4],'distinct_stop_ids_p50':x[5],'max_vehicle_ids_per_trip':int(x[6])}
+          al=con.execute('''SELECT count(*) n_rows,count(DISTINCT entity_id) n_entity,count(DISTINCT header_text) n_header,
+            count(DISTINCT route_id) FILTER(WHERE route_id IS NOT NULL) n_routes,count(DISTINCT trip_id) FILTER(WHERE trip_id IS NOT NULL) n_trips,
+            count(DISTINCT coalesce(cast(active_period_start AS VARCHAR),'')||'|'||coalesce(cast(active_period_end AS VARCHAR),'')) FILTER(WHERE active_period_start IS NOT NULL OR active_period_end IS NOT NULL) n_periods
+            FROM sp_al''').fetchone()
+          out={'schema':'rail-service-state-snapshot-dedup.v1','service_date':'2026-08-31',
+            'metrolink':{'polling':{'trip_updates':polling('ml_tu'),'vehicle_positions':polling('ml_vp')},'trip_identity_overlap':overlap('ml_tu','ml_vp'),
+              'trip_stop_forecast_history':{'trip_stop_keys':int(ml_key[0]),'snapshots_per_key_p50':ml_key[1],'p90':ml_key[2],'distinct_arrival_predictions_p50':ml_key[3],'p90':ml_key[4],'arrival_prediction_range_sec_p50':ml_key[5],'p90':ml_key[6],'max':ml_key[7]},'vehicle_snapshot_history':vp('ml_vp')},
+            'septa':{'polling':{'trip_updates':polling('sp_tu'),'vehicle_positions':polling('sp_vp'),'service_alerts':polling('sp_al')},'trip_identity_overlap':overlap('sp_tu','sp_vp'),
+              'trip_stop_delay_history':{'trip_stop_keys':int(sp_key[0]),'snapshots_per_key_p50':sp_key[1],'p90':sp_key[2],'distinct_arrival_delay_values_p50':sp_key[3],'p90':sp_key[4],'arrival_delay_range_sec_p50':sp_key[5],'p90':sp_key[6],'max':sp_key[7]},'vehicle_snapshot_history':vp('sp_vp'),
+              'service_alert_snapshot_history':{'rows':int(al[0]),'unique_entity_ids':int(al[1]),'unique_header_texts':int(al[2]),'route_ids':int(al[3]),'trip_ids':int(al[4]),'active_period_pairs':int(al[5])}},
+            'scientific_decision':'Raw GTFS-RT row count is dominated by repeated polling snapshots. Canonical service-state construction must preserve forecast-history/direct-snapshot/context layers and deduplicate or sequence them by entity/trip/stop/time rather than count rows as train events.',
+            'evidence_state':'SNAPSHOT_REPETITION_AND_CROSS_FEED_IDENTITY_PROFILED'}
+          Path('service_state_snapshot_dedup.json').write_text(json.dumps(out,ensure_ascii=False,indent=2,default=str),encoding='utf-8');print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
+          PY
+
+      - name: Persist result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dedup"
+          rclone copyto service_state_snapshot_dedup.json "$REMOTE_NAME:$OUT_DRIVE/service_state_snapshot_dedup.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,137 @@
+name: SPTCC Metro Entry Exit Qualification 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sptcc-metro-entry-exit-qualification-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/99_manifests/sptcc_metro_entry_exit_qualification_20260903
+    steps:
+      - name: Prepare storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check duckdb
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/sptcc"
+
+      - name: Test metro fare-order semantics without exporting card IDs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sptcc"
+          for src in SPTCC-20160701.csv SPTCC-20160802.csv SPTCC-20160901.csv; do
+            rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$src" input.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            SRC="$src" python - <<'PY'
+          import codecs,json,os
+          from pathlib import Path
+          import duckdb
+          src=os.environ['SRC']; raw=Path('input.csv'); utf8=Path('input.utf8.csv')
+          with raw.open('rb') as fi, utf8.open('w',encoding='utf-8',newline='') as fo:
+              for line in codecs.getreader('gb18030')(fi,errors='strict'): fo.write(line)
+          con=duckdb.connect(':memory:')
+          con.execute("CREATE TABLE t AS SELECT * FROM read_csv_auto(?,header=true,all_varchar=true,sample_size=200000,ignore_errors=false)",[str(utf8)])
+          con.execute('''CREATE TABLE m AS SELECT "卡ID" card_key,"刷卡站点" station_token,
+            try_cast("刷卡扣钱" AS DOUBLE) fare,
+            strptime("刷卡日期"||' '||"刷卡时间",'%Y-%m-%d %H:%M:%S') ts
+            FROM t WHERE "刷卡乘车类型"='地铁' AND try_cast("刷卡扣钱" AS DOUBLE) IS NOT NULL''')
+          total=con.execute('SELECT count(*) FROM m').fetchone()[0]
+          fare=con.execute('''SELECT count(*) FILTER(WHERE fare=0),count(*) FILTER(WHERE fare>0),count(*) FILTER(WHERE fare<0),
+            quantile_cont(fare,.5),quantile_cont(fare,.9),max(fare) FROM m''').fetchone()
+          con.execute('''CREATE TABLE exact2 AS WITH x AS (
+            SELECT *,row_number() OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) rn,count(*) OVER(PARTITION BY card_key) cnt FROM m)
+            SELECT card_key,
+              max(CASE WHEN rn=1 THEN ts END) ts1,max(CASE WHEN rn=2 THEN ts END) ts2,
+              max(CASE WHEN rn=1 THEN fare END) fare1,max(CASE WHEN rn=2 THEN fare END) fare2,
+              max(CASE WHEN rn=1 THEN station_token END) st1,max(CASE WHEN rn=2 THEN station_token END) st2
+            FROM x WHERE cnt=2 GROUP BY card_key''')
+          e2=con.execute('''SELECT count(*) n,
+            count(*) FILTER(WHERE fare1=0 AND fare2>0) zero_positive,
+            count(*) FILTER(WHERE fare1>0 AND fare2=0) positive_zero,
+            count(*) FILTER(WHERE fare1=0 AND fare2=0) zero_zero,
+            count(*) FILTER(WHERE fare1>0 AND fare2>0) positive_positive,
+            count(*) FILTER(WHERE st1<>st2) different_station,
+            count(*) FILTER(WHERE fare1=0 AND fare2>0 AND st1<>st2) canonical_diff_station,
+            quantile_cont(epoch(ts2-ts1),.5) duration_p50,
+            quantile_cont(epoch(ts2-ts1),.9) duration_p90,
+            quantile_cont(epoch(ts2-ts1),.99) duration_p99
+            FROM exact2 WHERE ts2>=ts1''').fetchone()
+          # More than two metro records: test adjacent chronological event fare pattern without pairing across a >6h gap.
+          con.execute('''CREATE TABLE adj AS WITH x AS (
+            SELECT card_key,ts,fare,station_token,
+              lag(ts) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) prev_ts,
+              lag(fare) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) prev_fare,
+              lag(station_token) OVER(PARTITION BY card_key ORDER BY ts,station_token,fare) prev_st
+            FROM m)
+            SELECT * FROM x WHERE prev_ts IS NOT NULL AND epoch(ts-prev_ts) BETWEEN 0 AND 21600''')
+          adj=con.execute('''SELECT count(*) n,
+            count(*) FILTER(WHERE prev_fare=0 AND fare>0) zero_positive,
+            count(*) FILTER(WHERE prev_fare>0 AND fare=0) positive_zero,
+            count(*) FILTER(WHERE prev_fare=0 AND fare=0) zero_zero,
+            count(*) FILTER(WHERE prev_fare>0 AND fare>0) positive_positive,
+            count(*) FILTER(WHERE prev_fare=0 AND fare>0 AND prev_st<>station_token) zero_positive_diff_station
+            FROM adj''').fetchone()
+          out={'schema':'sptcc-metro-entry-exit-qualification.v1','source_file':src,'metro_rows':int(total),
+            'metro_fare':{'zero_rows':int(fare[0]),'positive_rows':int(fare[1]),'negative_rows':int(fare[2]),'median':fare[3],'p90':fare[4],'max':fare[5]},
+            'exact_two_metro_records':{'n_cards':int(e2[0]),'zero_then_positive':int(e2[1]),'positive_then_zero':int(e2[2]),'zero_zero':int(e2[3]),'positive_positive':int(e2[4]),'different_station':int(e2[5]),'zero_then_positive_and_different_station':int(e2[6]),'duration_p50_sec':e2[7],'duration_p90_sec':e2[8],'duration_p99_sec':e2[9]},
+            'adjacent_metro_records_with_gap_le_6h':{'n_pairs':int(adj[0]),'zero_then_positive':int(adj[1]),'positive_then_zero':int(adj[2]),'zero_zero':int(adj[3]),'positive_positive':int(adj[4]),'zero_then_positive_and_different_station':int(adj[5])},
+            'external_semantic_note':'Published research using SPTCC states that zero fare represents metro entry and nonzero fare represents exit. This workflow independently checks whether temporal transaction ordering is consistent with that rule.',
+            'privacy_rule':'No card IDs or card-level sequences are exported.'}
+          Path(src+'.metro_entry_exit.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2)); con.close(); raw.unlink(); utf8.unlink()
+          PY
+          done
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          ps=[json.loads(p.read_text(encoding='utf-8')) for p in sorted(Path('.').glob('SPTCC-*.metro_entry_exit.json'))]
+          zpos=sum(p['exact_two_metro_records']['zero_then_positive'] for p in ps); e2=sum(p['exact_two_metro_records']['n_cards'] for p in ps)
+          zposdiff=sum(p['exact_two_metro_records']['zero_then_positive_and_different_station'] for p in ps)
+          adj_n=sum(p['adjacent_metro_records_with_gap_le_6h']['n_pairs'] for p in ps); adj_zp=sum(p['adjacent_metro_records_with_gap_le_6h']['zero_then_positive'] for p in ps)
+          out={'schema':'sptcc-metro-entry-exit-crossday-summary.v1','dataset_id':'CN_SH_SPTCC_2016_DRIVE_STACK','days':len(ps),'metro_rows':sum(p['metro_rows'] for p in ps),
+            'exact_two_metro_cards':e2,'exact_two_zero_then_positive':zpos,'exact_two_zero_then_positive_share':zpos/e2 if e2 else None,'exact_two_zero_positive_different_station':zposdiff,'exact_two_zero_positive_different_station_share':zposdiff/e2 if e2 else None,
+            'adjacent_metro_pairs_gap_le6h':adj_n,'adjacent_zero_then_positive':adj_zp,'adjacent_zero_then_positive_share':adj_zp/adj_n if adj_n else None,
+            'semantic_decision':'ZERO_FARE_ENTRY_NONZERO_FARE_EXIT_SUPPORTED' if zpos/e2>0.9 else 'SEMANTICS_NOT_CLOSED',
+            'evidence_class':'SOURCE_TRANSACTION_RULE_PLUS_EMPIRICAL_TEMPORAL_CONSISTENCY',
+            'claim_boundary':'This qualifies entry/exit transaction semantics for metro records; it does not prove every card record is complete. Journey construction still requires complete/even-pair and service-day quality gates.'}
+          Path('sptcc_metro_entry_exit_summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8');print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sptcc"
+          for f in *.metro_entry_exit.json sptcc_metro_entry_exit_summary.json; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

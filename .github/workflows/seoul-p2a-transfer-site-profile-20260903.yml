@@ -1,0 +1,146 @@
+name: Seoul P2A Transfer Site Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p2a-transfer-site-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore transfer data
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p2a"; cd "$RUNNER_TEMP/p2a"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/observed_aggregate/20260825/kscc_dx_trnsf_path_sum_20260825.zip" observed.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" directional.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Profile observed transfer stations and overlap directional table
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def norm(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\s+','',s)
+              s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def num(s):
+              try:return float(str(s).replace(',','').strip())
+              except:return None
+          def qs(a):
+              a=sorted(a)
+              if not a:return None
+              def q(p):return a[round((len(a)-1)*p)]
+              return {'n':len(a),'min':a[0],'median':q(.5),'p90':q(.9),'p99':q(.99),'max':a[-1]}
+
+          with zipfile.ZipFile('observed.zip') as z:
+              n=[x for x in z.namelist() if x.lower().endswith('.csv')][0]
+              raw=z.read(n);e=detect(raw[:262144]);r=csv.DictReader(io.StringIO(raw.decode(e,errors='replace')));fields=r.fieldnames or []
+              # Discover columns by semantics; preserve actual choices in result.
+              station_cols=[k for k in fields if any(x in k.lower() for x in ('sttn','bsst','station','정류장','역'))]
+              count_cols=[k for k in fields if any(x in k.lower() for x in ('psng','cnt','count','인원','승객'))]
+              time_cols=[k for k in fields if any(x in k.lower() for x in ('time','tm','시간'))]
+              date_cols=[k for k in fields if any(x in k.lower() for x in ('date','stdr','de','일자','기준일'))]
+              unique={k:set() for k in fields};numeric={k:[] for k in fields};rows=[]
+              # Station aggregation is computed for every plausible station column; later rank quality chooses the most informative.
+              agg={k:defaultdict(lambda:{'rows':0,'count_sum':0.0,'count_n':0,'times':[]}) for k in station_cols}
+              nrows=0
+              for row in r:
+                  nrows+=1
+                  for k in fields:
+                      v=(row.get(k) or '').strip()
+                      if v and len(unique[k])<10000:unique[k].add(v)
+                      x=num(v)
+                      if x is not None and len(numeric[k])<100000:numeric[k].append(x)
+                  cvals=[num(row.get(k)) for k in count_cols]; cvals=[x for x in cvals if x is not None]
+                  tvals=[num(row.get(k)) for k in time_cols]; tvals=[x for x in tvals if x is not None]
+                  c=cvals[0] if cvals else None; t=tvals[0] if tvals else None
+                  for sk in station_cols:
+                      s=norm(row.get(sk))
+                      if not s:continue
+                      a=agg[sk][s];a['rows']+=1
+                      if c is not None:a['count_sum']+=c;a['count_n']+=1
+                      if t is not None and len(a['times'])<50000:a['times'].append(t)
+
+          column_profile={k:{'unique_capped':len(unique[k]),'numeric_sample_stats':qs(numeric[k])} for k in fields}
+          # Pick station column with the largest nontrivial station universe below 5000 keys.
+          station_choice=None
+          cand=[]
+          for k,a in agg.items():
+              m=len(a)
+              if 2<=m<=5000:cand.append((m,k))
+          if cand:station_choice=max(cand)[1]
+          ranked=[]
+          if station_choice:
+              for s,a in agg[station_choice].items():
+                  ranked.append({'station':s,'rows':a['rows'],'observed_count_sum':a['count_sum'] if a['count_n'] else None,'time_stats':qs(a['times'])})
+              ranked.sort(key=lambda x:(-(x['observed_count_sum'] or 0),-x['rows'],x['station']))
+
+          # Directional transfer table station coverage.
+          raw=Path('directional.csv').read_bytes();de=detect(raw[:262144]);dr=csv.DictReader(io.StringIO(raw.decode(de,errors='replace')));df=dr.fieldnames or []
+          start=next(k for k in df if k=='환승시작역');end=next(k for k in df if k=='환승종료역')
+          directional_stations=Counter();directional_rows=0
+          for row in dr:
+              directional_rows+=1
+              for k in (start,end):
+                  s=norm(row.get(k))
+                  if s:directional_stations[s]+=1
+          for x in ranked:
+              x['directional_rows']=directional_stations.get(x['station'],0)
+              x['directional_supported']=x['directional_rows']>0
+
+          supported=[x for x in ranked if x['directional_supported']]
+          result={'schema':'mppd-n1-seoul-p2a-transfer-site-profile-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'observed_member':n,'encoding':e,'rows':nrows,'fields':fields,'station_candidates':station_cols,'count_candidates':count_cols,'time_candidates':time_cols,'date_candidates':date_cols,'column_profile':column_profile,'chosen_station_column':station_choice,'directional_rows':directional_rows,'directional_station_count':len(directional_stations),'top_observed_stations':ranked[:100],'top_directional_supported_observed_stations':supported[:50],'evidence_boundary':'Observed transfer aggregate supplies station/user-type transfer counts and times. It is not individual passenger train-to-train genealogy.'}
+          Path('seoul_p2a_transfer_site_profile_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P2A_CONCISE='+json.dumps({'rows':nrows,'fields':fields,'station_candidates':station_cols,'count_candidates':count_cols,'time_candidates':time_cols,'chosen_station_column':station_choice,'directional_station_count':len(directional_stations),'top_directional_supported':supported[:20]},ensure_ascii=False))
+          PY
+
+      - name: Store result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p2a"
+          F=seoul_p2a_transfer_site_profile_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P2A_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

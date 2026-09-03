@@ -1,0 +1,187 @@
+name: MBTA 2020 Three-Source Profile 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mbta-2020-three-source-profile-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      BASE_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/boston_mbta
+      OUT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/boston_mbta/profile_2020_three_source
+
+    steps:
+      - name: Prepare environment and pull held data
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq unzip
+          python -m pip install --disable-pip-version-check pandas pyarrow
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP"
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/gated_entries_historical/GSE_by_year.zip" GSE_by_year.zip --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/rapid_transit_events_2020/Events_2020.zip" Events_2020.zip --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          for t in pathways transfers stops routes feed_info; do
+            rclone copyto "$REMOTE_NAME:$BASE_DRIVE/gtfs_2020_archive_probe/$t.parquet" "$t.parquet" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          done
+
+      - name: Profile GSE 2020, realized events, and historical transfer network
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import csv, io, json, math, zipfile
+          from collections import Counter, defaultdict
+          from pathlib import Path
+          import pandas as pd
+          import pyarrow.parquet as pq
+
+          def csv_stream(z, name):
+              raw=z.open(name)
+              return io.TextIOWrapper(raw, encoding='utf-8-sig', newline='')
+
+          # --- GSE 2020 ---
+          with zipfile.ZipFile('GSE_by_year.zip') as z:
+              target=[n for n in z.namelist() if n.endswith('GSE_2020.csv')][0]
+              with csv_stream(z,target) as f:
+                  r=csv.DictReader(f); gse_cols=r.fieldnames
+                  gse_rows=0; gse_dates=Counter(); gse_stops=Counter(); gse_routes=Counter(); periods=Counter()
+                  gse_sample=[]
+                  for row in r:
+                      gse_rows+=1
+                      if len(gse_sample)<5: gse_sample.append(row)
+                      d=row.get('service_date') or row.get('date') or row.get('service_day')
+                      if d: gse_dates[d]+=1
+                      sid=row.get('stop_id') or row.get('station') or row.get('station_id')
+                      if sid: gse_stops[sid]+=1
+                      route=row.get('route_or_line') or row.get('route_id') or row.get('line')
+                      if route: gse_routes[route]+=1
+                      p=row.get('time_period') or row.get('time_bin') or row.get('period')
+                      if p: periods[p]+=1
+
+          # --- Events 2020 ---
+          with zipfile.ZipFile('Events_2020.zip') as z:
+              names=[n for n in z.namelist() if n.lower().endswith('.csv')]
+              event_cols=None; event_rows=0; event_dates=Counter(); event_stops=Counter(); event_routes=Counter(); event_types=Counter(); event_dirs=Counter(); event_trips=set(); event_vehicles=set(); event_sample=[]
+              per_file={}
+              for name in names:
+                  nrows=0
+                  with csv_stream(z,name) as f:
+                      r=csv.DictReader(f)
+                      if event_cols is None: event_cols=r.fieldnames
+                      for row in r:
+                          nrows+=1; event_rows+=1
+                          if len(event_sample)<5: event_sample.append(row)
+                          d=row.get('service_date') or row.get('date')
+                          if d: event_dates[d]+=1
+                          sid=row.get('stop_id')
+                          if sid: event_stops[sid]+=1
+                          route=row.get('route_id') or row.get('route')
+                          if route: event_routes[route]+=1
+                          et=row.get('event_type')
+                          if et: event_types[et]+=1
+                          di=row.get('direction_id')
+                          if di!='' and di is not None: event_dirs[di]+=1
+                          t=row.get('trip_id')
+                          if t: event_trips.add(t)
+                          v=row.get('vehicle_id')
+                          if v: event_vehicles.add(v)
+                  per_file[name]=nrows
+
+          # --- Historical 2020 GTFS ---
+          transfer=pq.read_table('transfers.parquet').to_pandas()
+          pathway=pq.read_table('pathways.parquet').to_pandas()
+          stops=pq.read_table('stops.parquet').to_pandas()
+          routes=pq.read_table('routes.parquet').to_pandas()
+          feed=pq.read_table('feed_info.parquet').to_pandas()
+
+          # Basic table stats and physical-time coverage.
+          transfer_walk=transfer[transfer['min_walk_time'].notna()].copy() if 'min_walk_time' in transfer else transfer.iloc[0:0]
+          transfer_buffer=transfer[transfer['suggested_buffer_time'].notna()].copy() if 'suggested_buffer_time' in transfer else transfer.iloc[0:0]
+          pathway_time=pathway[pathway['traversal_time'].notna()].copy() if 'traversal_time' in pathway else pathway.iloc[0:0]
+
+          # stop IDs that have event observations and are represented in historical GTFS at any 2020 feed interval.
+          gtfs_stop_ids=set(stops['stop_id'].dropna().astype(str)) if 'stop_id' in stops else set()
+          event_stop_ids=set(event_stops)
+          gse_stop_ids=set(gse_stops)
+          transfer_stop_ids=set(transfer['from_stop_id'].dropna().astype(str)) | set(transfer['to_stop_id'].dropna().astype(str))
+          pathway_stop_ids=set(pathway['from_stop_id'].dropna().astype(str)) | set(pathway['to_stop_id'].dropna().astype(str))
+
+          # GSE dates can be YYYY-MM-DD or similar; event dates likewise. Direct lexical intersection is fine after stripping.
+          g_dates=set(gse_dates); e_dates=set(event_dates); same_dates=sorted(g_dates & e_dates)
+
+          # Potential transfer-related stations/events: event stop IDs present in transfer/pathways endpoint sets.
+          event_transfer_overlap=event_stop_ids & transfer_stop_ids
+          event_pathway_overlap=event_stop_ids & pathway_stop_ids
+
+          def qstats(s):
+              vals=pd.to_numeric(s, errors='coerce').dropna()
+              if len(vals)==0: return None
+              return {'n':int(len(vals)),'min':float(vals.min()),'median':float(vals.median()),'p90':float(vals.quantile(.9)),'max':float(vals.max())}
+
+          out={
+            'dataset_id':'US_BOS_MBTA_2020_THREE_SOURCE_PROFILE',
+            'evidence_level':'SAME_YEAR_AGGREGATE_AFC_REALIZED_EVENTS_HISTORICAL_TRANSFER',
+            'gse':{
+              'columns':gse_cols,'rows':gse_rows,'unique_dates':len(g_dates),'date_min':min(g_dates) if g_dates else None,'date_max':max(g_dates) if g_dates else None,
+              'unique_stop_ids':len(gse_stop_ids),'unique_routes_or_lines':len(gse_routes),'routes_or_lines':dict(gse_routes),'unique_time_periods':len(periods),'sample':gse_sample,
+            },
+            'events':{
+              'columns':event_cols,'rows':event_rows,'files':per_file,'unique_dates':len(e_dates),'date_min':min(e_dates) if e_dates else None,'date_max':max(e_dates) if e_dates else None,
+              'unique_stop_ids':len(event_stop_ids),'unique_routes':len(event_routes),'routes':dict(event_routes),'event_types':dict(event_types),'directions':dict(event_dirs),
+              'unique_trip_ids':len(event_trips),'unique_vehicle_ids':len(event_vehicles),'sample':event_sample,
+            },
+            'historical_gtfs_2020':{
+              'transfer_rows':int(len(transfer)),'pathway_rows':int(len(pathway)),'stop_rows':int(len(stops)),'route_rows':int(len(routes)),'feed_rows':int(len(feed)),
+              'transfer_rows_with_min_walk_time':int(len(transfer_walk)),'transfer_rows_with_suggested_buffer_time':int(len(transfer_buffer)),'pathway_rows_with_traversal_time':int(len(pathway_time)),
+              'min_walk_time_sec':qstats(transfer_walk['min_walk_time']) if len(transfer_walk) else None,
+              'suggested_buffer_time_sec':qstats(transfer_buffer['suggested_buffer_time']) if len(transfer_buffer) else None,
+              'pathway_traversal_time_sec':qstats(pathway_time['traversal_time']) if len(pathway_time) else None,
+              'gtfs_stop_ids':len(gtfs_stop_ids),'transfer_endpoint_stop_ids':len(transfer_stop_ids),'pathway_endpoint_stop_ids':len(pathway_stop_ids),
+            },
+            'joinability':{
+              'same_service_dates_gse_events':len(same_dates),'same_date_min':same_dates[0] if same_dates else None,'same_date_max':same_dates[-1] if same_dates else None,
+              'gse_stop_ids_in_gtfs':len(gse_stop_ids & gtfs_stop_ids),'gse_stop_id_gtfs_share':len(gse_stop_ids & gtfs_stop_ids)/len(gse_stop_ids) if gse_stop_ids else None,
+              'event_stop_ids_in_gtfs':len(event_stop_ids & gtfs_stop_ids),'event_stop_id_gtfs_share':len(event_stop_ids & gtfs_stop_ids)/len(event_stop_ids) if event_stop_ids else None,
+              'gse_event_exact_stop_id_overlap':len(gse_stop_ids & event_stop_ids),
+              'event_transfer_endpoint_overlap':len(event_transfer_overlap),'event_pathway_endpoint_overlap':len(event_pathway_overlap),
+            },
+            'evidence_ceiling_note':'GSE is aggregate gated entry demand, not individual AFC and not observed internal transfer flow. Actual ARR/DEP + historical min_walk_time can support realized connection-opportunity margins, but not individual passenger catch/miss genealogy without ODX-like passenger assignment.'
+          }
+          Path('mbta_2020_three_source_profile.json').write_text(json.dumps(out,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(out,indent=2,ensure_ascii=False))
+          PY
+
+      - name: Store profile
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          f=mbta_2020_three_source_profile.json
+          rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 5 --low-level-retries 10
+          L="$(stat -c '%s' "$f")"; R="$(rclone size "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$L" = "$R"
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

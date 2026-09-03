@@ -1,0 +1,185 @@
+name: Rail Transfer Structure Standardization 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rail-transfer-structure-standardization-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standardize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      BASE_DRIVE: ResearchData/rail_transit/metro_transfer_time_benchmark/20260903
+      OUT_DRIVE: ResearchData/rail_transit/metro_transfer_time_benchmark/20260903/standardized_20260903
+
+    steps:
+      - name: Restore public benchmark sources
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq unzip
+          python -m pip install --disable-pip-version-check openpyxl
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/tr"; cd "$RUNNER_TEMP/tr"
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/singapore_mrt/singapore_interchange_transfer_times_measured.xlsx" singapore.xlsx --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/singapore_mrt/manifest.json" singapore_manifest.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/boston_mbta/mbta_gtfs_20260903.zip" boston.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/melbourne_ptv/melbourne_metropolitan_train_gtfs_20260903.zip" melbourne.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/santiago/santiago_gtfs_20260829.zip" santiago.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/budapest_bkk/budapest_bkk_gtfs_20260903.zip" budapest.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/nyc_mta/nyc_mta_subway_gtfs_20260903.zip" nyc.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/london_tfl/london_tube_interchange_times_hf_snapshot_20260903.zip" london.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$BASE_DRIVE/london_tfl/manifest.json" london_manifest.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build semantic and structural transfer profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/tr"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, io, json, math, statistics, zipfile
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          import openpyxl
+
+          def q(a,p):
+              if not a:return None
+              b=sorted(a); return b[round((len(b)-1)*p)]
+          def stats(a):
+              if not a:return None
+              return {'n':len(a),'min':min(a),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def detect(raw):
+              for enc in ('utf-8-sig','utf-8','cp1252','latin-1'):
+                  try: raw.decode(enc); return enc
+                  except UnicodeDecodeError: pass
+              return 'latin-1'
+          def read_zip_csv(z,path):
+              raw=z.read(path); enc=detect(raw[:262144]); return list(csv.DictReader(io.StringIO(raw.decode(enc))))
+          def find_member(z,base):
+              xs=[n for n in z.namelist() if n.lower().endswith('/'+base.lower()) or n.lower()==base.lower()]
+              return xs[0] if xs else None
+          def num(v):
+              try:
+                  x=float(str(v).strip()); return x if math.isfinite(x) else None
+              except:return None
+          def gtfs_profile(city,fn):
+              out={'city':city,'file':fn,'semantic_classes':[]}
+              with zipfile.ZipFile(fn) as z:
+                  for table in ('pathways.txt','transfers.txt','levels.txt','stops.txt'):
+                      m=find_member(z,table)
+                      out[table.replace('.txt','')+'_rows']=None if m is None else max(0,len(z.read(m).splitlines())-1)
+                  pm=find_member(z,'pathways.txt')
+                  if pm:
+                      rows=read_zip_csv(z,pm); times=[]; modes=Counter(); directional_pairs=defaultdict(dict)
+                      for r in rows:
+                          t=num(r.get('traversal_time')); f=str(r.get('from_stop_id','')); to=str(r.get('to_stop_id','')); mode=str(r.get('pathway_mode',''))
+                          if t is not None: times.append(t)
+                          if mode: modes[mode]+=1
+                          if f and to and t is not None: directional_pairs[tuple(sorted((f,to)))][(f,to)]=t
+                      reverse=[]
+                      for pair,d in directional_pairs.items():
+                          if len(d)>=2:
+                              vals=list(d.values()); reverse.append(abs(vals[0]-vals[1]))
+                      out['pathways']={'semantic_class':'OFFICIAL_FACILITY_PATH_EDGE','traversal_time_sec':stats(times),'pathway_modes':dict(modes),'bidirectional_timed_pairs':len(reverse),'absolute_directional_time_difference_sec':stats(reverse)}
+                      out['semantic_classes'].append('OFFICIAL_FACILITY_PATH_EDGE')
+                  tm=find_member(z,'transfers.txt')
+                  if tm:
+                      rows=read_zip_csv(z,tm); mins=[]; types=Counter()
+                      for r in rows:
+                          for k in ('min_transfer_time','min_walk_time'):
+                              t=num(r.get(k));
+                              if t is not None: mins.append(t); break
+                          v=str(r.get('transfer_type',''))
+                          if v: types[v]+=1
+                      out['transfers']={'semantic_class':'OFFICIAL_TRANSFER_EDGE_OR_CONSTRAINT','minimum_time_sec':stats(mins),'transfer_types':dict(types)}
+                      out['semantic_classes'].append('OFFICIAL_TRANSFER_EDGE_OR_CONSTRAINT')
+              return out
+
+          wb=openpyxl.load_workbook('singapore.xlsx',read_only=True,data_only=True)
+          ws=wb['Timing'] if 'Timing' in wb.sheetnames else wb[wb.sheetnames[0]]
+          rows=list(ws.iter_rows(values_only=True)); header=[str(x).strip() if x is not None else '' for x in rows[0]]
+          idx={h:i for i,h in enumerate(header)}
+          required=['Station Name','Start Line','Start Code','End Line','End Code','Transfer time in seconds']
+          if not all(x in idx for x in required): raise SystemExit(f'Singapore header mismatch: {header}')
+          sg=[]
+          for r in rows[1:]:
+              t=num(r[idx['Transfer time in seconds']])
+              if t is None: continue
+              rec={k:r[idx[k]] for k in required}; rec['t']=t; sg.append(rec)
+          pairs=defaultdict(dict)
+          for x in sg:
+              a=(str(x['Start Line']),str(x['Start Code'])); b=(str(x['End Line']),str(x['End Code'])); key=(str(x['Station Name']),tuple(sorted((a,b))))
+              pairs[key][(a,b)]=x['t']
+          asym=[]
+          for k,d in pairs.items():
+              if len(d)>=2:
+                  vals=list(d.values()); asym.append(abs(vals[0]-vals[1]))
+          sg_manifest=json.loads(Path('singapore_manifest.json').read_text(encoding='utf-8'))
+          sg_profile={
+              'city':'Singapore / 新加坡','semantic_class':'COMMUNITY_MEASURED_DIRECTIONAL_INTERCHANGE_WALKING_TIME',
+              'valid_data_rows':len(sg),'worksheet_physical_rows_including_header':ws.max_row,'unique_stations':len({str(x['Station Name']) for x in sg}),
+              'transfer_time_sec':stats([x['t'] for x in sg]),'bidirectional_station_route_pairs':sum(1 for d in pairs.values() if len(d)>=2),
+              'nonzero_directional_asymmetry_pairs':sum(1 for x in asym if x>0),'absolute_directional_asymmetry_sec':stats(asym),
+              'manifest_declared_rows_including_header':sg_manifest.get('transfers_rows_including_header'),
+          }
+          sg_profile['manifest_workbook_row_count_consistent']=(sg_profile['manifest_declared_rows_including_header']==sg_profile['worksheet_physical_rows_including_header'])
+          if not sg_profile['manifest_workbook_row_count_consistent']:
+              sg_profile['qualification_warning']='MANIFEST_WORKBOOK_ROW_COUNT_CONFLICT_REQUIRES_RECONCILIATION'
+
+          gtfs=[
+              gtfs_profile('Boston / 波士顿','boston.zip'),gtfs_profile('Melbourne / 墨尔本','melbourne.zip'),gtfs_profile('Santiago / 圣地亚哥','santiago.zip'),
+              gtfs_profile('Budapest / 布达佩斯','budapest.zip'),gtfs_profile('New York / 纽约','nyc.zip')]
+          lon_manifest=json.loads(Path('london_manifest.json').read_text(encoding='utf-8'))
+          with zipfile.ZipFile('london.zip') as z:
+              names=z.namelist(); target=next((n for n in names if n.endswith('interchange_times.json')),None)
+              lon_records=None
+              if target:
+                  obj=json.loads(z.read(target).decode('utf-8'))
+                  if isinstance(obj,list): lon_records=len(obj)
+                  elif isinstance(obj,dict): lon_records=len(obj)
+              london={'city':'London / 伦敦','semantic_class':'PROCESSED_MIXED_TRANSFER_SEMANTICS','source_record_count':lon_records,'evidence_note':lon_manifest.get('evidence_note'),'physical_kernel_eligibility':'PARTIAL_ONLY_GATE_TO_PLATFORM_WALKING; INTERCHANGE_VALUES_INCLUDE_WAITING_PENALTY'}
+
+          ladder=[
+            {'level':'K0','class':'SCALAR_CONSTANT','meaning':'single assumed transfer constant'},
+            {'level':'K1','class':'PHYSICAL_LOWER_BOUND','meaning':'direction/station-specific minimum transfer constraint'},
+            {'level':'K2','class':'DIRECTIONAL_MEASURED_WALK','meaning':'measured direction-specific walking evidence'},
+            {'level':'K3','class':'FACILITY_PATH_GRAPH','meaning':'pathway/level graph and traversal-time constraints'},
+            {'level':'K4','class':'EMPIRICALLY_INFERRED_DISTRIBUTION','meaning':'realized passenger transfer-time kernel inferred with passenger/service observations'}]
+          out={'schema':'rail-transfer-structure-standardization.v1','singapore':sg_profile,'official_gtfs_profiles':gtfs,'london':london,'transfer_evidence_ladder':ladder,
+               'hard_semantic_rules':['transfers.txt edges are not station-equivalence relations','facility/pathway times are constraints or priors, not observed passenger distributions','generalized interchange time including waiting penalty is not a physical walking kernel','direction-specific evidence must not be symmetrized without an explicit test'],
+               'evidence_state':'MULTICITY_TRANSFER_STRUCTURE_PROFILED'}
+          Path('rail_transfer_structure_summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist standardized profile
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/tr"
+          f=rail_transfer_structure_summary.json
+          rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          local_bytes="$(stat -c '%s' "$f")"; remote_bytes="$(rclone size "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --json | jq -r '.bytes')"; test "$local_bytes" = "$remote_bytes"
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

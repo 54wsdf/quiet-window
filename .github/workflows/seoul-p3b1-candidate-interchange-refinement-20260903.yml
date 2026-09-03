@@ -1,0 +1,191 @@
+name: Seoul P3B1 Candidate Interchange Refinement 2026-09-03
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seoul-p3b1-candidate-interchange-refinement-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore qualified layers
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/p3b1"; cd "$RUNNER_TEMP/p3b1"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p3b0_ordinary_transfer_support_audit_20260903.json" p3b0.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/transfer/static/서울교통공사_수도권 도시철도 환승 데이터_20250317.csv" transfer.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_departure_only_candidates_0700_1000.csv" departures.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Refine station and endpoint service support
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b1"
+          python - <<'PY'
+          import csv,io,json,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def nn(s):
+              s=unicodedata.normalize('NFKC',str(s or '')).strip();s=re.sub(r'\([^)]*\)|\[[^]]*\]','',s);s=re.sub(r'\s+','',s)
+              if s.endswith('역'):s=s[:-1]
+              return s
+          def parse14(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              s=''.join(ch for ch in str(v or '') if ch.isdigit())
+              return int(s) if s else None
+
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          p3b0=json.loads(Path('p3b0.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          line_map={k:v['service_subway_id'] for k,v in p1c['inferred_transfer_line_to_service_line'].items() if v.get('accepted')}
+          by_line_name={}
+          for c,x in cw.items():
+              by_line_name[(x['service_subway_id'],nn(x['dv_name']))]=x
+
+          dep_counts=Counter();dep_times=defaultdict(list)
+          with open('departures.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip();st=(row.get('statn_id') or '').strip();t=parse14(row.get('departure_detect_time'))
+                  if line and st:
+                      dep_counts[(line,st)]+=1
+                      if t:dep_times[(line,st)].append(t)
+          pair_counts=Counter();arr_times=defaultdict(list)
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip();st=(row.get('statn_id') or '').strip();t=parse14(row.get('arrival_detect_time'))
+                  if line and st:
+                      pair_counts[(line,st)]+=1
+                      if t:arr_times[(line,st)].append(t)
+
+          # Rebuild exact unique-interchange candidates with service station IDs and physical duration rows.
+          raw=Path('transfer.csv').read_bytes();enc=detect(raw[:262144]);r=csv.DictReader(io.StringIO(raw.decode(enc,errors='replace')));fields=r.fieldnames or []
+          scf=next(k for k in fields if '환승시작 코드' in k);ecf=next(k for k in fields if '환승종료역 코드' in k)
+          grouped=defaultdict(list);pair_stations=defaultdict(set)
+          for row in r:
+              sl=(row.get('환승시작 호선') or '').strip();el=(row.get('환승종료 호선') or '').strip()
+              if sl not in line_map or el not in line_map:continue
+              il=line_map[sl];ol=line_map[el];sc=z4(row.get(scf));ec=z4(row.get(ecf));cs=cw.get(sc);ce=cw.get(ec)
+              if not cs or not ce or cs['service_subway_id']!=il or ce['service_subway_id']!=ol:continue
+              sn=nn(row.get('환승시작역'));en=nn(row.get('환승종료역'));station=sn if sn==en else f'{sn}->{en}'
+              rec={'incoming_line':il,'outgoing_line':ol,'station':station,'start_code':sc,'end_code':ec,'start_service_station':cs['service_statn_id'],'end_service_station':ce['service_statn_id'],'incoming_seq':seqnum(cs.get('service_statn_sn')),'outgoing_seq':seqnum(ce.get('service_statn_sn')),'duration_raw':(row.get('소요시간') or '').strip(),'incoming_direction_label':(row.get('하차 열차 방면') or '').strip(),'outgoing_direction_label':(row.get('환승 열차 방면') or '').strip()}
+              grouped[(il,ol,station)].append(rec);pair_stations[(il,ol)].add(station)
+          candidates={k:v for k,v in grouped.items() if len(pair_stations[(k[0],k[1])])==1}
+
+          # Counters for AFC support per candidate.
+          stats={k:Counter() for k in candidates};origins={k:Counter() for k in candidates};dests={k:Counter() for k in candidates};dirs={k:Counter() for k in candidates};travel={k:[] for k in candidates}
+          candidate_by_pair={(k[0],k[1]):k for k in candidates}
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');rr=csv.DictReader(f)
+              for row in rr:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  key=candidate_by_pair.get((a['service_subway_id'],b['service_subway_id']))
+                  if key is None:continue
+                  t0=parse14(row.get('RIDE_DTM'));t1=parse14(row.get('ALGH_DTM'))
+                  if not t0 or not (t0.date().isoformat()=='2026-08-29' and 7<=t0.hour<9):continue
+                  s=stats[key];s['am_candidate_rows']+=1
+                  if not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  s['valid_od_time_rows']+=1;travel[key].append((t1-t0).total_seconds())
+                  okey=(a['service_subway_id'],a['service_statn_id']);dkey=(b['service_subway_id'],b['service_statn_id'])
+                  odep=dep_counts.get(okey,0)>0;darr=pair_counts.get(dkey,0)>0
+                  s['origin_departure_supported']+=int(odep);s['destination_arrival_supported']+=int(darr);s['endpoint_both_supported']+=int(odep and darr)
+                  origins[key][a['out_stn_num'] if 'out_stn_num' in a else z4(row.get('RIDE_BSST_ID'))]+=1
+                  dests[key][b['out_stn_num'] if 'out_stn_num' in b else z4(row.get('ALGH_BSST_ID'))]+=1
+                  # Direction relative to transfer by line station sequence; diagnostic only.
+                  tr=candidates[key][0]
+                  osn=seqnum(a.get('service_statn_sn'));dsn=seqnum(b.get('service_statn_sn'));isn=tr['incoming_seq'];os2=tr['outgoing_seq']
+                  idir='UNKNOWN' if osn is None or isn is None or osn==isn else ('INCREASING_SEQ' if osn<isn else 'DECREASING_SEQ')
+                  odir='UNKNOWN' if dsn is None or os2 is None or dsn==os2 else ('INCREASING_SEQ' if os2<dsn else 'DECREASING_SEQ')
+                  dirs[key][f'{idir}->{odir}']+=1
+              f.close()
+
+          out=[]
+          for key,recs in candidates.items():
+              il,ol,station=key;s=stats[key];tr=recs[0];ik=(il,tr['start_service_station']);ok=(ol,tr['end_service_station'])
+              vals=travel[key]
+              durations=[]
+              for rec in recs:
+                  x=rec['duration_raw'];m=re.fullmatch(r'(\d+):(\d+)',x)
+                  if m:durations.append(int(m.group(1))*60+int(m.group(2)))
+                  else:
+                      try:durations.append(float(x))
+                      except:pass
+              row={
+                'incoming_line':il,'outgoing_line':ol,'station':station,
+                'incoming_transfer_station_id':tr['start_service_station'],'outgoing_transfer_station_id':tr['end_service_station'],
+                'incoming_transfer_arrival_pairs':pair_counts.get(ik,0),'incoming_transfer_departures':dep_counts.get(ik,0),'outgoing_transfer_arrival_pairs':pair_counts.get(ok,0),'outgoing_transfer_departures':dep_counts.get(ok,0),
+                'directional_transfer_rows':len(recs),'physical_shortest_transfer_sec_min':min(durations) if durations else None,'physical_shortest_transfer_sec_median':statistics.median(durations) if durations else None,
+                'am_candidate_rows':s['am_candidate_rows'],'valid_od_time_rows':s['valid_od_time_rows'],'origin_departure_supported_rows':s['origin_departure_supported'],'destination_arrival_supported_rows':s['destination_arrival_supported'],'endpoint_both_supported_rows':s['endpoint_both_supported'],
+                'endpoint_both_supported_share':s['endpoint_both_supported']/s['valid_od_time_rows'] if s['valid_od_time_rows'] else None,
+                'observed_od_travel_time_median_sec':statistics.median(vals) if vals else None,'observed_od_travel_time_p90_sec':sorted(vals)[round((len(vals)-1)*.9)] if vals else None,
+                'direction_structure_counts':dict(dirs[key]),'top_origin_station_codes':dict(origins[key].most_common(10)),'top_destination_station_codes':dict(dests[key].most_common(10))
+              }
+              # Gate requires actual arrival support at incoming transfer station and departure support at outgoing transfer station.
+              row['service_chain_transfer_gate']=bool(row['incoming_transfer_arrival_pairs']>=20 and row['outgoing_transfer_departures']>=20)
+              out.append(row)
+          out.sort(key=lambda x:(x['service_chain_transfer_gate'],x['endpoint_both_supported_rows'],x['am_candidate_rows']),reverse=True)
+          qualified=[x for x in out if x['service_chain_transfer_gate'] and x['endpoint_both_supported_rows']>=500 and (x['endpoint_both_supported_share'] or 0)>=0.5]
+          result={'schema':'mppd-n1-seoul-p3b1-candidate-interchange-refinement-v1','generated_at_utc':datetime.now(timezone.utc).isoformat(),'window':'AFC entry 2026-08-29 07:00-09:00; service-event support 07:00-10:00','candidate_count':len(out),'qualified_candidate_count':len(qualified),'qualified_candidates':qualified[:30],'all_candidates_top50':out[:50],'qualification':{'candidate_ready_for_bounded_pilot':bool(qualified),'recommended_first_candidate':qualified[0] if qualified else None},'evidence_boundary':['Candidate rows are structurally constrained one-transfer populations, not observed individual transfer-station choices.','Origin departure and destination arrival support are service-event availability checks, not passenger-to-train assignments.','Station sequence direction is diagnostic and does not itself prove realized passenger route direction.','Directional transfer duration is a physical shortest-transfer constraint, not an empirical walking distribution.','No T6 observed passenger train genealogy.']}
+          Path('seoul_p3b1_candidate_interchange_refinement_20260903.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('P3B1_CONCISE='+json.dumps({'candidate_count':len(out),'qualified_count':len(qualified),'top10':qualified[:10] if qualified else out[:10]},ensure_ascii=False))
+          PY
+
+      - name: Store refinement
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/p3b1"
+          F=seoul_p3b1_candidate_interchange_refinement_20260903.json;D="$REMOTE_NAME:$ROOT_DRIVE/99_manifests/$F"
+          rclone copyto "$F" "$D" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          L="$(stat -c '%s' "$F")";R="$(rclone size "$D" --config "$CONFIG_FILE" --json|jq -r '.bytes')";test "$L" = "$R"
+          echo SEOUL_P3B1_DURABLE_PASS
+
+      - name: Clean configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

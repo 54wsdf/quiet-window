@@ -1,0 +1,121 @@
+name: MPPD R1B G1E Corrected Service Micro V2 2026-09-04
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/mppd-r1b-g1e-corrected-service-micro-v2-20260904.yml
+
+permissions:
+  contents: read
+
+jobs:
+  r1b-g1e-corrected-service-micro-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      G1E_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1e_corrected_service_recompletion
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1e_corrected_service_micro_v2
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore corrected substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1b_g1e_micro"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$ROOT/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1E_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v4_corrected_recompletion.json" "$ROOT/service_init_g1e.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1E_DRIVE/g1e_corrected_service_trajectory_recompletion_summary.json" "$ROOT/g1e_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1b_g1e_micro'
+          svc=json.loads((root/'service_init_g1e.json').read_text())
+          s=json.loads((root/'g1e_summary.json').read_text())
+          assert svc.get('schema') == 'mppd.city-day-service-state-initialization.v4-corrected-graph-recompletion'
+          assert s.get('status') == 'G1E_CORRECTED_SERVICE_TRAJECTORY_RECOMPLETION_COMPLETED'
+          assert int(s.get('manifest',{}).get('final_state_count',-1)) == 1989
+          PY
+          cd "$ROOT"; sha256sum p1c.json cohorts.csv.gz routes.jsonl.gz service_init_g1e.json g1e_summary.json > input_sha256.txt
+
+      - name: Run paired G1E micro V2
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_g1e_micro"
+          python -m py_compile scripts/mppd_r1b_first_bidirectional_joint_update_v2_20260904.py
+          /usr/bin/time -v python -m scripts.mppd_r1b_first_bidirectional_joint_update_v2_20260904 \
+            --p1c "$ROOT/p1c.json" \
+            --cohorts "$ROOT/cohorts.csv.gz" \
+            --routes "$ROOT/routes.jsonl.gz" \
+            --service-init "$ROOT/service_init_g1e.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --sample-mod 50 \
+            --max-cohorts 1500 \
+            --beam 6 \
+            --max-skip 2 \
+            --min-service-usage 10 \
+            --out "$ROOT/out" \
+            2>&1 | tee "$ROOT/out/r1b_g1e_micro_v2_execution.log"
+          cp "$ROOT/input_sha256.txt" "$ROOT/out/r1b_g1e_micro_v2_input_sha256.txt"
+          cp "$ROOT/g1e_summary.json" "$ROOT/out/r1b_g1e_source_summary.json"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1b_g1e_micro'; out=root/'out'
+          result=json.loads((out/'r1b_first_bidirectional_joint_update_smoke_summary.json').read_text())
+          gates=result.get('r1b_minimum_gate',{})
+          assert all(gates.get(k) is True for k in ['passenger_evidence_updates_kernel_posterior','passenger_evidence_updates_service_timing','updated_state_redistributes_route_or_boarding_posterior','not_sequential_fixed_service_pipeline']), gates
+          e0=result.get('iteration',{}).get('E0_passenger_posterior',{})
+          e1=result.get('iteration',{}).get('E1_passenger_posterior',{})
+          assert 'EGRESS_INCOMPATIBLE' not in (e0.get('failure_mass') or {})
+          assert 'EGRESS_INCOMPATIBLE' not in (e1.get('failure_mass') or {})
+          manifest={'schema':'mppd.r1b-g1e-corrected-service-micro-v2-execution-manifest.v1','date':'2026-09-04','status':'R1B_G1E_MICRO_V2_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'sample':result.get('scope'),'r1b_minimum_gate':gates,'E0_failure_mass':e0.get('failure_mass'),'E1_failure_mass':e1.get('failure_mass'),'output_files':{},'scientific_boundary':['Paired deterministic micro comparison against R1B V2 micro; only service completion substrate changes from G1D v3 to G1E v4.','G1E creates no independent service root.'],'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='r1b_g1e_micro_v2_execution_manifest.json':
+                  manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'r1b_g1e_micro_v2_execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'scope':result.get('scope'),'gate':gates,'E0':e0,'E1':e1,'redistribution':result.get('iteration',{}).get('posterior_redistribution')},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"
+          find . -maxdepth 1 -type f ! -name r1b_g1e_micro_v2_output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > r1b_g1e_micro_v2_output_sha256.txt
+          cat r1b_first_bidirectional_joint_update_smoke_summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist paired G1E micro outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_g1e_micro/out"
+          for f in "$ROOT"/*; do
+            test -s "$f"
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,70 @@
+name: Cleanup Obsolete MetroFlow V1 Parts 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cleanup-obsolete-metroflow-v1-parts-20260905.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - name: Check durable-storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${GDRIVE_CONFIG_B64:-}" ]] || { echo 'Missing storage config' >&2; exit 3; }
+      - name: Install rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore temporary rclone config
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          [[ -n "$REMOTE_NAME" ]] || exit 4
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+      - name: Delete only obsolete member.part-* files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT='transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675/extracted/MetroFlow/metroData_ODFlow_10.csv.parts'
+          echo 'Before cleanup:'
+          rclone lsf '${{ steps.storage.outputs.remote_name }}:'"$ROOT" --config '${{ steps.storage.outputs.config_file }}' --include 'member.part-*' | tee /tmp/obsolete.txt
+          count="$(wc -l < /tmp/obsolete.txt | tr -d ' ')"
+          echo "obsolete_count=$count"
+          if [[ "$count" -gt 0 ]]; then
+            rclone delete '${{ steps.storage.outputs.remote_name }}:'"$ROOT" --config '${{ steps.storage.outputs.config_file }}' --include 'member.part-*' --retries 8 --low-level-retries 20
+          fi
+          remain="$(rclone lsf '${{ steps.storage.outputs.remote_name }}:'"$ROOT" --config '${{ steps.storage.outputs.config_file }}' --include 'member.part-*' | wc -l | tr -d ' ')"
+          echo "remaining_obsolete=$remain"
+          [[ "$remain" == '0' ]]
+          # Prove V2 readable parts remain present.
+          v2="$(rclone lsf '${{ steps.storage.outputs.remote_name }}:'"$ROOT" --config '${{ steps.storage.outputs.config_file }}' --include 'metroData_ODFlow_10.part-*.csv' | wc -l | tr -d ' ')"
+          echo "v2_parts_remaining=$v2"
+          [[ "$v2" -gt 0 ]]
+      - name: Clean temporary storage configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

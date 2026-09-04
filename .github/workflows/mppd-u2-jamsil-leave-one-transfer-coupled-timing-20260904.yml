@@ -1,0 +1,220 @@
+name: MPPD U2 Jamsil Leave-One Transfer-Coupled Timing 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u2-jamsil-leave-one-transfer-coupled-timing-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timing-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u2_jamsil_leave_one_transfer_coupled_timing
+
+    steps:
+      - name: Restore qualified passenger and service layers
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u2h/out"; cd "$RUNNER_TEMP/u2h"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Compare midpoint interpolation with transfer-coupled passenger timing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2h"
+          python - <<'PY'
+          import csv,hashlib,io,json,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          IN_LINE='1008'; OUT_LINE='1002'; IN_TRANSFER='1008000814'; OUT_TRANSFER='1002000216'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7,0); ENTRY_END=datetime(2026,8,29,8,30); END=datetime(2026,8,29,10,0)
+          K_GRID=(150,180); EGRESS_SEC=60; OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summarize(a):
+              return None if not a else {'n':len(a),'min':min(a),'p10':q(a,.1),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def selected_fold(tr):return hashlib.sha1(('u2h|'+tr).encode()).digest()[0]%3==0
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d and START<=a<END:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+
+          # Incoming line-8 origin -> Jamsil service segments remain fully observed in this mechanism test.
+          inbound=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line!=IN_LINE or IN_TRANSFER not in sts:continue
+              for ia,idp in sts[IN_TRANSFER]:
+                  for os,evs in sts.items():
+                      if os==IN_TRANSFER:continue
+                      prior=[(oa,od) for oa,od in evs if od<ia and 0<(ia-od).total_seconds()<=7200]
+                      if prior:
+                          oa,od=max(prior,key=lambda x:x[1]);inbound[os].append((od,ia,tr))
+          for st in inbound:inbound[st]=sorted(set(inbound[st]))
+
+          # Outgoing line-2 trains: keep a structural direction signature (the first observed downstream station)
+          # while hiding the held train's Jamsil timing. This is a timing-holdout mechanism probe, not route reconstruction.
+          out_train={}
+          for (line,tr),sts in trains.items():
+              if line!=OUT_LINE or OUT_TRANSFER not in sts:continue
+              dep=min(d for a,d in sts[OUT_TRANSFER])
+              downstream=[]
+              for ds,evs in sts.items():
+                  if ds==OUT_TRANSFER:continue
+                  aft=[a for a,d in evs if a>dep and 0<(a-dep).total_seconds()<=7200]
+                  if aft:downstream.append((min(aft),ds))
+              downstream.sort()
+              if not downstream:continue
+              sig=downstream[0][1]
+              run={ds:(a-dep).total_seconds() for a,ds in downstream}
+              out_train[tr]={'dep':dep,'sig':sig,'runtime':run}
+          by_sig=defaultdict(list)
+          for tr,x in out_train.items():by_sig[x['sig']].append((x['dep'],tr))
+          for sig in by_sig:by_sig[sig].sort()
+
+          # Passenger cohort, same strict line-aware boundary as U2 constraint field.
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a.get('service_subway_id')!=IN_LINE or b.get('service_subway_id')!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or not (START<=t0<ENTRY_END) or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  os=a.get('service_statn_id');ds=b.get('service_statn_id')
+                  if os in inbound:passengers.append((t0,t1,os,ds))
+              f.close()
+
+          folds=[]
+          for sig,seq in by_sig.items():
+              if len(seq)<4:continue
+              for i in range(1,len(seq)-1):
+                  dep,tr=seq[i]
+                  if not selected_fold(tr):continue
+                  prev_dep,prev_tr=seq[i-1];next_dep,next_tr=seq[i+1]
+                  gap=(next_dep-prev_dep).total_seconds()
+                  if gap<120 or gap>1800:continue
+                  # Estimate candidate trajectory from other trains in the same structural direction group.
+                  runtimes=defaultdict(list)
+                  for _,otr in seq:
+                      if otr==tr:continue
+                      for ds,rt in out_train[otr]['runtime'].items():runtimes[ds].append(rt)
+                  rtmed={ds:statistics.median(v) for ds,v in runtimes.items() if len(v)>=2}
+                  if len(rtmed)<3:continue
+                  midpoint=prev_dep+(next_dep-prev_dep)/2
+                  lo=prev_dep+timedelta(seconds=30);hi=next_dep-timedelta(seconds=30)
+                  grid=[];g=lo
+                  while g<=hi:
+                      grid.append(g);g+=timedelta(seconds=30)
+                  if not grid:continue
+
+                  # Visible outgoing trains in the same structural direction, excluding held train.
+                  visible=[]
+                  for vdep,vtr in seq:
+                      if vtr==tr:continue
+                      vr=out_train[vtr]['runtime'];visible.append((vdep,vtr,vr))
+                  visible.sort()
+
+                  def candidate_support(cdep):
+                      supported=0
+                      for t0,t1,os,ds in passengers:
+                          rt=rtmed.get(ds)
+                          if rt is None:continue
+                          carr=cdep+timedelta(seconds=rt)
+                          # Exit minute interval [t1,t1+59]; egress point from prior U2 near-optimal support is used only as
+                          # an exploratory mechanism prior, not a qualified final distribution.
+                          if not (t1<=carr+timedelta(seconds=EGRESS_SEC)<=t1+timedelta(seconds=59)):continue
+                          inc=[x for x in inbound[os] if t0<=x[0]<=t0+timedelta(minutes=45) and x[1]<t1+timedelta(seconds=59)]
+                          inc=sorted(inc,key=lambda x:x[1])[:8]
+                          ok=False
+                          for idep,iarr,itr in inc:
+                              # Insert candidate into visible same-direction departures. For a given K, the passenger boards
+                              # the first departure after arriving at platform at iarr+K.
+                              for K in K_GRID:
+                                  ready=iarr+timedelta(seconds=K)
+                                  options=[]
+                                  for vdep,vtr,vr in visible:
+                                      if vdep>=ready and ds in vr:
+                                          options.append((vdep,False,vdep+timedelta(seconds=vr[ds])))
+                                  if cdep>=ready:options.append((cdep,True,carr))
+                                  if not options:continue
+                                  first=min(options,key=lambda x:x[0])
+                                  if first[1]:ok=True;break
+                              if ok:break
+                          if ok:supported+=1
+                      return supported
+
+                  scores=[(candidate_support(g),g) for g in grid]
+                  maxscore=max(s for s,g in scores)
+                  best_candidates=[g for s,g in scores if s==maxscore]
+                  best=min(best_candidates,key=lambda x:abs((x-midpoint).total_seconds()))
+                  base_err=abs((midpoint-dep).total_seconds());coupled_err=abs((best-dep).total_seconds())
+                  folds.append({'train':tr,'direction_signature':sig,'true_dep':dep.isoformat(),'prev_dep':prev_dep.isoformat(),'next_dep':next_dep.isoformat(),'gap_sec':gap,'midpoint':midpoint.isoformat(),'midpoint_abs_error_sec':base_err,'passenger_best':best.isoformat(),'passenger_best_abs_error_sec':coupled_err,'max_passenger_support':maxscore,'grid_n':len(grid),'runtime_destinations':len(rtmed),'outcome':'WIN' if coupled_err<base_err else ('LOSS' if coupled_err>base_err else 'TIE')})
+
+          wins=sum(x['outcome']=='WIN' for x in folds);losses=sum(x['outcome']=='LOSS' for x in folds);ties=sum(x['outcome']=='TIE' for x in folds)
+          result={'schema':'mppd.u2-jamsil-leave-one-transfer-coupled-timing.v1','date':'2026-09-04','status':'CONTROLLED_TIMING_MECHANISM_PROBE_COMPLETED','fold_count':len(folds),'wins':wins,'ties':ties,'losses':losses,'midpoint_error_sec':summarize([x['midpoint_abs_error_sec'] for x in folds]),'transfer_coupled_error_sec':summarize([x['passenger_best_abs_error_sec'] for x in folds]),'support_count':summarize([x['max_passenger_support'] for x in folds]),'folds':folds,'scientific_boundary':['This is leave-one-train TIMING holdout with the held train structural direction signature retained; it is not free-count train discovery.','K_GRID=(150,180) and EGRESS_SEC=60 come from the preceding U2 identifiability diagnostic and therefore make this an exploratory mechanism probe, not a fully independent qualification.','The candidate downstream trajectory uses median running times from other visible trains in the same direction signature.','The passenger timing score never reads the held departure time; it is used only for final error scoring.','No raw card identifiers are persisted.'],'next_gate':'If transfer-coupled timing beats midpoint with stable support, rerun with per-fold movement-kernel calibration and distributional K/E priors; otherwise stop escalation and repair chain coverage/model semantics first.'}
+          (OUT/'u2_jamsil_leave_one_transfer_coupled_timing_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:v for k,v in result.items() if k!='folds'},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist aggregate mechanism result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2h/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

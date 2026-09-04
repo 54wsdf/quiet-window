@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from pathlib import Path
 
 
@@ -23,6 +24,12 @@ def _name_match(meta_row, aliases):
 def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
     overlay = load_overlay(overlay_or_path) if isinstance(overlay_or_path, (str, Path)) else overlay_or_path
     stations = {str(x["code"]): x for x in overlay.get("stations", [])}
+    component_by_code = {}
+    for comp in overlay.get("operational_components", []):
+        component_id = str(comp.get("component_id") or "").strip()
+        for code in comp.get("stations_in_service_order", []):
+            component_by_code[str(code)] = component_id
+
     inserted_nodes = []
     reused_nodes = []
     code_overrides = []
@@ -30,6 +37,7 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
     inline_records = []
     transfer_records = []
     unresolved_transfer_targets = []
+    resolved_transfer_count_by_component = Counter()
 
     for code, spec in stations.items():
         node = str(spec.get("node") or "").strip()
@@ -69,6 +77,7 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
             "old_nodes": old,
             "new_node": node,
             "mapping_action": spec.get("mapping_action"),
+            "operational_component_id": component_by_code.get(code),
         })
 
     for e in overlay.get("inline_edges", []):
@@ -97,9 +106,8 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
         if not spec.get("active"):
             continue
         source = code_to_nodes[code][0]
-        declared_targets = list(spec.get("transfer_targets", []))
-        resolved_for_station = 0
-        for target in declared_targets:
+        component_id = component_by_code.get(code)
+        for target in list(spec.get("transfer_targets", [])):
             line = str(target["line"])
             aliases = list(target.get("station_names") or [])
             matches = sorted(
@@ -110,6 +118,7 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
                 unresolved_transfer_targets.append({
                     "code": code,
                     "source": source,
+                    "operational_component_id": component_id,
                     "target_line": line,
                     "aliases": aliases,
                     "action": "UNRESOLVED_IN_BASE_REPRESENTATION",
@@ -131,17 +140,32 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
                         observed_ats=False,
                     )
                     action = "INSERTED"
-                resolved_for_station += 1
+                if component_id:
+                    resolved_transfer_count_by_component[component_id] += 1
                 transfer_records.append({
                     "code": code,
                     "source": source,
+                    "operational_component_id": component_id,
                     "target_line": line,
                     "target_node": target_node,
                     "aliases": aliases,
                     "action": action,
                 })
-        if declared_targets and resolved_for_station == 0:
-            raise ValueError(f"GTX-A transfer station has no resolvable target in current graph: code={code}, station={spec.get('name')}")
+
+    active_component_ids = [
+        str(comp.get("component_id") or "").strip()
+        for comp in overlay.get("operational_components", [])
+        if str(comp.get("status") or "").upper() == "ACTIVE"
+    ]
+    missing_component_attachment = [
+        component_id for component_id in active_component_ids
+        if resolved_transfer_count_by_component[component_id] == 0
+    ]
+    if missing_component_attachment:
+        raise ValueError(
+            "GTX-A operating component has no resolvable transfer attachment to the current base graph: "
+            + ",".join(missing_component_attachment)
+        )
 
     north = [code_to_nodes[c][0] for c in ["9000", "9001", "9002", "9004", "9005"]]
     south = [code_to_nodes[c][0] for c in ["9007", "9008", "9009", "9010"]]
@@ -162,10 +186,13 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
         "inline_edge_records": inline_records,
         "transfer_edge_records": transfer_records,
         "unresolved_transfer_targets": unresolved_transfer_targets,
+        "resolved_transfer_count_by_component": dict(resolved_transfer_count_by_component),
+        "all_active_components_have_base_network_attachment": not missing_component_attachment,
         "north_active_nodes": north,
         "south_active_nodes": south,
         "north_south_direct_edge_forbidden": True,
         "scientific_boundary": list(overlay.get("scientific_boundary") or []) + [
-            "Declared transfer targets absent from the coarse base graph are retained as unresolved provenance records and are never guessed into existence."
+            "Declared transfer targets absent from the coarse base graph are retained as unresolved provenance records and are never guessed into existence.",
+            "Qualification requires each active GTX-A operating component to have at least one explicitly resolved attachment to the existing network; it does not require every transfer station to be explicit in the coarse graph."
         ],
     }

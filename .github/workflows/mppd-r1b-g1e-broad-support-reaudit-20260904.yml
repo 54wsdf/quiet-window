@@ -1,0 +1,89 @@
+name: MPPD R1B G1E Broad Support Reaudit 2026-09-04
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - MPPD R1B G1E Corrected Service Broad V2 2026-09-04
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  g1e-broad-support-reaudit:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      G1E_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1e_corrected_service_recompletion
+      R1B_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1e_corrected_service_broad_v2
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1e_broad_support_reaudit
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+      - name: Restore G1E broad result and substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/g1e_broad_reaudit"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1E_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v4_corrected_recompletion.json" "$ROOT/service_g1e.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/r1b_g1e_broad.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Reaudit actual G1E broad posterior pressure
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/g1e_broad_reaudit"
+          python -m py_compile scripts/mppd_r1b_missing_service_support_proposal_audit_20260904.py
+          python -m scripts.mppd_r1b_missing_service_support_proposal_audit_20260904 \
+            --p1c "$ROOT/p1c.json" \
+            --service-init "$ROOT/service_g1e.json" \
+            --r1b-summary "$ROOT/r1b_g1e_broad.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --nearby-edges 3 \
+            --out "$ROOT/out" | tee "$ROOT/out/r1b_g1e_broad_support_reaudit.log"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'g1e_broad_reaudit'; out=root/'out'
+          r=json.loads((out/'r1b_missing_service_support_proposal_audit_summary.json').read_text())
+          manifest={'schema':'mppd.r1b-g1e-broad-support-reaudit-execution-manifest.v1','date':'2026-09-04','status':'R1B_G1E_BROAD_SUPPORT_REAUDIT_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'pressure_by_classification':r.get('pressure_by_classification'),'pressure_by_line':r.get('pressure_by_line'),'output_files':{},'scientific_boundary':['Uses actual G1E broad posterior pressure.','Classification only; no service state mutation.','Dominant-label V2 posterior pressure is transitional and will be superseded for final residual mass accounting by V3 weighted failure attribution.'],'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='r1b_g1e_broad_support_reaudit_manifest.json':
+                  manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'r1b_g1e_broad_support_reaudit_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'pressure_by_classification':r.get('pressure_by_classification'),'pressure_by_line':r.get('pressure_by_line'),'top_segments':r.get('top_segments',[])[:20]},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"; find . -maxdepth 1 -type f ! -name output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > output_sha256.txt
+          cat r1b_missing_service_support_proposal_audit_summary.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Persist reaudit outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/g1e_broad_reaudit/out"
+          for f in "$ROOT"/*; do
+            test -s "$f"
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

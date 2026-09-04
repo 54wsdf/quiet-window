@@ -30,6 +30,7 @@ jobs:
           set -euo pipefail
           test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
           C="$RUNNER_TEMP/rclone.conf"; umask 077
           printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"

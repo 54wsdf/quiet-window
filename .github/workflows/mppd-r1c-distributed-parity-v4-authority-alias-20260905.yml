@@ -1,0 +1,53 @@
+name: MPPD R1C Distributed Parity V4 Authority Alias 2026-09-05
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mppd-r1c-distributed-parity-v4-authority-alias-20260905.yml
+      - scripts/run_mppd_r1c_distributed_parity_v4_20260905.sh
+      - scripts/mppd_r1c_distributed_parity_compare_v4_authority_alias_20260905.py
+
+permissions:
+  contents: read
+
+jobs:
+  parity-v4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
+      MONO_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_context_aware_service_offset_consistency
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_distributed_parity_v4_authority_alias
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare parity environment
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+      - name: Run reusable high-precision parity
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: bash scripts/run_mppd_r1c_distributed_parity_v4_20260905.sh
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

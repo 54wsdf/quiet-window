@@ -1,0 +1,187 @@
+name: MPPD N1 Shanghai Structural Network ECD 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-shanghai-structural-ecd-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  structural-ecd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n1_shanghai_structural_ecd
+    steps:
+      - name: Prepare small public structural assets and Drive sink
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/shn1/out"; cd "$RUNNER_TEMP/shn1"
+          curl -fsSL https://ndownloader.figshare.com/files/46552846 -o od.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46553314 -o sections.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46553326 -o stations.csv
+
+      - name: Build active historical line-aware graph and structural ECD
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shn1"
+          python - <<'PY'
+          import csv,json,re
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          import networkx as nx
+
+          OUT=Path('out'); OUT.mkdir(exist_ok=True)
+          ACTIVE={1,2,3,4,5,6,7,8,9,10,11,12,13,16}
+          ALIAS={
+            (1,'黄陂南路'):'一大会址·黄陂南路',
+            (4,'浦电路4号线'):'浦电路',
+            (6,'浦电路6号线'):'浦电路',
+            (7,'上海大学站'):'上海大学',
+            (10,'新天地'):'一大会址·新天地',
+            (11,'李子园路'):'李子园',
+            (16,'上海野生动物园'):'野生动物园'
+          }
+          def dec(fn):
+              raw=Path(fn).read_bytes()
+              for e in ('utf-8-sig','gb18030','gb2312','cp936'):
+                  try:return raw.decode(e)
+                  except UnicodeDecodeError:pass
+              raise RuntimeError('decode')
+          def nn(s): return re.sub(r'\s+','',str(s or '').strip())
+          def canon(line,name): return nn(ALIAS.get((int(line),nn(name)),nn(name)))
+          def node(line,name): return f'{int(line)}|{canon(line,name)}'
+          def section_line(num):
+              try:n=int(float(str(num).strip()))
+              except:return None
+              return n//100
+
+          # Line-aware in-line graph from section table, historical active lines only.
+          G=nx.Graph(); section_edges=[]; line_nodes=defaultdict(set)
+          rr=csv.DictReader(dec('sections.csv').splitlines())
+          for r in rr:
+              line=section_line(r.get('Num'))
+              if line not in ACTIVE: continue
+              a=canon(line,r.get('Name1')); b=canon(line,r.get('Name2'))
+              u,v=node(line,a),node(line,b)
+              G.add_node(u,line=line,name=a); G.add_node(v,line=line,name=b); G.add_edge(u,v,kind='inline',weight=1.0,line=line)
+              line_nodes[line].update([a,b]); section_edges.append((line,a,b))
+
+          # Transfer edges from aggregated station Lines field; line-aware identity retained.
+          transfer_groups=[]
+          sr=csv.DictReader(dec('stations.csv').splitlines())
+          for r in sr:
+              name=nn(r.get('Name')); toks=[int(x) for x in re.findall(r'\d+',str(r.get('Lines') or '')) if int(x) in ACTIVE]
+              members=[]
+              for line in sorted(set(toks)):
+                  # Reconcile known rename variants; only add an edge when the line-aware node exists.
+                  candidates=[name]
+                  if name=='一大会址·黄陂南路': candidates.append('黄陂南路')
+                  if name=='一大会址·新天地': candidates.append('新天地')
+                  picked=None
+                  for c in candidates:
+                      n=node(line,c)
+                      if n in G: picked=n; break
+                  if picked: members.append(picked)
+              if len(members)>=2:
+                  transfer_groups.append({'name':name,'members':members})
+                  for i in range(len(members)):
+                      for j in range(i+1,len(members)):
+                          G.add_edge(members[i],members[j],kind='transfer',weight=1.0,transfer=f"{members[i].split('|')[0]}->{members[j].split('|')[0]}")
+
+          # OD load and routes.
+          odrows=[]; total_mass=0; mapped_mass=0; routed_mass=0; unmapped=[]; unrouted=[]
+          rr=csv.DictReader(dec('od.csv').splitlines())
+          for r in rr:
+              ol=int(r['进站线路']); dl=int(r['出站线路']); mass=int(float(r['OD量']))
+              if ol not in ACTIVE or dl not in ACTIVE or mass<=0: continue
+              total_mass+=mass; o=node(ol,r['进站站点']); d=node(dl,r['出站站点'])
+              if o not in G or d not in G:
+                  unmapped.append((o,d,mass)); continue
+              mapped_mass+=mass
+              if o==d: path=[o]
+              else:
+                  try:path=nx.shortest_path(G,o,d,weight='weight')
+                  except nx.NetworkXNoPath:
+                      unrouted.append((o,d,mass)); continue
+              routed_mass+=mass; odrows.append((o,d,mass,path))
+
+          seg_od=defaultdict(set);seg_o=defaultdict(set);seg_d=defaultdict(set);seg_routes=defaultdict(set);seg_trans=defaultdict(set);seg_up=defaultdict(set);seg_down=defaultdict(set);seg_mass=Counter()
+          xfer_od=defaultdict(set);xfer_routes=defaultdict(set);xfer_mass=Counter(); route_family_mass=Counter(); route_family_od=Counter()
+          transfer_count_mass=Counter()
+          for o,d,mass,path in odrows:
+              lines=[int(x.split('|',1)[0]) for x in path]; comp=[]
+              for l in lines:
+                  if not comp or comp[-1]!=l: comp.append(l)
+              fam='>'.join(map(str,comp)); route_family_mass[fam]+=mass; route_family_od[fam]+=1; transfer_count_mass[max(0,len(comp)-1)]+=mass
+              transitions=[f'{a}->{b}' for a,b in zip(comp,comp[1:])]
+              for u,v in zip(path,path[1:]):
+                  dat=G.get_edge_data(u,v) or {}
+                  if dat.get('kind')=='transfer':
+                      key='--'.join(sorted((u,v)));xfer_od[key].add((o,d));xfer_routes[key].add(fam);xfer_mass[key]+=mass;continue
+                  key='--'.join(sorted((u,v))); line=int(u.split('|',1)[0])
+                  seg_od[key].add((o,d));seg_o[key].add(o);seg_d[key].add(d);seg_routes[key].add(fam);seg_trans[key].update(transitions);seg_mass[key]+=mass
+                  if line in comp:
+                      ix=comp.index(line);seg_up[key].update(comp[:ix]);seg_down[key].update(comp[ix+1:])
+
+          segrows=[]
+          for key,m in seg_mass.items():
+              u,v=key.split('--'); line=int(u.split('|',1)[0])
+              segrows.append({'segment':key,'line':line,'n_independent_od':len(seg_od[key]),'n_origins':len(seg_o[key]),'n_destinations':len(seg_d[key]),'n_upstream_lines':len(seg_up[key]),'n_downstream_lines':len(seg_down[key]),'n_transfer_directions':len(seg_trans[key]),'n_shared_route_families':len(seg_routes[key]),'passenger_mass':m})
+          segrows.sort(key=lambda x:(x['n_independent_od'],x['n_shared_route_families'],x['n_transfer_directions'],x['passenger_mass']),reverse=True)
+          xrows=[{'transfer_edge':k,'n_independent_od':len(xfer_od[k]),'n_route_families':len(xfer_routes[k]),'passenger_mass':m} for k,m in xfer_mass.items()]
+          xrows.sort(key=lambda x:(x['n_independent_od'],x['n_route_families'],x['passenger_mass']),reverse=True)
+
+          with (OUT/'n1_shanghai_structural_segment_ecd_top1000.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(segrows[0]) if segrows else ['segment']);w.writeheader();w.writerows(segrows[:1000])
+          with (OUT/'n1_shanghai_structural_transfer_ecd.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(xrows[0]) if xrows else ['transfer_edge']);w.writeheader();w.writerows(xrows)
+          famrows=[{'line_sequence':k,'od_cells':route_family_od[k],'passenger_mass':v,'transfer_count':max(0,len(k.split('>'))-1)} for k,v in route_family_mass.most_common()]
+          with (OUT/'n1_shanghai_route_families.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(famrows[0]) if famrows else ['line_sequence']);w.writeheader();w.writerows(famrows)
+
+          summary={
+            'schema':'mppd.n1-shanghai-structural-ecd.v1','date':'2026-09-04','status':'N1_STRUCTURAL_NETWORK_ECD_COMPLETED',
+            'source':{'figshare_record':25904512,'od_file_id':46552846,'sections_file_id':46553314,'stations_file_id':46553326},
+            'graph':{'nodes':G.number_of_nodes(),'edges':G.number_of_edges(),'inline_edges':sum(1 for _,_,x in G.edges(data=True) if x.get('kind')=='inline'),'transfer_edges':sum(1 for _,_,x in G.edges(data=True) if x.get('kind')=='transfer'),'transfer_groups':len(transfer_groups),'active_lines':sorted(ACTIVE)},
+            'od':{'total_mass':total_mass,'mapped_mass':mapped_mass,'routed_mass':routed_mass,'mapped_share':mapped_mass/total_mass if total_mass else 0,'routed_share':routed_mass/total_mass if total_mass else 0,'unmapped_cells':len(unmapped),'unrouted_cells':len(unrouted)},
+            'transfer_count_mass':{str(k):v for k,v in sorted(transfer_count_mass.items())},
+            'top_segments':segrows[:30],'top_transfers':xrows[:30],'top_route_families':famrows[:30],
+            'scientific_boundary':['All routes are active-line structural shortest-path proxies, not observed route choice.','This dataset has aggregate peak OD and therefore cannot provide service-phase entropy or actual service recovery truth.','Line-aware identities are retained and known rename aliases are reconciled; extra lines 14/15/18 are excluded because they are absent from the OD demand world.','N1 Shanghai is for network-patch/ECD target design; timed certification must use Seoul/Hangzhou/other individual observations.'],
+            'next_gate':'Cross-reference high structural-ECD segments/line sequences with timestamped Seoul/Hangzhou network patches; use Seoul partial service anchors for same-target network-vs-local certification.'
+          }
+          (OUT/'n1_shanghai_structural_ecd_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist aggregate structural outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shn1/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

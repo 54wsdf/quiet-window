@@ -1,0 +1,69 @@
+name: MPPD G0J Unmapped Code Source Discovery 2026-09-04
+
+on:
+  push:
+    paths:
+      - 'scripts/mppd_g0j_unmapped_code_source_discovery_20260904.py'
+      - '.github/workflows/mppd-g0j-unmapped-code-source-discovery-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g0j-unmapped-code-source-discovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g0j_unmapped_code_source_discovery
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore raw TAIMS and G0I residual code list
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/g0j/out"
+          rclone copyto "$R:$SEOUL_ROOT/passenger/20260902/TAIMS_20260902.zip" "$RUNNER_TEMP/g0j/TAIMS.zip" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0i_generalized_unmapped_scope_audit/g0i_unmapped_endpoint_code_audit.csv" "$RUNNER_TEMP/g0j/codes.csv" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+
+      - name: Discover independent raw metadata sources for unmapped codes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/mppd_g0j_unmapped_code_source_discovery_20260904.py
+          python -m scripts.mppd_g0j_unmapped_code_source_discovery_20260904 \
+            --taims "$RUNNER_TEMP/g0j/TAIMS.zip" \
+            --codes "$RUNNER_TEMP/g0j/codes.csv" \
+            --out "$RUNNER_TEMP/g0j/out" | tee "$RUNNER_TEMP/g0j/out/g0j_execution.log"
+          cat "$RUNNER_TEMP/g0j/out/g0j_unmapped_code_source_discovery.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist G0J source discovery outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/g0j/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

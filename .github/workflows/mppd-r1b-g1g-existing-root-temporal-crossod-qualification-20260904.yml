@@ -1,0 +1,92 @@
+name: MPPD R1B G1G Existing Root Temporal CrossOD Qualification 2026-09-04
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/mppd_r1b_g1g_existing_root_temporal_crossod_qualification_20260904.py
+      - .github/workflows/mppd-r1b-g1g-existing-root-temporal-crossod-qualification-20260904.yml
+
+permissions:
+  contents: read
+
+jobs:
+  g1g-existing-root-temporal-crossod-qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
+      G1F_REPLAY_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1f_residual_service_support_targeted_replay
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1g_existing_root_temporal_crossod_qualification
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+      - name: Restore G1F authority and residual evidence
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/g1g"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service_g1f.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_REPLAY_DRIVE/r1b_g1f_residual_service_support_evidence_join.json" "$ROOT/evidence_join.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_REPLAY_DRIVE/r1b_residual_service_support_targeted_replay_cohorts.jsonl.gz" "$ROOT/residual_cohorts.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          cd "$ROOT"; sha256sum p1c.json service_g1f.json evidence_join.json residual_cohorts.jsonl.gz > input_sha256.txt
+      - name: Run G1G qualification audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/g1g"
+          python -m py_compile scripts/mppd_r1b_g1g_existing_root_temporal_crossod_qualification_20260904.py
+          python -m scripts.mppd_r1b_g1g_existing_root_temporal_crossod_qualification_20260904 \
+            --p1c "$ROOT/p1c.json" --service-init "$ROOT/service_g1f.json" \
+            --evidence-join "$ROOT/evidence_join.json" --residual-cohorts "$ROOT/residual_cohorts.jsonl.gz" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --out "$ROOT/out" | tee "$ROOT/out/g1g_execution.log"
+          cp "$ROOT/input_sha256.txt" "$ROOT/out/input_sha256.txt"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'g1g'/'out'
+          p=out/'r1b_g1g_existing_root_temporal_crossod_qualification.json'
+          s=json.loads(p.read_text())
+          assert s['schema']=='mppd.r1b-g1g-existing-root-temporal-crossod-qualification.v1'
+          assert s['status']=='G1G_EXISTING_ROOT_TEMPORAL_CROSSOD_QUALIFICATION_COMPLETED_NO_SERVICE_MUTATION'
+          assert s['source_service_schema']=='mppd.city-day-service-state-initialization.v5-observed-event-preserving-corrected-recompletion'
+          assert s['source_evidence_join_schema']=='mppd.r1b-g1f-residual-service-support-evidence-join.v1'
+          assert abs(float(s['scope']['eligible_pressure_mass_represented'])-125.18986095427873) <= 1e-6, s['scope']
+          manifest={'schema':'mppd.r1b-g1g-existing-root-temporal-crossod-qualification-execution-manifest.v1','date':'2026-09-04','status':'G1G_QUALIFICATION_AUDIT_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'scope':s['scope'],'output_files':{},'scientific_boundary':['Qualification only; no service state is mutated.','High temporal-support proposals are bounded repair trials, not observed service truth.','New latent roots remain forbidden in G1G.'],'no_email_notification_logic':True}
+          for f in sorted(out.iterdir()):
+              if f.is_file() and f.name!='execution_manifest.json': manifest['output_files'][f.name]={'bytes':f.stat().st_size,'sha256':hashlib.sha256(f.read_bytes()).hexdigest()}
+          (out/'execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'scope':s['scope'],'top_proposals':s['proposals'][:10]},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"; find . -maxdepth 1 -type f ! -name output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > output_sha256.txt
+      - name: Persist G1G outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/g1g/out"
+          for f in "$ROOT"/*; do test -s "$f"; rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

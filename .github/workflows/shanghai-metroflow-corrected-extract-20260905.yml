@@ -1,0 +1,71 @@
+name: Shanghai MetroFlow Corrected Extract 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/shanghai-metroflow-corrected-extract-20260905.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - name: Check durable-storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${GDRIVE_CONFIG_B64:-}" ]] || { echo 'Missing storage config' >&2; exit 3; }
+      - name: Checkout public fetchers
+        uses: actions/checkout@v5
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore temporary rclone config
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          [[ -n "$REMOTE_NAME" ]] || exit 4
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+      - name: Extract corrected release and mirror accessible members
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetchers/zip_extract_to_rclone.py \
+            --url 'https://ndownloader.figshare.com/files/68207551' \
+            --dataset-id metroflow_shanghai_corrected_33436675 \
+            --drive-path transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675 \
+            --config '${{ steps.storage.outputs.config_file }}' \
+            --remote '${{ steps.storage.outputs.remote_name }}' \
+            --direct-file-max-mib 220 \
+            --partition-target-mib 160
+      - name: Clean temporary storage configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

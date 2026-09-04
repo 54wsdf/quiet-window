@@ -1,0 +1,74 @@
+name: MPPD G0B Topology Residual Audit 2026-09-04
+
+on:
+  push:
+    paths:
+      - 'scripts/mppd_g0b_topology_residual_audit_20260904.py'
+      - '.github/workflows/mppd-g0b-topology-residual-audit-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g0b-topology-residual-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      G0_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g0_full_network_coverage
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g0b_topology_residual_audit
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore topology residual inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/g0b/out"
+          rclone copyto "$R:$SEOUL_ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/g0b/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G0_DRIVE/g0_full_network_unrouted_codepairs.csv" "$RUNNER_TEMP/g0b/unrouted.csv" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+
+      - name: Run AFC-driven topology residual audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/mppd_g0b_topology_residual_audit_20260904.py
+          python scripts/mppd_g0b_topology_residual_audit_20260904.py \
+            --p1c "$RUNNER_TEMP/g0b/p1c.json" \
+            --unrouted "$RUNNER_TEMP/g0b/unrouted.csv" \
+            --out "$RUNNER_TEMP/g0b/out" | tee "$RUNNER_TEMP/g0b/out/g0b_topology_residual_audit.log"
+          cat "$RUNNER_TEMP/g0b/out/g0b_topology_residual_audit_summary.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist topology residual audit outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/g0b/out"
+          test "$(find . -maxdepth 1 -type f | wc -l)" -gt 0
+          for f in *; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

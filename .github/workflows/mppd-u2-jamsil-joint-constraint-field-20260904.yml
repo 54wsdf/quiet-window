@@ -25,6 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check numpy
           CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
           printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
           REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
@@ -74,7 +75,6 @@ jobs:
 
           p1c=json.loads(Path('p1c.json').read_text())
           cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
-          # Build same-train service segments origin->Jamsil and Jamsil->destination.
           trains=defaultdict(lambda:defaultdict(list))
           with open('paired.csv',encoding='utf-8',newline='') as f:
               for row in csv.DictReader(f):
@@ -103,7 +103,6 @@ jobs:
           for st in inbound: inbound[st]=sorted(set(inbound[st]))
           for st in outbound: outbound[st]=sorted(set(outbound[st]))
 
-          # Passenger cohort. No identifier is persisted.
           passengers=[]
           with zipfile.ZipFile('TAIMS.zip') as z:
               f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
@@ -117,12 +116,9 @@ jobs:
                   if os in inbound and ds in outbound:passengers.append((t0,t1,os,ds))
               f.close()
 
-          # Enumerate a bounded but non-parametric feasible service-chain set per passenger.
-          # Entry/exit AFC minute stamps are intervals [t,t+59]. No fixed transfer time is imposed.
           chain_rows=[]; passenger_stats=[]; od_counts=Counter(); all_A=[];all_K=[];all_Elo=[];all_Ehi=[]
           for pi,(t0,t1,os,ds) in enumerate(passengers):
               od_counts[(os,ds)]+=1; inc=[x for x in inbound[os] if t0<=x[0]<=t0+timedelta(minutes=45) and x[1]<t1+timedelta(seconds=59)]
-              # retain first 8 services reaching transfer earliest after entry
               inc=sorted(inc,key=lambda x:(x[1],x[0],x[2]))[:8]
               cand=[]
               for idep,iarr,itr in inc:
@@ -143,7 +139,6 @@ jobs:
                   all_A+=au;all_K+=ku;all_Elo+=el;all_Ehi+=eh
                   passenger_stats.append({'n':len(cand),'access_upper_min':min(au),'transfer_upper_min':min(ku),'egress_low_min':min(el),'egress_high_max':max(eh),'heldout_od':od_holdout(os,ds),'od':(os,ds),'candidates':cand})
 
-          # Joint scalar feasibility surface is a diagnostic of constraint shrinkage, not the final distributional model.
           AGRID=list(range(0,301,30));KGRID=list(range(60,361,30));EGRID=list(range(0,601,60))
           def score(params,subset):
               A,K,E=params;ok=0;unique=0;chain_sum=0
@@ -159,7 +154,6 @@ jobs:
               for K in KGRID:
                   for E in EGRID:
                       cov,uni,nc=score((A,K,E),train)
-                      # reward coverage, then parsimony/uniqueness; no service truth used.
                       objective=cov+0.15*uni-0.002*max(0,nc-1)
                       surface.append((objective,cov,uni,nc,A,K,E))
           surface.sort(reverse=True);best=surface[0]
@@ -176,7 +170,6 @@ jobs:
             'scientific_boundary':['All direct service events are used only to construct the current service-chain constraint field; this run does NOT yet reconstruct hidden service.','The scalar grid is an identifiability diagnostic, not the canonical station-time model; V3 requires distributions and joint service inference.','Transfer waiting is induced by the selected downstream service gate; it is not an independent free parameter.','Exit has no next-service waiting term.','No raw card identifier is retained.'],
             'next_gate':'Hide selected whole-train service states and jointly optimize hidden service timing plus station-time distributions against the same held-out-OD/passenger constraints.'}
           (OUT/'u2_jamsil_joint_constraint_field_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
-          # Save only aggregate/top surface, no passenger records.
           with (OUT/'u2_jamsil_joint_scalar_surface_top500.csv').open('w',encoding='utf-8',newline='') as f:
               w=csv.writer(f);w.writerow(['objective','train_coverage','train_unique','train_mean_chains','A_sec','K_sec','E_sec']);w.writerows(surface[:500])
           print(json.dumps(result,ensure_ascii=False,indent=2))

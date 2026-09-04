@@ -1,0 +1,314 @@
+name: MPPD U1 Seoul Count-Free Five-Fold CV 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-seoul-count-free-fivefold-cv-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fivefold:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_count_free_fivefold_cv
+    outputs:
+      trains: ${{ steps.run.outputs.trains }}
+      tr60_r: ${{ steps.run.outputs.tr60_r }}
+      tr60_p: ${{ steps.run.outputs.tr60_p }}
+      tr60_f: ${{ steps.run.outputs.tr60_f }}
+      evtruth: ${{ steps.run.outputs.evtruth }}
+      evpred: ${{ steps.run.outputs.evpred }}
+      ev60_m: ${{ steps.run.outputs.ev60_m }}
+      ev60_r: ${{ steps.run.outputs.ev60_r }}
+      ev60_p: ${{ steps.run.outputs.ev60_p }}
+      ev60_f: ${{ steps.run.outputs.ev60_f }}
+      ev120_f: ${{ steps.run.outputs.ev120_f }}
+      foldmin: ${{ steps.run.outputs.foldmin }}
+      foldmed: ${{ steps.run.outputs.foldmed }}
+      foldmax: ${{ steps.run.outputs.foldmax }}
+
+    steps:
+      - name: Restore Seoul AFC, service evidence, and line crosswalk
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u1cv/out"; cd "$RUNNER_TEMP/u1cv"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Run disjoint five-fold whole-train validation
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1cv"
+          python - <<'PY'
+          import csv,hashlib,io,json,math,os,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          LINE='1008'; START=datetime(2026,8,29,7); END=datetime(2026,8,29,10); FRESH=120
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          QGRID=[0.70,0.75,0.80,0.85,0.88,0.90,0.92,0.94,0.96,0.98]
+          SEPGRID=[90,120,150,180,210,240,300];BLOCK_SEC=75;OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit());return int(d) if d else None
+          def mf(t):return t.replace(second=0,microsecond=0)
+          def fold_of(tr):return hashlib.sha1(tr.encode()).digest()[0]%5
+          def pseudo_holdout(fold,tr):return hashlib.sha1((f'cv{fold}|pseudo|'+tr).encode()).digest()[0]%5==0
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def pearson(x,y):
+              if len(x)<3:return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              if vx<=0 or vy<=0:return 0.0
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy)
+          def robust_z(v,vals):
+              if not vals:return 0.0
+              med=statistics.median(vals);mad=statistics.median(abs(x-med) for x in vals);return (v-med)/max(1.0,1.4826*mad)
+          def median_dt(vals):
+              if not vals:return None
+              return datetime.fromtimestamp(statistics.median(sorted(v.timestamp() for v in vals)))
+          def classify(st_times,seq):
+              pairs=sorted((seq[s],t.timestamp()) for s,t in st_times.items() if s in seq and seq[s] is not None)
+              if len(pairs)<4:return None
+              c=pearson([x for x,y in pairs],[y for x,y in pairs]);return ('INC' if c>0 else 'DEC') if abs(c)>=0.35 else None
+          def nms(items,sep):
+              chosen=[]
+              for t,s in sorted(items,key=lambda z:(z[1],-z[0].timestamp()),reverse=True):
+                  if all(abs((t-u).total_seconds())>=sep for u,v in chosen):chosen.append((t,s))
+              return sorted(chosen)
+          def match_times(truth,pred,tol):
+              used=set();ds=[]
+              for t in sorted(truth):
+                  cc=[(abs((p-t).total_seconds()),j) for j,p in enumerate(pred) if j not in used and abs((p-t).total_seconds())<=tol]
+                  if cc:
+                      d,j=min(cc);used.add(j);ds.append(d)
+              return len(ds),ds
+          def metric_times(truth,pred,tol):
+              mn,ds=match_times(truth,pred,tol);tn=len(truth);pn=len(pred)
+              return {'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else 0,'precision':mn/pn if pn else 0,'f1':2*mn/(tn+pn) if tn+pn else 0,'median_abs_error_sec':statistics.median(ds) if ds else None}
+          def metric_station(truth,pred,tol):
+              bt=defaultdict(list);bp=defaultdict(list)
+              for st,t in truth:bt[st].append(t)
+              for st,t in pred:bp[st].append(t)
+              mn=0;ds=[]
+              for st,tt in bt.items():
+                  pp=sorted(bp.get(st,[]));used=set()
+                  for t in sorted(tt):
+                      cc=[(abs((p-t).total_seconds()),j) for j,p in enumerate(pp) if j not in used and abs((p-t).total_seconds())<=tol]
+                      if cc:
+                          d,j=min(cc);used.add(j);mn+=1;ds.append(d)
+              tn=len(truth);pn=len(pred)
+              return {'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else 0,'precision':mn/pn if pn else 0,'f1':2*mn/(tn+pn) if tn+pn else 0,'median_abs_error_sec':statistics.median(ds) if ds else None}
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          canonical=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in canonical};stations={x['service_statn_id']:{'name':x.get('dv_name'),'seq':seqnum(x.get('service_statn_sn'))} for x in canonical};seq={s:v['seq'] for s,v in stations.items()}
+          minutes=[START+timedelta(minutes=i,seconds=30) for i in range(180)]
+
+          exit_hist=defaultdict(Counter);exit_mass=Counter();afc_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  if not (START<=t0<END and START<=t1<END) or a['service_statn_id']==b['service_statn_id']:continue
+                  s=b['service_statn_id'];exit_hist[s][mf(t1)]+=1;exit_mass[s]+=1;afc_rows+=1
+              f.close()
+
+          pat=re.compile(r'subarr_(260829(\d{6}))');obs=defaultdict(dict)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,snap in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      if (row.get('subway_id') or '').strip()!=LINE or (row.get('arvl_cd') or '').strip() not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();state=(row.get('arvl_cd') or '').strip()
+                      if not t or not tr or st not in stations:continue
+                      age=(snap-t).total_seconds();key=(tr,st);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+          truth=[]
+          for (tr,st),d in obs.items():
+              items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in items:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':truth.append((tr,st,t))
+                  prev=s
+          by_train=defaultdict(dict)
+          for tr,st,t in truth:
+              if st not in by_train[tr] or t<by_train[tr][st]:by_train[tr][st]=t
+          directions={tr:classify(sts,seq) for tr,sts in by_train.items()};directions={tr:d for tr,d in directions.items() if d}
+          universe=set(directions)
+
+          def build_model(anchor_trains):
+              model={}
+              for direction in ('INC','DEC'):
+                  trs=[tr for tr in anchor_trains if directions.get(tr)==direction]
+                  coverage=Counter(s for tr in trs for s in by_train[tr]);ref=coverage.most_common(1)[0][0] if coverage else None
+                  off=defaultdict(list)
+                  if ref:
+                      for tr in trs:
+                          if ref not in by_train[tr]:continue
+                          rt=by_train[tr][ref]
+                          for s,t in by_train[tr].items():off[s].append((t-rt).total_seconds())
+                  offsets={s:statistics.median(v) for s,v in off.items() if len(v)>=3}
+                  intercepts={}
+                  for tr in trs:
+                      vals=[t-timedelta(seconds=offsets[s]) for s,t in by_train[tr].items() if s in offsets]
+                      m=median_dt(vals)
+                      if m:intercepts[tr]=m
+                  lag={};quality={}
+                  for s in offsets:
+                      if exit_mass[s]<20:continue
+                      arr=Counter(mf(by_train[tr][s]) for tr in trs if s in by_train[tr])
+                      vals=[]
+                      for l in range(11):
+                          xs=[];ys=[]
+                          for i in range(180):
+                              m=START+timedelta(minutes=i);xs.append(arr.get(m,0));ys.append(exit_hist[s].get(m+timedelta(minutes=l),0))
+                          vals.append((pearson(xs,ys),l))
+                      best=max(vals,key=lambda z:(z[0],-z[1]));lag[s]=best[1];quality[s]=best[0]
+                  model[direction]={'ref':ref,'offsets':offsets,'intercepts':intercepts,'lag':lag,'quality':quality}
+              return model
+
+          def ridge_scores(model,direction):
+              md=model[direction];usable=[];zcache={}
+              for s,off in md['offsets'].items():
+                  if s not in md['lag'] or exit_mass[s]<20:continue
+                  vals=[exit_hist[s].get(START+timedelta(minutes=i),0) for i in range(180)]
+                  zcache[s]=(vals,md['lag'][s]);usable.append((s,off,math.sqrt(exit_mass[s])*max(.05,md['quality'].get(s,0))))
+              scores=[]
+              for t0 in minutes:
+                  num=den=0.0
+                  for s,off,w in usable:
+                      em=mf(t0+timedelta(seconds=off))+timedelta(minutes=zcache[s][1]);z=robust_z(exit_hist[s].get(em,0),zcache[s][0]);num+=w*max(0,z);den+=w
+                  scores.append((t0,num/den if den else 0.0))
+              return scores
+
+          def target_intercepts(target,model,direction):
+              out=[]
+              for tr in target:
+                  if directions.get(tr)!=direction:continue
+                  vals=[t-timedelta(seconds=model[direction]['offsets'][s]) for s,t in by_train[tr].items() if s in model[direction]['offsets']]
+                  m=median_dt(vals)
+                  if m:out.append(m)
+              return sorted(out)
+
+          fold_rows=[];train_agg={30:[0,0,0],60:[0,0,0],120:[0,0,0]};event_agg={30:[0,0,0],60:[0,0,0],120:[0,0,0]}
+          for fold in range(5):
+              hidden={tr for tr in universe if fold_of(tr)==fold};visible=universe-hidden
+              pseudo={tr for tr in visible if pseudo_holdout(fold,tr)};calib=visible-pseudo
+              pmodel=build_model(calib);combos=[]
+              for qq in QGRID:
+                  for sep in SEPGRID:
+                      TN=PN=MN=0
+                      for direction in ('INC','DEC'):
+                          scores=ridge_scores(pmodel,direction);anchors=list(pmodel[direction]['intercepts'].values());unblocked=[(t,s) for t,s in scores if all(abs((t-a).total_seconds())>BLOCK_SEC for a in anchors)];th=q([s for t,s in unblocked],qq) if unblocked else 0;pred=[t for t,s in nms([(t,s) for t,s in unblocked if s>=th],sep)];tt=target_intercepts(pseudo,pmodel,direction);m=metric_times(tt,pred,60);TN+=m['truth_n'];PN+=m['pred_n'];MN+=m['matched']
+                      combos.append({'q':qq,'sep':sep,'tn':TN,'pn':PN,'mn':MN,'f1':2*MN/(TN+PN) if TN+PN else 0,'recall':MN/TN if TN else 0,'precision':MN/PN if PN else 0})
+              chosen=max(combos,key=lambda z:(z['f1'],z['recall'],z['precision']))
+              fmodel=build_model(visible);pred_intercepts=[];truth_intercepts=[];pred_events=[];truth_events=[]
+              dirinfo=[]
+              for direction in ('INC','DEC'):
+                  scores=ridge_scores(fmodel,direction);anchors=list(fmodel[direction]['intercepts'].values());unblocked=[(t,s) for t,s in scores if all(abs((t-a).total_seconds())>BLOCK_SEC for a in anchors)];th=q([s for t,s in unblocked],chosen['q']) if unblocked else 0;items=nms([(t,s) for t,s in unblocked if s>=th],chosen['sep']);pred=[t for t,s in items];tt=target_intercepts(hidden,fmodel,direction);pred_intercepts+=pred;truth_intercepts+=tt
+                  for t0 in pred:
+                      for st,off in fmodel[direction]['offsets'].items():pred_events.append((st,t0+timedelta(seconds=off)))
+                  for tr in hidden:
+                      if directions.get(tr)!=direction:continue
+                      for st,t in by_train[tr].items():
+                          if st in fmodel[direction]['offsets']:truth_events.append((st,t))
+                  dirinfo.append({'direction':direction,'hidden_trains':sum(directions.get(tr)==direction for tr in hidden),'pred_candidates':len(pred),'template_stations':len(fmodel[direction]['offsets'])})
+              tm={};em={}
+              for tol in (30,60,120):
+                  tm[str(tol)]=metric_times(truth_intercepts,pred_intercepts,tol);em[str(tol)]=metric_station(truth_events,pred_events,tol)
+                  train_agg[tol][0]+=tm[str(tol)]['truth_n'];train_agg[tol][1]+=tm[str(tol)]['pred_n'];train_agg[tol][2]+=tm[str(tol)]['matched']
+                  event_agg[tol][0]+=em[str(tol)]['truth_n'];event_agg[tol][1]+=em[str(tol)]['pred_n'];event_agg[tol][2]+=em[str(tol)]['matched']
+              fold_rows.append({'fold':fold,'hidden_train_count':len(hidden),'pseudo_train_count':len(pseudo),'chosen':chosen,'directions':dirinfo,'train_intercept_metrics':tm,'station_event_metrics':em})
+
+          def agg(v):
+              tn,pn,mn=v;return {'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else 0,'precision':mn/pn if pn else 0,'f1':2*mn/(tn+pn) if tn+pn else 0}
+          train_out={str(t):agg(v) for t,v in train_agg.items()};event_out={str(t):agg(v) for t,v in event_agg.items()}
+          f60=[x['station_event_metrics']['60']['f1'] for x in fold_rows]
+          result={'schema':'mppd.u1-seoul-count-free-fivefold-cv.v1','date':'2026-09-04','status':'FIVEFOLD_COUNT_FREE_VALIDATION_COMPLETED','line':LINE,'window':'07:00-10:00','afc_rows':afc_rows,'qualified_direction_train_universe':len(universe),'all_trains_held_exactly_once':sum(x['hidden_train_count'] for x in fold_rows)==len(universe),'hidden_train_count_used_for_generation':False,'gap_inferred_missing_count_used':False,'folds':fold_rows,'aggregate_train_intercept_metrics':train_out,'aggregate_station_event_metrics':event_out,'fold_station_event_f1_60':{'values':f60,'min':min(f60),'median':statistics.median(f60),'max':max(f60)},'scientific_boundary':['Every qualified-direction train is assigned to exactly one deterministic SHA1 fold and is hidden for that fold.','Each fold selects q/separation only using pseudo-hidden trains within the fold-visible set.','Candidate count is free in every fold; no held train count and no gap-derived missing count are inputs.','Direction qualification defines the evaluation universe but both directions are always searched; held-train direction composition is not used to set candidate counts.','This is one Line-8 morning-window cross-validation, not yet cross-line/cross-day replication.'],'next_gate':'If five-fold station-event metrics remain materially above the earlier single-station family without catastrophic fold collapse, qualify cross-station continuity as the Line-8 U1 mechanism and move to cross-line/time replication plus reference-passenger/path-tomography refinement.'}
+          (OUT/'u1_seoul_count_free_fivefold_cv_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          go=os.environ['GITHUB_OUTPUT']
+          with open(go,'a') as f:
+              f.write(f"trains={len(universe)}\n")
+              f.write(f"tr60_r={train_out['60']['recall']}\ntr60_p={train_out['60']['precision']}\ntr60_f={train_out['60']['f1']}\n")
+              f.write(f"evtruth={event_out['60']['truth_n']}\nevpred={event_out['60']['pred_n']}\nev60_m={event_out['60']['matched']}\n")
+              f.write(f"ev60_r={event_out['60']['recall']}\nev60_p={event_out['60']['precision']}\nev60_f={event_out['60']['f1']}\nev120_f={event_out['120']['f1']}\n")
+              f.write(f"foldmin={min(f60)}\nfoldmed={statistics.median(f60)}\nfoldmax={max(f60)}\n")
+          print(json.dumps({k:v for k,v in result.items() if k!='folds'},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist five-fold result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1cv/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  aggregate-60s:
+    needs: fivefold
+    runs-on: ubuntu-24.04
+    name: "U1CV trains=${{ needs.fivefold.outputs.trains }} TR60 R=${{ needs.fivefold.outputs.tr60_r }} P=${{ needs.fivefold.outputs.tr60_p }} F=${{ needs.fivefold.outputs.tr60_f }} EV truth=${{ needs.fivefold.outputs.evtruth }} pred=${{ needs.fivefold.outputs.evpred }} M=${{ needs.fivefold.outputs.ev60_m }} R=${{ needs.fivefold.outputs.ev60_r }} P=${{ needs.fivefold.outputs.ev60_p }} F=${{ needs.fivefold.outputs.ev60_f }}"
+    steps:
+      - run: echo fivefold-summary
+
+  robustness:
+    needs: fivefold
+    runs-on: ubuntu-24.04
+    name: "U1CV EV60 foldF1 min=${{ needs.fivefold.outputs.foldmin }} med=${{ needs.fivefold.outputs.foldmed }} max=${{ needs.fivefold.outputs.foldmax }} EV120F=${{ needs.fivefold.outputs.ev120_f }}"
+    steps:
+      - run: echo fivefold-robustness

@@ -1,0 +1,221 @@
+name: MPPD R1C Full Denominator Distributed 2026-09-05
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mppd-r1c-full-denominator-distributed-20260905.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1c-full-denominator-distributed-20260905
+  cancel-in-progress: false
+
+env:
+  SHARD_COUNT: 32
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+  BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+  ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+  G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
+  OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_full_denominator_distributed
+
+jobs:
+  e0:
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore full substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"; echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1c_e0"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$ROOT/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Run E0 shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1c_e0"; SID="${{ matrix.shard }}"; PAD=$(printf '%02d' "$SID")
+          python -m py_compile scripts/mppd_r1c_distributed_posterior_shard_20260905.py
+          /usr/bin/time -v python -m scripts.mppd_r1c_distributed_posterior_shard_20260905 \
+            --phase E0 --shard-count "$SHARD_COUNT" --shard-id "$SID" --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --beam 8 --max-skip 2 --out "$ROOT/out" 2>&1 | tee "$ROOT/out/execution.log"
+          python - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_e0'/'out'/'shard_summary.json'; s=json.loads(p.read_text())
+          assert s['schema']=='mppd.r1c-distributed-posterior-shard.v2-sufficient-stats'; assert s['phase']=='E0'; assert int(s['scan_authority']['full_cohort_count_seen'])==562071; assert int(s['scan_authority']['full_passenger_mass_seen'])==632143; assert s['posterior']['failure_mass_conservation_pass'] is True
+          PY
+          C="${{ steps.prep.outputs.config_file }}"; R="${{ steps.prep.outputs.remote_name }}"
+          for f in "$ROOT/out"/*; do rclone copyto "$f" "$R:$OUT_DRIVE/e0/shard_$PAD/$(basename "$f")" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        run: |
+          C="${{ steps.prep.outputs.config_file }}"; if [[ -n "${C:-}" && -f "$C" ]]; then shred -u "$C" 2>/dev/null || rm -f "$C"; fi
+
+  kernels:
+    needs: e0
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aggregate global hierarchical kernels
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet scipy numpy networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          ROOT="$RUNNER_TEMP/r1c_kernels"; mkdir -p "$ROOT/e0" "$ROOT/out"
+          rclone copy "$R:$OUT_DRIVE/e0" "$ROOT/e0" --config "$C" --include 'shard_*/e0_kernel_sufficient_stats.jsonl.gz' --retries 6 --low-level-retries 15 --transfers 8
+          python -m py_compile scripts/mppd_r1c_distributed_kernel_aggregator_20260905.py
+          /usr/bin/time -v python -m scripts.mppd_r1c_distributed_kernel_aggregator_20260905 --stats-root "$ROOT/e0" --out "$ROOT/out" 2>&1 | tee "$ROOT/out/execution.log"
+          python - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_kernels'/'out'; k=json.loads((root/'global_kernels.json').read_text())['kernels']; d=json.loads((root/'kernel_aggregation_diagnostics.json').read_text()); assert d['source_shard_file_count']==32; assert len(k['access_by_context'])>0 and len(k['egress_by_context'])>0 and len(k['transfer_by_movement'])>0
+          PY
+          for f in "$ROOT/out"/*; do rclone copyto "$f" "$R:$OUT_DRIVE/global/$(basename "$f")" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  offset_score:
+    needs: kernels
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Score context-aware offsets
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet scipy numpy networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          ROOT="$RUNNER_TEMP/r1c_offset_score"; mkdir -p "$ROOT/out"; SID="${{ matrix.shard }}"; PAD=$(printf '%02d' "$SID")
+          rclone copyto "$R:$OUT_DRIVE/e0/shard_$PAD/e0_offset_sufficient_stats.jsonl.gz" "$ROOT/stats.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/global/global_kernels.json" "$ROOT/kernels.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python -m scripts.mppd_r1c_distributed_offset_score_shard_20260905 --offset-stats "$ROOT/stats.jsonl.gz" --kernels "$ROOT/kernels.json" --out "$ROOT/out"
+          rclone copyto "$ROOT/out/offset_score_sums.json" "$R:$OUT_DRIVE/offset_scores/shard_$PAD/offset_score_sums.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  offsets:
+    needs: offset_score
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Merge global offset objective
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet scipy numpy networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          ROOT="$RUNNER_TEMP/r1c_offsets"; mkdir -p "$ROOT/scores" "$ROOT/e0" "$ROOT/out"
+          rclone copy "$R:$OUT_DRIVE/offset_scores" "$ROOT/scores" --config "$C" --include 'shard_*/offset_score_sums.json' --retries 6 --low-level-retries 15 --transfers 8
+          rclone copy "$R:$OUT_DRIVE/e0" "$ROOT/e0" --config "$C" --include 'shard_*/shard_summary.json' --retries 6 --low-level-retries 15 --transfers 8
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python -m scripts.mppd_r1c_distributed_offset_aggregator_20260905 --score-root "$ROOT/scores" --e0-root "$ROOT/e0" --service-init "$ROOT/service.json" --min-service-usage 25 --out "$ROOT/out"
+          python - <<'PY'
+          import json,os,pathlib
+          x=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_offsets'/'out'/'global_offsets.json').read_text()); assert x['full_scan_authority']=={'cohort_count':562071,'passenger_mass':632143}
+          PY
+          rclone copyto "$ROOT/out/global_offsets.json" "$R:$OUT_DRIVE/global/global_offsets.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  e1:
+    needs: offsets
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore full substrate and global M-step
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1c_e1"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$ROOT/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/global/global_kernels.json" "$ROOT/kernels.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/global/global_offsets.json" "$ROOT/offsets.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Run E1 shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1c_e1"; SID="${{ matrix.shard }}"; PAD=$(printf '%02d' "$SID")
+          /usr/bin/time -v python -m scripts.mppd_r1c_distributed_posterior_shard_20260905 --phase E1 --shard-count "$SHARD_COUNT" --shard-id "$SID" --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --kernels "$ROOT/kernels.json" --offsets "$ROOT/offsets.json" --beam 8 --max-skip 2 --out "$ROOT/out" 2>&1 | tee "$ROOT/out/execution.log"
+          python - <<'PY'
+          import json,os,pathlib
+          s=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_e1'/'out'/'shard_summary.json').read_text()); assert s['phase']=='E1' and int(s['scan_authority']['full_cohort_count_seen'])==562071 and int(s['scan_authority']['full_passenger_mass_seen'])==632143 and s['posterior']['failure_mass_conservation_pass'] is True
+          PY
+          C="${{ steps.prep.outputs.config_file }}"; R="${{ steps.prep.outputs.remote_name }}"; for f in "$ROOT/out"/*; do rclone copyto "$f" "$R:$OUT_DRIVE/e1/shard_$PAD/$(basename "$f")" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        run: |
+          C="${{ steps.prep.outputs.config_file }}"; if [[ -n "${C:-}" && -f "$C" ]]; then shred -u "$C" 2>/dev/null || rm -f "$C"; fi
+
+  merge:
+    needs: e1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Merge exact full denominator result
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          ROOT="$RUNNER_TEMP/r1c_merge"; mkdir -p "$ROOT/e0" "$ROOT/e1" "$ROOT/out"
+          rclone copy "$R:$OUT_DRIVE/e0" "$ROOT/e0" --config "$C" --include 'shard_*/shard_summary.json' --include 'shard_*/e0_cohort_posterior.jsonl.gz' --exclude '*' --retries 6 --low-level-retries 15 --transfers 8
+          rclone copy "$R:$OUT_DRIVE/e1" "$ROOT/e1" --config "$C" --include 'shard_*/shard_summary.json' --include 'shard_*/e1_cohort_posterior.jsonl.gz' --exclude '*' --retries 6 --low-level-retries 15 --transfers 8
+          rclone copyto "$R:$OUT_DRIVE/global/global_kernels.json" "$ROOT/kernels.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/global/global_offsets.json" "$ROOT/offsets.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python -m scripts.mppd_r1c_distributed_final_merger_20260905 --e0-root "$ROOT/e0" --e1-root "$ROOT/e1" --kernels "$ROOT/kernels.json" --offsets "$ROOT/offsets.json" --out "$ROOT/out"
+          python - <<'PY'
+          import json,os,pathlib
+          x=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_merge'/'out'/'r1c_full_denominator_distributed_joint_posterior_result.json').read_text()); assert x['scope']['cohort_count']==562071 and x['scope']['passenger_mass']==632143; assert x['qualification']['denominator_conservation']=='PASS' and x['qualification']['cohort_partition_conservation']=='PASS' and x['qualification']['failure_mass_conservation_E0'] and x['qualification']['failure_mass_conservation_E1']
+          PY
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_merge'/'out'; result=json.loads((root/'r1c_full_denominator_distributed_joint_posterior_result.json').read_text()); manifest={'schema':'mppd.r1c-full-denominator-distributed-execution-manifest.v1','date':'2026-09-05','status':'R1C_FULL_DENOMINATOR_DISTRIBUTED_EXECUTION_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'result':{'E0_finite':result['E0']['finite_posterior_mass'],'E1_finite':result['E1']['finite_posterior_mass'],'E1_failure_mass':result['E1']['failure_mass'],'redistribution':result['posterior_redistribution'],'kernel_counts':result['kernel_counts'],'service_timing':result['service_timing']},'output_files':{},'no_email_notification_logic':True};
+          for p in root.iterdir():
+              if p.is_file() and p.name!='execution_manifest.json': manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (root/'execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+          for f in "$ROOT/out"/*; do rclone copyto "$f" "$R:$OUT_DRIVE/final/$(basename "$f")" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          shred -u "$C" 2>/dev/null || rm -f "$C"

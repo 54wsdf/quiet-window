@@ -1,0 +1,95 @@
+name: MPPD R1B G1E Residual Record Broad V4 2026-09-04
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - MPPD R1B G1E Residual Record Micro V4 2026-09-04
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  r1b-g1e-residual-record-broad-v4:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      G1E_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1e_corrected_service_recompletion
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1e_residual_record_broad_v4
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+      - name: Restore corrected substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1b_g1e_v4_broad"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$ROOT/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1E_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v4_corrected_recompletion.json" "$ROOT/service_init_g1e.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          cd "$ROOT"; sha256sum p1c.json cohorts.csv.gz routes.jsonl.gz service_init_g1e.json > input_sha256.txt
+      - name: Run residual-record V4 broad
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_g1e_v4_broad"
+          python -m py_compile scripts/mppd_r1b_first_bidirectional_joint_update_v4_residual_records_20260904.py
+          /usr/bin/time -v python -m scripts.mppd_r1b_first_bidirectional_joint_update_v4_residual_records_20260904 \
+            --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service_init_g1e.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --sample-mod 50 --beam 8 --max-skip 2 --min-service-usage 25 --out "$ROOT/out" \
+            2>&1 | tee "$ROOT/out/r1b_g1e_residual_record_broad_v4_execution.log"
+          cp "$ROOT/input_sha256.txt" "$ROOT/out/r1b_g1e_residual_record_broad_v4_input_sha256.txt"
+          python - <<'PY'
+          import gzip,hashlib,json,os,pathlib
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1b_g1e_v4_broad'/'out'
+          s=json.loads((out/'r1b_first_bidirectional_joint_update_smoke_summary.json').read_text())
+          assert s['schema']=='mppd.r1b-first-bidirectional-joint-update-smoke.v4-residual-records'
+          for phase,fn in [('E0_passenger_posterior','r1b_weighted_failure_residual_cohorts_e0.jsonl.gz'),('E1_passenger_posterior','r1b_weighted_failure_residual_cohorts_e1.jsonl.gz')]:
+              e=s['iteration'][phase]; assert e['failure_mass_conservation_pass'] is True
+              with gzip.open(out/fn,'rt',encoding='utf-8') as f: rows=[json.loads(x) for x in f if x.strip()]
+              residual_mass=sum(float(r['passenger_mass']) for r in rows)
+              nofinite=float(e['processed_passenger_mass'])-float(e['finite_posterior_mass'])
+              assert abs(residual_mass-nofinite)<=1e-6,(phase,residual_mass,nofinite)
+          gates=s.get('r1b_minimum_gate',{})
+          assert all(gates.get(k) is True for k in ['passenger_evidence_updates_kernel_posterior','passenger_evidence_updates_service_timing','updated_state_redistributes_route_or_boarding_posterior','not_sequential_fixed_service_pipeline'])
+          manifest={'schema':'mppd.r1b-g1e-residual-record-broad-v4-execution-manifest.v1','date':'2026-09-04','status':'R1B_G1E_RESIDUAL_RECORD_BROAD_V4_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'sample':s.get('scope'),'r1b_minimum_gate':gates,'residual_record_outputs':s.get('residual_record_outputs'),'output_files':{},'scientific_boundary':['Deterministic 1/50 full-network-domain residual-accounting authority; not full 632143-passenger R1B completion.','Residual cohort records are model-audit objects, not observed causal labels.'],'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='r1b_g1e_residual_record_broad_v4_execution_manifest.json': manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'r1b_g1e_residual_record_broad_v4_execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'E0':s['iteration']['E0_passenger_posterior'],'E1':s['iteration']['E1_passenger_posterior'],'redistribution':s['iteration']['posterior_redistribution'],'residual_record_outputs':s['residual_record_outputs']},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"; find . -maxdepth 1 -type f ! -name output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > output_sha256.txt
+          cat r1b_first_bidirectional_joint_update_smoke_summary.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Persist V4 broad outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_g1e_v4_broad/out"
+          for f in "$ROOT"/*; do test -s "$f"; rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

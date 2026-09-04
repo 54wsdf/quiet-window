@@ -1,0 +1,39 @@
+name: MPPD N1 Shanghai Structural Schema Probe 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-shanghai-structural-schema-probe-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download four small structural assets and print schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://ndownloader.figshare.com/files/46552846 -o od.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46553314 -o sections.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46553326 -o stations.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46552816 -o rail.zip
+          python - <<'PY'
+          import csv, zipfile
+          from pathlib import Path
+          for fn in ['od.csv','sections.csv','stations.csv']:
+              raw=Path(fn).read_bytes()
+              for enc in ['utf-8-sig','gb18030','gb2312','cp936']:
+                  try: txt=raw.decode(enc); break
+                  except: pass
+              lines=txt.splitlines()
+              print('\nFILE',fn,'ENC',enc,'N_LINES',len(lines))
+              for x in lines[:4]: print(x[:1000])
+          with zipfile.ZipFile('rail.zip') as z:
+              print('\nZIP MEMBERS')
+              for i in z.infolist(): print(i.filename,i.file_size)
+          PY

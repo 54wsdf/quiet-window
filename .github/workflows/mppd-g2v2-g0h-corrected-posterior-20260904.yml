@@ -1,0 +1,133 @@
+name: MPPD G2V2 G0H Corrected Posterior 2026-09-04
+
+on:
+  workflow_run:
+    workflows:
+      - MPPD R0 Route Ensemble G0H GTX-A 2026-09-04
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  g2v2-g0h-corrected-posterior:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      SERVICE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1d_gtxa_date_aware_service_init
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g2v2_g0h_corrected_posterior
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore corrected denominator route and service inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/g2v2_g0h/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/g2v2_g0h/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$RUNNER_TEMP/g2v2_g0h/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/g0h_gtxa_corrected_cohort_rebuild_summary.json" "$RUNNER_TEMP/g2v2_g0h/g0h_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$RUNNER_TEMP/g2v2_g0h/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_summary.json" "$RUNNER_TEMP/g2v2_g0h/route_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SERVICE_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v3_gtxa_date_aware.json" "$RUNNER_TEMP/g2v2_g0h/service_init.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SERVICE_DRIVE/g1d_gtxa_date_aware_service_init_summary.json" "$RUNNER_TEMP/g2v2_g0h/g1d_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json, pathlib, os
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'g2v2_g0h'
+          g0h=json.loads((root/'g0h_summary.json').read_text())
+          route=json.loads((root/'route_summary.json').read_text())
+          svc=json.loads((root/'service_init.json').read_text())
+          g1d=json.loads((root/'g1d_summary.json').read_text())
+          assert g0h.get('qualification_checks',{}).get('all_gtxa_rows_mapped_after_overlay') is True
+          assert route.get('topology',{}).get('gtxa_overlay_applied') is True
+          assert route.get('topology',{}).get('gtxa_overlay',{}).get('schema')=='mppd.seoul-gtxa-crosswalk-overlay.g0h.v1'
+          assert svc.get('schema')=='mppd.city-day-service-state-initialization.v3-gtxa-date-aware'
+          assert int(g1d.get('removed_invalid_line1032_weak_states',-1))==49
+          assert len(g1d.get('components') or [])==4
+          PY
+
+      - name: Run corrected denominator G2v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/mppd_topology_patch_20260904.py \
+            scripts/mppd_gtxa_crosswalk_overlay_20260904.py \
+            scripts/mppd_g2v2_uncertain_service_full_network_posterior_20260904.py
+          /usr/bin/time -v python -m scripts.mppd_g2v2_uncertain_service_full_network_posterior_20260904 \
+            --p1c "$RUNNER_TEMP/g2v2_g0h/p1c.json" \
+            --cohorts "$RUNNER_TEMP/g2v2_g0h/cohorts.csv.gz" \
+            --routes "$RUNNER_TEMP/g2v2_g0h/routes.jsonl.gz" \
+            --service-init "$RUNNER_TEMP/g2v2_g0h/service_init.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --out "$RUNNER_TEMP/g2v2_g0h/out" \
+            2>&1 | tee "$RUNNER_TEMP/g2v2_g0h/out/g2v2_execution.log"
+          cp "$RUNNER_TEMP/g2v2_g0h/g0h_summary.json" "$RUNNER_TEMP/g2v2_g0h/out/g2v2_g0h_denominator_source_summary.json"
+          cp "$RUNNER_TEMP/g2v2_g0h/route_summary.json" "$RUNNER_TEMP/g2v2_g0h/out/g2v2_route_source_summary.json"
+          cp "$RUNNER_TEMP/g2v2_g0h/g1d_summary.json" "$RUNNER_TEMP/g2v2_g0h/out/g2v2_service_source_summary.json"
+          python - <<'PY'
+          import json, pathlib, os
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'g2v2_g0h'
+          result=json.loads((root/'out/g2v2_uncertain_service_full_network_posterior_summary.json').read_text())
+          g0h=json.loads((root/'g0h_summary.json').read_text())
+          manifest={
+            'schema':'mppd.g2v2-g0h-corrected-execution-manifest.v1',
+            'date':'2026-09-04',
+            'status':'G2V2_G0H_CORRECTED_EXECUTION_COMPLETED',
+            'authority':'00_CURRENT_CORE_CLOSURE_WORKPLAN_V6_FULL_NETWORK_STATE_RECONSTRUCTION_20260904.md',
+            'denominator':g0h.get('afc'),
+            'posterior':{
+              'passenger_mass':result.get('afc',{}).get('passenger_mass'),
+              'finite_posterior_mass':result.get('afc',{}).get('finite_posterior_mass'),
+              'finite_posterior_share':result.get('afc',{}).get('finite_posterior_share'),
+              'status_mass':result.get('posterior',{}).get('status_mass'),
+              'failure_mass':result.get('posterior',{}).get('failure_mass'),
+              'weighted_mean_route_entropy_nats':result.get('posterior',{}).get('weighted_mean_route_entropy_nats')
+            },
+            'scientific_boundary':[
+              'This is the first G2v2 run aligned on the corrected raw-AFC denominator, G0E+G0H network representation, expanded route ensemble and date-aware GTX-A service initialization.',
+              'It remains an initialization posterior rather than G3 joint inversion.',
+              'A/K/E remain broad initial priors and are not measured station-time truth.'
+            ],
+            'next_gate':'Audit remaining unmapped AFC scope and G2 residual attribution, then begin G3 shared station-time/service-state updates.',
+            'no_email_notification_logic':True
+          }
+          (root/'out/g2v2_g0h_corrected_execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+          cat "$RUNNER_TEMP/g2v2_g0h/out/g2v2_g0h_corrected_execution_manifest.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist corrected G2v2 outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/g2v2_g0h/out"
+          test "$(find . -maxdepth 1 -type f | wc -l)" -gt 0
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

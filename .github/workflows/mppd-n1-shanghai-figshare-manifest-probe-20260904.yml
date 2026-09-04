@@ -1,0 +1,27 @@
+name: MPPD N1 Shanghai Figshare Manifest Probe 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-shanghai-figshare-manifest-probe-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch Figshare record manifest only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, urllib.request
+          u='https://api.figshare.com/v2/articles/25904512'
+          with urllib.request.urlopen(u,timeout=60) as r: d=json.load(r)
+          out={'id':d.get('id'),'title':d.get('title'),'version':d.get('version'),'files':[{'id':f.get('id'),'name':f.get('name'),'size':f.get('size'),'download_url':f.get('download_url'),'md5':f.get('computed_md5') or f.get('supplied_md5')} for f in d.get('files',[])]}
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY

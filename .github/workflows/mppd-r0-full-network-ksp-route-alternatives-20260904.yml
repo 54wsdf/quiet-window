@@ -1,0 +1,117 @@
+name: MPPD R0 Full Network KSP Route Alternatives 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r0-full-network-ksp-route-alternatives-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ksp-shards:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_ksp_route_alternatives
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore full-network topology and OD cache
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/ksp/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/ksp/p1c.json" --config "$C"
+          rclone copyto "$R:$BASE_DRIVE/r0_city_day_cache/seoul_20260829_0700_1000_afc_time_cohorts.csv.gz" "$RUNNER_TEMP/ksp/cohorts.csv.gz" --config "$C"
+      - name: Enumerate near-optimal simple routes on complete network
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE"
+          python -m py_compile scripts/mppd_r0_full_network_ksp_route_alternatives_20260904.py
+          /usr/bin/time -v python scripts/mppd_r0_full_network_ksp_route_alternatives_20260904.py \
+            --p1c "$RUNNER_TEMP/ksp/p1c.json" --cohorts "$RUNNER_TEMP/ksp/cohorts.csv.gz" \
+            --out "$RUNNER_TEMP/ksp/out" --shard-index "${{ matrix.shard }}" --shard-count 8 \
+            --max-candidates 16 --detour-ratio 1.60 --detour-abs 8.0 \
+            2>&1 | tee "$RUNNER_TEMP/ksp/out/ksp_shard_${{ matrix.shard }}_execution.log"
+      - name: Persist shard
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ksp/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/shards/$f" --config "$CONFIG_FILE"; done
+      - name: Clean protected configuration
+        if: always()
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        shell: bash
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  merge-ksp:
+    needs: ksp-shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_ksp_route_alternatives
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore all route shards
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/kspmerge/shards" "$RUNNER_TEMP/kspmerge/out"
+          for i in 0 1 2 3 4 5 6 7; do
+            ii=$(printf '%02d' "$i")
+            rclone copyto "$R:$OUT_DRIVE/shards/ksp_routes_shard_${ii}_of_08.jsonl.gz" "$RUNNER_TEMP/kspmerge/shards/ksp_routes_shard_${ii}_of_08.jsonl.gz" --config "$C"
+          done
+      - name: Merge full-network route candidate cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/mppd_r0_merge_ksp_route_alternatives_20260904.py
+          python scripts/mppd_r0_merge_ksp_route_alternatives_20260904.py \
+            --dir "$RUNNER_TEMP/kspmerge/shards" --out "$RUNNER_TEMP/kspmerge/out" --shard-count 8
+      - name: Persist merged route cache
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/kspmerge/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE"; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected configuration
+        if: always()
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        shell: bash
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

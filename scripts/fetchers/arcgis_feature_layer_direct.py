@@ -43,10 +43,13 @@ def rclone_put(path: Path, dest: str, cfg: str, remote: str) -> None:
         raise RuntimeError(f'remote size mismatch: {size} != {path.stat().st_size}')
 
 
-def get_json(session: requests.Session, url: str, params: dict) -> dict:
+def request_json(session: requests.Session, url: str, params: dict, *, method: str = 'GET') -> dict:
     for attempt in range(8):
         try:
-            r = session.get(url, params=params, timeout=(30, 300))
+            if method == 'POST':
+                r = session.post(url, data=params, timeout=(30, 300))
+            else:
+                r = session.get(url, params=params, timeout=(30, 300))
             r.raise_for_status()
             data = r.json()
             if isinstance(data, dict) and data.get('error'):
@@ -72,10 +75,10 @@ def main() -> None:
     args = ap.parse_args()
 
     session = requests.Session()
-    session.headers['User-Agent'] = 'quiet-window-public-data-worker/3.0'
+    session.headers['User-Agent'] = 'quiet-window-public-data-worker/3.1'
     query_url = args.layer_url.rstrip('/') + '/query'
 
-    ids_payload = get_json(session, query_url, {
+    ids_payload = request_json(session, query_url, {
         'where': '1=1', 'returnIdsOnly': 'true', 'f': 'json'
     })
     object_ids = sorted(int(x) for x in (ids_payload.get('objectIds') or []))
@@ -91,10 +94,11 @@ def main() -> None:
             writer = None
             for offset in range(0, len(object_ids), args.chunk_size):
                 block = object_ids[offset: offset + args.chunk_size]
-                data = get_json(session, query_url, {
+                # POST avoids query-string length limits when object ID lists are large.
+                data = request_json(session, query_url, {
                     'objectIds': ','.join(str(x) for x in block),
                     'outFields': '*', 'returnGeometry': 'false', 'f': 'json'
-                })
+                }, method='POST')
                 rows = [x.get('attributes') or {} for x in data.get('features', [])]
                 if not rows:
                     continue
@@ -109,6 +113,8 @@ def main() -> None:
 
         if written <= 0 or csv_path.stat().st_size <= 0:
             raise RuntimeError('ArcGIS layer returned no rows')
+        if written != len(object_ids):
+            raise RuntimeError(f'ArcGIS row-count mismatch: written={written} ids={len(object_ids)}')
 
         digest = sha256(csv_path)
         dest = f'{args.drive_path}/{args.filename}'

@@ -1,0 +1,77 @@
+name: MPPD G1D GTX-A Date Aware Service Init 2026-09-04
+
+on:
+  push:
+    paths:
+      - 'scripts/mppd_g1d_gtxa_date_aware_service_init_20260904.py'
+      - '.github/workflows/mppd-g1d-gtxa-date-aware-service-init-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g1d-gtxa-date-aware-service-init:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1d_gtxa_date_aware_service_init
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore raw AFC, P1C and predecessor service initialization
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/g1d/out"
+          rclone copyto "$R:$SEOUL_ROOT/passenger/20260902/TAIMS_20260902.zip" "$RUNNER_TEMP/g1d/TAIMS.zip" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/g1d/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g1c_service_trajectory_completion/seoul_20260829_0700_1000_service_state_initialization_v2.json" "$RUNNER_TEMP/g1d/service_init_v2.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+
+      - name: Replace invalid cross-component GTX-A weak service lattice
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/mppd_topology_patch_20260904.py \
+            scripts/mppd_gtxa_crosswalk_overlay_20260904.py \
+            scripts/mppd_g1d_gtxa_date_aware_service_init_20260904.py
+          python -m scripts.mppd_g1d_gtxa_date_aware_service_init_20260904 \
+            --taims "$RUNNER_TEMP/g1d/TAIMS.zip" \
+            --p1c "$RUNNER_TEMP/g1d/p1c.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --service-init-v2 "$RUNNER_TEMP/g1d/service_init_v2.json" \
+            --out "$RUNNER_TEMP/g1d/out" | tee "$RUNNER_TEMP/g1d/out/g1d_execution.log"
+          cat "$RUNNER_TEMP/g1d/out/g1d_gtxa_date_aware_service_init_summary.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist G1D service initialization
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/g1d/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

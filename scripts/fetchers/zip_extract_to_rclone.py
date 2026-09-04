@@ -73,63 +73,84 @@ def download(session: requests.Session, url: str, dest: Path) -> None:
             time.sleep(min(120, 2 ** attempt))
 
 
-def split_binary(path: Path, out_dir: Path, target_bytes: int) -> list[dict]:
-    rows = []
-    with path.open('rb') as src:
-        idx = 0
-        while True:
-            part = out_dir / f'{path.name}.part-{idx:05d}'
-            remaining = target_bytes
-            wrote = 0
-            with part.open('wb') as dst:
-                while remaining > 0:
-                    block = src.read(min(8 * 1024 * 1024, remaining))
-                    if not block:
-                        break
-                    dst.write(block)
-                    wrote += len(block)
-                    remaining -= len(block)
-            if wrote == 0:
-                part.unlink(missing_ok=True)
-                break
-            rows.append({'file': part.name, 'bytes': wrote, 'sha256': sha256(part)})
-            idx += 1
-    return rows
+def upload_part(part: Path, dest: str, cfg: str, remote: str, idx: int) -> dict:
+    digest = sha256(part)
+    size = part.stat().st_size
+    rclone_put(part, dest, cfg, remote)
+    name = part.name
+    part.unlink()
+    return {'part': idx, 'file': name, 'bytes': size, 'sha256': digest, 'drive_path': dest}
 
 
-def split_text_with_header(path: Path, out_dir: Path, target_bytes: int) -> list[dict]:
-    rows = []
-    with path.open('rb') as src:
+def stream_text_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, td: Path, remote_base: str,
+                       base_name: str, target_bytes: int, cfg: str, remote: str) -> tuple[str, list[dict]]:
+    whole = hashlib.sha256()
+    parts: list[dict] = []
+    with zf.open(info) as src:
         header = src.readline()
+        whole.update(header)
         idx = 0
-        part = None
+        part_path: Path | None = None
         dst = None
         current = 0
         try:
             for line in src:
+                whole.update(line)
                 if dst is None or (current + len(line) > target_bytes and current > len(header)):
                     if dst is not None:
                         dst.close()
-                        rows.append({'file': part.name, 'bytes': part.stat().st_size, 'sha256': sha256(part)})
-                    part = out_dir / f'{path.stem}.part-{idx:05d}{path.suffix}'
-                    dst = part.open('wb')
+                        dst = None
+                        assert part_path is not None
+                        dest = f'{remote_base}/{base_name}.parts/{part_path.name}'
+                        parts.append(upload_part(part_path, dest, cfg, remote, idx - 1))
+                    part_path = td / f'{Path(base_name).stem}.part-{idx:05d}{Path(base_name).suffix}'
+                    dst = part_path.open('wb')
                     dst.write(header)
                     current = len(header)
                     idx += 1
                 dst.write(line)
                 current += len(line)
             if dst is None:
-                part = out_dir / f'{path.stem}.part-00000{path.suffix}'
-                part.write_bytes(header)
-                rows.append({'file': part.name, 'bytes': part.stat().st_size, 'sha256': sha256(part)})
+                part_path = td / f'{Path(base_name).stem}.part-00000{Path(base_name).suffix}'
+                part_path.write_bytes(header)
+                dest = f'{remote_base}/{base_name}.parts/{part_path.name}'
+                parts.append(upload_part(part_path, dest, cfg, remote, 0))
             else:
                 dst.close()
                 dst = None
-                rows.append({'file': part.name, 'bytes': part.stat().st_size, 'sha256': sha256(part)})
+                assert part_path is not None
+                dest = f'{remote_base}/{base_name}.parts/{part_path.name}'
+                parts.append(upload_part(part_path, dest, cfg, remote, idx - 1))
         finally:
             if dst is not None:
                 dst.close()
-    return rows
+    return whole.hexdigest(), parts
+
+
+def stream_binary_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, td: Path, remote_base: str,
+                         base_name: str, target_bytes: int, cfg: str, remote: str) -> tuple[str, list[dict]]:
+    whole = hashlib.sha256()
+    parts: list[dict] = []
+    with zf.open(info) as src:
+        idx = 0
+        while True:
+            part_path = td / f'{base_name}.part-{idx:05d}'
+            wrote = 0
+            with part_path.open('wb') as dst:
+                while wrote < target_bytes:
+                    block = src.read(min(8 * 1024 * 1024, target_bytes - wrote))
+                    if not block:
+                        break
+                    whole.update(block)
+                    dst.write(block)
+                    wrote += len(block)
+            if wrote == 0:
+                part_path.unlink(missing_ok=True)
+                break
+            dest = f'{remote_base}/{base_name}.parts/{part_path.name}'
+            parts.append(upload_part(part_path, dest, cfg, remote, idx))
+            idx += 1
+    return whole.hexdigest(), parts
 
 
 def main() -> None:
@@ -146,7 +167,7 @@ def main() -> None:
     direct_max = args.direct_file_max_mib * 1024 * 1024
     target = args.partition_target_mib * 1024 * 1024
     session = requests.Session()
-    session.headers['User-Agent'] = 'quiet-window-public-data-worker/3.1'
+    session.headers['User-Agent'] = 'quiet-window-public-data-worker/3.2'
 
     with tempfile.TemporaryDirectory(prefix='qw-zip-extract-') as tmp:
         td = Path(tmp)
@@ -155,9 +176,6 @@ def main() -> None:
         zip_digest = sha256(zip_path)
 
         with zipfile.ZipFile(zip_path) as zf:
-            bad = zf.testzip()
-            if bad:
-                raise RuntimeError(f'zip CRC failure: {bad}')
             infos = [x for x in zf.infolist() if not x.is_dir()]
             inventory = [{
                 'name': safe_zip_name(x.filename), 'bytes_uncompressed': x.file_size,
@@ -170,6 +188,7 @@ def main() -> None:
                 'member_count': len(infos), 'members': inventory,
                 'retrieved_at_utc': datetime.now(timezone.utc).isoformat(),
                 'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+                'note': 'ZIP central-directory inventory; CRC is checked while every member is fully streamed.'
             }
             inv_path = td / f'ZIP_INVENTORY_{args.dataset_id}_{os.environ.get("GITHUB_RUN_ID", "manual")}.json'
             inv_path.write_text(json.dumps(inv, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -178,55 +197,45 @@ def main() -> None:
             records = []
             for i, info in enumerate(infos, 1):
                 member_name = safe_zip_name(info.filename)
-                local = td / 'member'
-                local.unlink(missing_ok=True)
-                with zf.open(info) as src, local.open('wb') as dst:
-                    shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
-                if local.stat().st_size != info.file_size:
-                    raise RuntimeError(f'extracted size mismatch: {member_name}')
-                digest = sha256(local)
                 base_name = Path(member_name).name
                 safe_dir = str(PurePosixPath(member_name).parent)
                 if safe_dir == '.':
                     safe_dir = ''
                 remote_base = f'{args.drive_path}/extracted' + (f'/{safe_dir}' if safe_dir else '')
 
-                if local.stat().st_size <= direct_max:
+                if info.file_size <= direct_max:
+                    local = td / 'member'
+                    local.unlink(missing_ok=True)
+                    with zf.open(info) as src, local.open('wb') as dst:
+                        shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+                    if local.stat().st_size != info.file_size:
+                        raise RuntimeError(f'extracted size mismatch: {member_name}')
+                    digest = sha256(local)
                     dest = f'{remote_base}/{base_name}'
                     rclone_put(local, dest, args.config, args.remote)
                     rec = {
                         'member': member_name, 'bytes': local.stat().st_size, 'sha256': digest,
                         'storage_mode': 'exact_extracted_file', 'drive_path': dest,
                     }
+                    local.unlink()
                 else:
-                    part_dir = td / 'parts'
-                    if part_dir.exists():
-                        shutil.rmtree(part_dir)
-                    part_dir.mkdir()
                     suffix = Path(base_name).suffix.lower()
                     if suffix in TEXT_SUFFIXES:
-                        parts = split_text_with_header(local, part_dir, target)
+                        digest, parts = stream_text_member(zf, info, td, remote_base, base_name, target, args.config, args.remote)
                         mode = 'text_rows_header_repeated'
                     else:
-                        parts = split_binary(local, part_dir, target)
+                        digest, parts = stream_binary_member(zf, info, td, remote_base, base_name, target, args.config, args.remote)
                         mode = 'exact_binary_concat'
-                    for part in parts:
-                        p = part_dir / part['file']
-                        dest = f'{remote_base}/{base_name}.parts/{part["file"]}'
-                        rclone_put(p, dest, args.config, args.remote)
-                        part['drive_path'] = dest
-                        p.unlink()
                     rec = {
-                        'member': member_name, 'bytes': local.stat().st_size, 'sha256': digest,
+                        'member': member_name, 'bytes': info.file_size, 'sha256': digest,
                         'storage_mode': mode, 'partition_target_bytes': target, 'parts': parts,
                         'canonical_note': 'Original corrected ZIP remains the byte-exact canonical source.'
                     }
                 records.append(rec)
-                local.unlink(missing_ok=True)
                 print(json.dumps({'dataset_id': args.dataset_id, 'done': i, 'total': len(infos), 'member': member_name, 'mode': rec['storage_mode']}), flush=True)
 
         manifest = {
-            'schema': 'quiet-window-zip-extraction-manifest-v1', 'state': 'ACQUIRED',
+            'schema': 'quiet-window-zip-extraction-manifest-v2', 'state': 'ACQUIRED',
             'dataset_id': args.dataset_id, 'source_url': args.url,
             'zip_sha256': zip_digest, 'zip_bytes': zip_path.stat().st_size,
             'member_count': len(records), 'members': records,

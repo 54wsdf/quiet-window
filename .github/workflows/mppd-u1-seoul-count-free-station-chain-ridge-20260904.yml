@@ -1,0 +1,269 @@
+name: MPPD U1 Seoul Count-Free Station-Chain Ridge 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-seoul-count-free-station-chain-ridge-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  count-free-ridge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_count_free_station_chain_ridge
+
+    steps:
+      - name: Restore canonical AFC and service layers
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u1ridge/out"; cd "$RUNNER_TEMP/u1ridge"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Generate train candidates from cross-station AFC ridge without hidden count
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1ridge"
+          python - <<'PY'
+          import csv,hashlib,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          LINE='1008'; START=datetime(2026,8,29,7); END=datetime(2026,8,29,10); FRESH=120
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          QGRID=[0.70,0.75,0.80,0.85,0.88,0.90,0.92,0.94,0.96,0.98]
+          SEPGRID=[90,120,150,180,210,240,300]
+          BLOCK_SEC=75
+          OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit());return int(d) if d else None
+          def mf(t):return t.replace(second=0,microsecond=0)
+          def final_holdout(tr):return hashlib.sha1(tr.encode()).digest()[0]%5<1
+          def pseudo_holdout(tr):return hashlib.sha1(('ridge-pseudo|'+tr).encode()).digest()[0]%5<1
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def pearson(x,y):
+              if len(x)<3:return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              if vx<=0 or vy<=0:return 0.0
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy)
+          def robust_z(v,vals):
+              if not vals:return 0.0
+              med=statistics.median(vals);mad=statistics.median(abs(x-med) for x in vals);sc=max(1.0,1.4826*mad);return (v-med)/sc
+          def median_dt(vals):
+              if not vals:return None
+              return datetime.fromtimestamp(statistics.median(sorted(v.timestamp() for v in vals)))
+          def classify(st_times,seq):
+              pairs=sorted((seq[s],t.timestamp()) for s,t in st_times.items() if s in seq and seq[s] is not None)
+              if len(pairs)<4:return None
+              c=pearson([x for x,y in pairs],[y for x,y in pairs]);return ('INC' if c>0 else 'DEC') if abs(c)>=0.35 else None
+          def match(truth,pred,tol=60):
+              used=set();ds=[]
+              for t in sorted(truth):
+                  c=[(abs((p-t).total_seconds()),j) for j,p in enumerate(pred) if j not in used and abs((p-t).total_seconds())<=tol]
+                  if c:
+                      d,j=min(c);used.add(j);ds.append(d)
+              return ds
+          def met(truth,pred,tol=60):
+              ds=match(truth,pred,tol);tn=len(truth);pn=len(pred);mn=len(ds)
+              return {'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else None,'precision':mn/pn if pn else None,'f1':2*mn/(tn+pn) if tn+pn else 0,'median_abs_error_sec':statistics.median(ds) if ds else None}
+          def nms(items,sep):
+              chosen=[]
+              for t,s in sorted(items,key=lambda z:(z[1],-z[0].timestamp()),reverse=True):
+                  if all(abs((t-u).total_seconds())>=sep for u,v in chosen):chosen.append((t,s))
+              return sorted(chosen)
+          def quantile(vals,p):
+              if not vals:return 0.0
+              return q(vals,p)
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          canonical=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in canonical};stations={x['service_statn_id']:{'name':x.get('dv_name'),'seq':seqnum(x.get('service_statn_sn'))} for x in canonical};seq={s:v['seq'] for s,v in stations.items()}
+          minutes=[START+timedelta(minutes=i,seconds=30) for i in range(int((END-START).total_seconds()/60))]
+
+          exit_hist=defaultdict(Counter);exit_mass=Counter();afc_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  if not (START<=t0<END and START<=t1<END) or a['service_statn_id']==b['service_statn_id']:continue
+                  s=b['service_statn_id'];exit_hist[s][mf(t1)]+=1;exit_mass[s]+=1;afc_rows+=1
+              f.close()
+
+          pat=re.compile(r'subarr_(260829(\d{6}))');obs=defaultdict(dict)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,snap in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      if (row.get('subway_id') or '').strip()!=LINE or (row.get('arvl_cd') or '').strip() not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();state=(row.get('arvl_cd') or '').strip()
+                      if not t or not tr or st not in stations:continue
+                      age=(snap-t).total_seconds();key=(tr,st);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+          truth=[]
+          for (tr,st),d in obs.items():
+              items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in items:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':truth.append((tr,st,t))
+                  prev=s
+          by_train=defaultdict(dict)
+          for tr,st,t in truth:
+              if st not in by_train[tr] or t<by_train[tr][st]:by_train[tr][st]=t
+          directions={tr:classify(sts,seq) for tr,sts in by_train.items()};directions={tr:d for tr,d in directions.items() if d}
+          final_hidden={tr for tr in directions if final_holdout(tr)};final_visible={tr for tr in directions if tr not in final_hidden}
+
+          def build_model(anchor_trains):
+              # Direction-specific trajectory offset and station egress lag models from permitted service anchors only.
+              model={}
+              for direction in ('INC','DEC'):
+                  trs=[tr for tr in anchor_trains if directions.get(tr)==direction]
+                  coverage=Counter(s for tr in trs for s in by_train[tr]);ref=coverage.most_common(1)[0][0] if coverage else None
+                  off=defaultdict(list)
+                  if ref:
+                      for tr in trs:
+                          sts=by_train[tr]
+                          if ref not in sts:continue
+                          rt=sts[ref]
+                          for s,t in sts.items():off[s].append((t-rt).total_seconds())
+                  offsets={s:statistics.median(v) for s,v in off.items() if len(v)>=3}
+                  intercepts={}
+                  for tr in trs:
+                      vals=[t-timedelta(seconds=offsets[s]) for s,t in by_train[tr].items() if s in offsets]
+                      m=median_dt(vals)
+                      if m:intercepts[tr]=m
+                  lag={};quality={}
+                  for s in offsets:
+                      if exit_mass[s]<20:continue
+                      arr=Counter(mf(by_train[tr][s]) for tr in trs if s in by_train[tr])
+                      vals=[]
+                      for l in range(0,11):
+                          xs=[];ys=[]
+                          for m in [START+timedelta(minutes=i) for i in range(180)]:xs.append(arr.get(m,0));ys.append(exit_hist[s].get(m+timedelta(minutes=l),0))
+                          vals.append((pearson(xs,ys),l))
+                      best=max(vals,key=lambda z:(z[0],-z[1])) if vals else (0,0);lag[s]=best[1];quality[s]=best[0]
+                  model[direction]={'ref':ref,'offsets':offsets,'intercepts':intercepts,'lag':lag,'quality':quality}
+              return model
+
+          def ridge_scores(model,direction):
+              md=model[direction];scores=[];zcache={}
+              usable=[]
+              for s,off in md['offsets'].items():
+                  if s not in md['lag'] or exit_mass[s]<20:continue
+                  vals=[exit_hist[s].get(START+timedelta(minutes=i),0) for i in range(180)]
+                  zcache[s]=(vals,md['lag'][s]);w=math.sqrt(exit_mass[s])*max(0.05,md['quality'].get(s,0));usable.append((s,off,w))
+              for t0 in minutes:
+                  num=den=0.0
+                  for s,off,w in usable:
+                      arr=t0+timedelta(seconds=off);em=mf(arr)+timedelta(minutes=zcache[s][1]);v=exit_hist[s].get(em,0);vals=zcache[s][0];z=robust_z(v,vals)
+                      num+=w*max(0.0,z);den+=w
+                  scores.append((t0,num/den if den else 0.0))
+              return scores,len(usable)
+
+          def true_intercepts(target_trains,model,direction):
+              md=model[direction];out=[]
+              for tr in target_trains:
+                  if directions.get(tr)!=direction:continue
+                  vals=[t-timedelta(seconds=md['offsets'][s]) for s,t in by_train[tr].items() if s in md['offsets']]
+                  m=median_dt(vals)
+                  if m:out.append(m)
+              return sorted(out)
+
+          # Strict pseudo-holdout: model calibration excludes pseudo trains.
+          pseudo={tr for tr in final_visible if pseudo_holdout(tr)};calib=final_visible-pseudo
+          pmodel=build_model(calib);grid=[]
+          for direction in ('INC','DEC'):
+              scores,nst=ridge_scores(pmodel,direction);anchors=list(pmodel[direction]['intercepts'].values());unblocked=[(t,s) for t,s in scores if all(abs((t-a).total_seconds())>BLOCK_SEC for a in anchors)]
+              truth_p=true_intercepts(pseudo,pmodel,direction);sv=[s for t,s in unblocked]
+              for qq in QGRID:
+                  th=quantile(sv,qq);above=[(t,s) for t,s in unblocked if s>=th]
+                  for sep in SEPGRID:
+                      pred=[t for t,s in nms(above,sep)];m=met(truth_p,pred,60)
+                      grid.append({'direction':direction,'q':qq,'sep_sec':sep,'threshold_score':th,'usable_stations':nst,**m})
+          # One global hyperparameter pair selected on pooled pseudo-holdout F1 by recomputing pooled direction metrics.
+          combos=[]
+          for qq in QGRID:
+              for sep in SEPGRID:
+                  TN=PN=MN=0
+                  for direction in ('INC','DEC'):
+                      row=next(x for x in grid if x['direction']==direction and x['q']==qq and x['sep_sec']==sep);TN+=row['truth_n'];PN+=row['pred_n'];MN+=row['matched']
+                  combos.append({'q':qq,'sep_sec':sep,'truth_n':TN,'pred_n':PN,'matched':MN,'recall':MN/TN if TN else 0,'precision':MN/PN if PN else 0,'f1':2*MN/(TN+PN) if TN+PN else 0})
+          chosen=max(combos,key=lambda z:(z['f1'],z['recall'],z['precision']))
+
+          fmodel=build_model(final_visible);final_rows=[];pooled={30:[0,0,0,[]],60:[0,0,0,[]],120:[0,0,0,[]]};candidates=[]
+          for direction in ('INC','DEC'):
+              scores,nst=ridge_scores(fmodel,direction);anchors=list(fmodel[direction]['intercepts'].values());unblocked=[(t,s) for t,s in scores if all(abs((t-a).total_seconds())>BLOCK_SEC for a in anchors)];th=quantile([s for t,s in unblocked],chosen['q']);above=[(t,s) for t,s in unblocked if s>=th];pred_items=nms(above,chosen['sep_sec']);pred=[t for t,s in pred_items];truth_h=true_intercepts(final_hidden,fmodel,direction)
+              for t,s in pred_items:candidates.append({'direction':direction,'intercept_time':t.isoformat(),'ridge_score':s})
+              rr={'direction':direction,'usable_stations':nst,'threshold_score':th,'hidden_truth_trains':len(truth_h),'predicted_count_free_candidates':len(pred)}
+              for tol in (30,60,120):
+                  m=met(truth_h,pred,tol);rr[f'holdout_{tol}']=m;ds=match(truth_h,pred,tol);pooled[tol][0]+=m['truth_n'];pooled[tol][1]+=m['pred_n'];pooled[tol][2]+=m['matched'];pooled[tol][3]+=ds
+              final_rows.append(rr)
+          pout={}
+          for tol,(tn,pn,mn,ds) in pooled.items():pout[str(tol)]={'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else None,'precision':mn/pn if pn else None,'f1':2*mn/(tn+pn) if tn+pn else 0,'median_abs_error_sec':statistics.median(ds) if ds else None}
+          result={'schema':'mppd.u1-seoul-count-free-station-chain-ridge.v1','date':'2026-09-04','status':'COUNT_FREE_STATION_CHAIN_RIDGE_COMPLETED','line':LINE,'window':'07:00-10:00','afc_rows':afc_rows,'qualified_direction_trains':len(directions),'final_hidden_train_count':len(final_hidden),'hidden_train_count_used_for_generation':False,'gap_inferred_missing_count_used':False,'pseudo_holdout_train_count':len(pseudo),'chosen':chosen,'holdout_pooled':pout,'direction_rows':final_rows,'candidate_events':candidates,'scientific_boundary':['Candidate count is free: no hidden-train count and no missing-count-from-gap rule is used.','Visible direct operational-status events are used to learn direction-specific trajectory templates, station egress-lag alignment, and to mask already-observed train neighborhoods.','Hyperparameters are selected only on pseudo-hidden trains inside the final-visible set; final hidden trains are used only for scoring.','This is an MPPD cross-station ridge baseline, not an exact Min/Lee published implementation.','Seoul AFC remains minute-quantized.'],'next_gate':'If count-free cross-station ridge still does not materially outperform the single-station baselines, stop pulse-density-only U1 escalation and implement reference-passenger/path-travel-time interval constraints.'}
+          (OUT/'u1_seoul_count_free_station_chain_ridge_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'u1_seoul_count_free_station_chain_ridge_hyper_grid.json').write_text(json.dumps({'direction_grid':grid,'pooled_combos':combos},ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:v for k,v in result.items() if k not in {'candidate_events'}},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist safe aggregate outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1ridge/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

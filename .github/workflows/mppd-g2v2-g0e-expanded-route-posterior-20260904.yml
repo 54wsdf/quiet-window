@@ -1,0 +1,124 @@
+name: MPPD G2V2 G0E Expanded Route Posterior 2026-09-04
+
+on:
+  workflow_run:
+    workflows:
+      - MPPD R0 Route Ensemble G0E Topology 2026-09-04
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  g2v2-g0e-expanded-route-posterior:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0e_topology
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g2v2_g0e_expanded_route_posterior
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore G0E expanded posterior inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/g2v2_g0e/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/g2v2_g0e/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/r0_city_day_cache/seoul_20260829_0700_1000_afc_time_cohorts.csv.gz" "$RUNNER_TEMP/g2v2_g0e/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$RUNNER_TEMP/g2v2_g0e/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_summary.json" "$RUNNER_TEMP/g2v2_g0e/route_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g1c_service_trajectory_completion/seoul_20260829_0700_1000_service_state_initialization_v2.json" "$RUNNER_TEMP/g2v2_g0e/service_init.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json, pathlib
+          p=pathlib.Path("${RUNNER_TEMP}/g2v2_g0e/route_summary.json")
+          x=json.loads(p.read_text())
+          assert x.get('topology',{}).get('topology_patch_applied') is True, x.get('topology')
+          patch=x.get('topology',{}).get('topology_patch',{})
+          assert patch.get('schema')=='mppd.seoul-topology-patch.g0e.v1', patch
+          assert int(x.get('policy_count',0))==26, x.get('policy_count')
+          PY
+
+      - name: Run G2v2 with G0E expanded route ensemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/mppd_g2v2_uncertain_service_full_network_posterior_20260904.py
+          /usr/bin/time -v python -m scripts.mppd_g2v2_uncertain_service_full_network_posterior_20260904 \
+            --p1c "$RUNNER_TEMP/g2v2_g0e/p1c.json" \
+            --cohorts "$RUNNER_TEMP/g2v2_g0e/cohorts.csv.gz" \
+            --routes "$RUNNER_TEMP/g2v2_g0e/routes.jsonl.gz" \
+            --service-init "$RUNNER_TEMP/g2v2_g0e/service_init.json" \
+            --out "$RUNNER_TEMP/g2v2_g0e/out" \
+            2>&1 | tee "$RUNNER_TEMP/g2v2_g0e/out/g2v2_execution.log"
+          cp "$RUNNER_TEMP/g2v2_g0e/route_summary.json" "$RUNNER_TEMP/g2v2_g0e/out/g2v2_route_source_summary.json"
+          python - <<'PY'
+          import json, pathlib, os
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'g2v2_g0e'
+          route=json.loads((root/'route_summary.json').read_text())
+          result=json.loads((root/'out/g2v2_uncertain_service_full_network_posterior_summary.json').read_text())
+          manifest={
+            'schema':'mppd.g2v2-g0e-expanded-route-execution-manifest.v1',
+            'date':'2026-09-04',
+            'status':'G2V2_G0E_EXPANDED_ROUTE_EXECUTION_COMPLETED',
+            'authority':'00_CURRENT_CORE_CLOSURE_WORKPLAN_V6_FULL_NETWORK_STATE_RECONSTRUCTION_20260904.md',
+            'route_source':{
+              'schema':route.get('schema'),
+              'status':route.get('status'),
+              'policy_count':route.get('policy_count'),
+              'topology':route.get('topology'),
+              'od':route.get('od')
+            },
+            'posterior_result':{
+              'finite_posterior_mass':result.get('afc',{}).get('finite_posterior_mass'),
+              'finite_posterior_share':result.get('afc',{}).get('finite_posterior_share'),
+              'status_mass':result.get('posterior',{}).get('status_mass'),
+              'failure_mass':result.get('posterior',{}).get('failure_mass'),
+              'weighted_mean_route_entropy_nats':result.get('posterior',{}).get('weighted_mean_route_entropy_nats')
+            },
+            'scientific_boundary':[
+              'This run changes the routing substrate and topology representation but remains a G2v2 initialization, not G3 joint inversion.',
+              'G0E topology repairs are provenance-typed reconciliation hypotheses; they do not become observed passenger paths or ATS events.',
+              'The remaining date-specific GTX-A structural residual is retained rather than force-connected.',
+              'A/K/E remain broad initial priors in the G2v2 engine.'
+            ],
+            'next_gate':'Compare against limited-route G2v2, audit residual attribution and route entropy, then begin G3 shared station-time/service-state block updates.',
+            'no_email_notification_logic':True
+          }
+          (root/'out/g2v2_g0e_expanded_route_execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+          cat "$RUNNER_TEMP/g2v2_g0e/out/g2v2_g0e_expanded_route_execution_manifest.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist expanded G2v2 outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/g2v2_g0e/out"
+          test "$(find . -maxdepth 1 -type f | wc -l)" -gt 0
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,87 @@
+name: MPPD G2 Cached Full Network Route Chain Posterior 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-g2-cached-full-network-route-chain-posterior-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g2-cached-full-network-posterior:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g2_cached_full_network_route_chain_posterior
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore complete-network cached state
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/g2cached/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/g2cached/p1c.json" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$BASE_DRIVE/r0_city_day_cache/seoul_20260829_0700_1000_afc_time_cohorts.csv.gz" "$RUNNER_TEMP/g2cached/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$BASE_DRIVE/r0_full_network_factor_engine_v2/r0_route_candidates_by_od.jsonl.gz" "$RUNNER_TEMP/g2cached/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$BASE_DRIVE/r0_service_state_cache/seoul_20260829_0700_1000_service_state_initialization.json" "$RUNNER_TEMP/g2cached/service_init.json" --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Run complete-network arbitrary-transfer posterior
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
+          python -m py_compile \
+            scripts/mppd_g0_full_network_coverage_20260904.py \
+            scripts/mppd_r0_full_network_factor_engine_20260904.py \
+            scripts/mppd_r0_cached_full_network_support_rescan_20260904.py \
+            scripts/mppd_g2_full_network_route_chain_posterior_20260904.py \
+            scripts/mppd_g2_cached_full_network_route_chain_posterior_20260904.py
+          /usr/bin/time -v python scripts/mppd_g2_cached_full_network_route_chain_posterior_20260904.py \
+            --p1c "$RUNNER_TEMP/g2cached/p1c.json" \
+            --cohorts "$RUNNER_TEMP/g2cached/cohorts.csv.gz" \
+            --routes "$RUNNER_TEMP/g2cached/routes.jsonl.gz" \
+            --service-init "$RUNNER_TEMP/g2cached/service_init.json" \
+            --out "$RUNNER_TEMP/g2cached/out" \
+            --beam 12 \
+            --checkpoint-every 50000 \
+            2>&1 | tee "$RUNNER_TEMP/g2cached/out/g2_cached_execution.log"
+
+      - name: Persist G2 posterior outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/g2cached/out"
+          test -f g2_cached_full_network_route_chain_posterior_summary.json
+          for f in *; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

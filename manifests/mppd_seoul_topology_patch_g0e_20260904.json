@@ -1,0 +1,158 @@
+{
+  "schema": "mppd.seoul-topology-patch.g0e.v1",
+  "date": "2026-09-04",
+  "status": "QUALIFIED_HYPOTHESIS_FOR_G0E_CROSS_LAYER_REROUTE",
+  "authority": "00_CURRENT_CORE_CLOSURE_WORKPLAN_V6_FULL_NETWORK_STATE_RECONSTRUCTION_20260904.md",
+  "inherits_from": "mppd_seoul_topology_patch_g0c_20260904.json",
+  "evidence_policy": {
+    "trigger": "POST_G0C_SAME_LINE_COMPONENT_RESIDUAL",
+    "required_cross_layer_evidence": "G1C_SERVICE_STATES_CONTAIN_BOTH_GAP_ENDPOINTS",
+    "required_topology_evidence": "CURRENT_REAL_NETWORK_SEQUENCE_CORROBORATION",
+    "edge_semantics": "LINE_SERVICE_CONTINUITY_RECONCILIATION_HYPOTHESIS",
+    "not_observed_ats": true,
+    "not_passenger_route_truth": true,
+    "automatic_global_promotion": false
+  },
+  "edges": [
+    {
+      "edge_id": "G0E_GYEONGUI_1063_NEUNGGOK_GOKSAN_CONTINUITY",
+      "u": "1063|1063075321",
+      "v": "1063|1063075323",
+      "kind": "inline_gap_repaired",
+      "corridor": "능곡-대곡-곡산",
+      "weight": 2.0,
+      "sequence_gap": 2,
+      "prior_component_pair": [0, 1],
+      "post_g0c_residual_mass": 5971,
+      "post_g0c_residual_od": 2513,
+      "evidence_class": "G0D_AFC_RESIDUAL_PLUS_G1C_SERVICE_CONTINUITY_PLUS_NETWORK_SEQUENCE",
+      "internal_evidence": [
+        "G0D:same_line_1063_seq16_seq14_gap2",
+        "G1C:42_of_42_line1063_states_contain_both_endpoints",
+        "G1C:median_endpoint_time_gap_sec=242"
+      ],
+      "external_corroboration": {
+        "status": "CURRENT_NETWORK_SEQUENCE_CONFIRMED",
+        "claim": "Gyeongui-Jungang sequence is Goksan-Daegok-Neunggok; the P1C line-specific view omits the intermediate Daegok service node."
+      }
+    },
+    {
+      "edge_id": "G0E_LINE1_SEOJEONGRI_PYEONGTAEK_CONTINUITY",
+      "u": "1001|1001080163",
+      "v": "1001|1001080165",
+      "kind": "inline_gap_repaired",
+      "corridor": "서정리-평택지제-평택",
+      "weight": 2.0,
+      "sequence_gap": 2,
+      "prior_component_pair": [0, 2],
+      "post_g0c_residual_mass": 2399,
+      "post_g0c_residual_od": 1165,
+      "evidence_class": "G0D_AFC_RESIDUAL_PLUS_G1C_SERVICE_CONTINUITY_PLUS_NETWORK_SEQUENCE",
+      "internal_evidence": [
+        "G0D:same_line_1001_seq67_seq69_gap2",
+        "G1C:40_of_40_line1001_states_contain_both_endpoints",
+        "G1C:median_endpoint_time_gap_sec=242"
+      ],
+      "external_corroboration": {
+        "status": "CURRENT_NETWORK_SEQUENCE_CONFIRMED",
+        "claim": "Line 1 sequence is Seojeong-ri-PyeongtaekJije-Pyeongtaek; the line-specific P1C view omits the intermediate PyeongtaekJije node."
+      }
+    },
+    {
+      "edge_id": "G0E_SUINBUNDANG_JEONGJA_ORI_CONTINUITY",
+      "u": "1075|1075075230",
+      "v": "1075|1075075232",
+      "kind": "inline_gap_repaired",
+      "corridor": "정자-미금-오리",
+      "weight": 2.0,
+      "sequence_gap": 2,
+      "prior_component_pair": [0, 4],
+      "post_g0c_residual_mass": 1453,
+      "post_g0c_residual_od": 608,
+      "evidence_class": "G0D_LOWER_TIER_NODE_PLUS_G1C_SERVICE_CONTINUITY_PLUS_NETWORK_SEQUENCE",
+      "internal_evidence": [
+        "G0D:seq23_node1075|1075075231_exists_as_D_ALIAS_SINGLETON_LINE_Migeum",
+        "G1C:48_of_48_line1075_states_contain_seq22_and_seq24_endpoints",
+        "G1C:median_endpoint_time_gap_sec=242"
+      ],
+      "external_corroboration": {
+        "status": "CURRENT_NETWORK_SEQUENCE_CONFIRMED",
+        "claim": "Suin-Bundang sequence is Jeongja-Migeum-Ori."
+      }
+    },
+    {
+      "edge_id": "G0E_SUINBUNDANG_SARI_DARWOL_SHARED_CORRIDOR_CONTINUITY",
+      "u": "1075|1075075250",
+      "v": "1075|1075075259",
+      "kind": "shared_corridor_continuity_repaired",
+      "corridor": "사리-한대앞-중앙-고잔-초지-안산-신길온천-정왕-오이도-달월",
+      "weight": 9.0,
+      "sequence_gap": 9,
+      "prior_component_pair": [0, 5],
+      "post_g0c_residual_mass": 767,
+      "post_g0c_residual_od": 591,
+      "evidence_class": "G0D_SHARED_CORRIDOR_GAP_PLUS_G1C_SERVICE_CONTINUITY_PLUS_NETWORK_SEQUENCE",
+      "internal_evidence": [
+        "G0D:same_line_1075_seq42_seq51_gap9",
+        "G1C:48_of_48_line1075_states_contain_both_endpoints",
+        "G1C:median_endpoint_time_gap_sec=1089"
+      ],
+      "external_corroboration": {
+        "status": "CURRENT_NETWORK_AND_THROUGH_SERVICE_CONFIRMED",
+        "claim": "Suin-Bundang trains continue through the Ansan/Line-4 shared corridor to Oido and then Darwol; the line-specific P1C view omits the intervening 1075 service nodes."
+      }
+    },
+    {
+      "edge_id": "G0E_GYEONGGANG_BUBAL_YEOJU_CONTINUITY",
+      "u": "1081|1081037418",
+      "v": "1081|1081037420",
+      "kind": "inline_gap_repaired",
+      "corridor": "부발-세종대왕릉-여주",
+      "weight": 2.0,
+      "sequence_gap": 2,
+      "prior_component_pair": [0, 3],
+      "post_g0c_residual_mass": 499,
+      "post_g0c_residual_od": 231,
+      "evidence_class": "G0D_AFC_RESIDUAL_PLUS_G1C_SERVICE_CONTINUITY_PLUS_NETWORK_SEQUENCE",
+      "internal_evidence": [
+        "G0D:same_line_1081_seq10_seq12_gap2",
+        "G1C:45_of_45_line1081_states_contain_both_endpoints",
+        "G1C:median_endpoint_time_gap_sec=242"
+      ],
+      "external_corroboration": {
+        "status": "CURRENT_NETWORK_SEQUENCE_CONFIRMED",
+        "claim": "Gyeonggang sequence is Bubal-Sejongdaewangneung-Yeoju."
+      }
+    },
+    {
+      "edge_id": "G0E_SEOHAE_SOSA_WONJONG_CONTINUITY",
+      "u": "1093|1093004010",
+      "v": "1093|1093004008",
+      "kind": "inline_gap_repaired",
+      "corridor": "소사-부천종합운동장-원종",
+      "weight": 2.0,
+      "sequence_gap": 2,
+      "prior_component_pair": [0, 6],
+      "post_g0c_residual_mass": 489,
+      "post_g0c_residual_od": 241,
+      "evidence_class": "G0D_AFC_RESIDUAL_PLUS_G1C_SERVICE_CONTINUITY_PLUS_NETWORK_SEQUENCE",
+      "internal_evidence": [
+        "G0D:same_line_1093_seq10_seq8_gap2",
+        "G1C:42_of_42_line1093_states_contain_both_endpoints",
+        "G1C:median_endpoint_time_gap_sec=242"
+      ],
+      "external_corroboration": {
+        "status": "CURRENT_NETWORK_SEQUENCE_CONFIRMED",
+        "claim": "Seohae sequence is Sosa-Bucheon Stadium-Wonjong."
+      }
+    }
+  ],
+  "scientific_boundary": [
+    "G0E inherits the seven evidence-qualified G0C physical-transfer repairs and adds six same-line continuity repairs.",
+    "The six continuity edges reconcile a route-topology disconnect with service-state trajectories that already contain both endpoints; they do not create observed ATS events.",
+    "Gap-edge weights equal the line-sequence gap so omitted intermediate stations do not become zero-cost shortcuts.",
+    "A continuity edge is a coarse routing substrate over omitted line-specific nodes. It is not a claim that intermediate stations do not exist and it must not be used as station-level ground truth.",
+    "The original G0 and G0C results remain immutable historical baselines."
+  ],
+  "no_email_notification_logic": true
+}

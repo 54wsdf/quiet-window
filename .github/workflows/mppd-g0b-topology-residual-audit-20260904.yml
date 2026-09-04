@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile scripts/mppd_g0b_topology_residual_audit_20260904.py
-          python scripts/mppd_g0b_topology_residual_audit_20260904.py \
+          python -m scripts.mppd_g0b_topology_residual_audit_20260904 \
             --p1c "$RUNNER_TEMP/g0b/p1c.json" \
             --unrouted "$RUNNER_TEMP/g0b/unrouted.csv" \
             --out "$RUNNER_TEMP/g0b/out" | tee "$RUNNER_TEMP/g0b/out/g0b_topology_residual_audit.log"

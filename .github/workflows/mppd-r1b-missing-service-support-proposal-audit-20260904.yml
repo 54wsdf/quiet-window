@@ -1,0 +1,98 @@
+name: MPPD R1B Missing Service Support Proposal Audit 2026-09-04
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - MPPD R1B First Bidirectional Joint Update Broad V2 2026-09-04
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  missing-service-support-proposal-audit:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      SERVICE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1d_gtxa_date_aware_service_init
+      R1B_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_first_bidirectional_joint_update_broad_v2
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_missing_service_support_proposal_audit
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore R1B broad V2 and substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1b_support_audit"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SERVICE_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v3_gtxa_date_aware.json" "$ROOT/service_init.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/r1b_broad_v2_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          cd "$ROOT"; sha256sum p1c.json service_init.json r1b_broad_v2_summary.json > input_sha256.txt
+
+      - name: Classify posterior-weighted missing service pressure
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_support_audit"
+          python -m py_compile scripts/mppd_r1b_missing_service_support_proposal_audit_20260904.py
+          python -m scripts.mppd_r1b_missing_service_support_proposal_audit_20260904 \
+            --p1c "$ROOT/p1c.json" \
+            --service-init "$ROOT/service_init.json" \
+            --r1b-summary "$ROOT/r1b_broad_v2_summary.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --nearby-edges 3 \
+            --out "$ROOT/out" | tee "$ROOT/out/r1b_missing_service_support_proposal_audit.log"
+          cp "$ROOT/input_sha256.txt" "$ROOT/out/r1b_missing_service_support_proposal_audit_input_sha256.txt"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1b_support_audit'; out=root/'out'
+          result=json.loads((out/'r1b_missing_service_support_proposal_audit_summary.json').read_text())
+          manifest={'schema':'mppd.r1b-missing-service-support-proposal-audit-execution-manifest.v1','date':'2026-09-04','status':'R1B_MISSING_SERVICE_SUPPORT_PROPOSAL_AUDIT_EXECUTION_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'source_broad_workflow_run_id':os.environ.get('GITHUB_EVENT_WORKFLOW_RUN_ID'),'pressure_by_classification':result.get('pressure_by_classification'),'pressure_by_line':result.get('pressure_by_line'),'output_files':{},'scientific_boundary':['Classification only; no service state is mutated.','New latent service roots are forbidden from spatial pressure alone.'],'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='r1b_missing_service_support_proposal_audit_execution_manifest.json':
+                  manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'r1b_missing_service_support_proposal_audit_execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'pressure_by_classification':result.get('pressure_by_classification'),'pressure_by_line':result.get('pressure_by_line'),'top_segments':result.get('top_segments',[])[:20]},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"
+          find . -maxdepth 1 -type f ! -name r1b_missing_service_support_proposal_audit_output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > r1b_missing_service_support_proposal_audit_output_sha256.txt
+          cat r1b_missing_service_support_proposal_audit_summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist proposal audit outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_support_audit/out"
+          for f in "$ROOT"/*; do
+            test -s "$f"
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,202 @@
+name: MPPD U2 Jamsil Joint Constraint Field 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u2-jamsil-joint-constraint-field-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  joint-constraints:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u2_jamsil_joint_constraint_field
+
+    steps:
+      - name: Restore qualified inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u2/out"; cd "$RUNNER_TEMP/u2"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Build passenger-service joint constraint field
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2"
+          python - <<'PY'
+          import csv,hashlib,io,json,statistics,zipfile
+          from bisect import bisect_left
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+          import numpy as np
+
+          IN_LINE='1008'; OUT_LINE='1002'; IN_TRANSFER='1008000814'; OUT_TRANSFER='1002000216'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7,0); ENTRY_END=datetime(2026,8,29,8,30); SERVICE_END=datetime(2026,8,29,10,0)
+          OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def q(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):
+              return None if not a else {'n':len(a),'min':min(a),'p10':q(a,.1),'median':q(a,.5),'p90':q(a,.9),'p99':q(a,.99),'max':max(a)}
+          def od_holdout(os,ds): return hashlib.sha1(f'{os}|{ds}'.encode()).digest()[0] % 5 == 0
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          # Build same-train service segments origin->Jamsil and Jamsil->destination.
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for st in trains[k]: trains[k][st]=sorted(set(trains[k][st]))
+          inbound=defaultdict(list); outbound=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for ia,idp in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          prior=[(oa,od) for oa,od in evs if od<ia and 0<(ia-od).total_seconds()<=7200]
+                          if prior:
+                              oa,od=max(prior,key=lambda x:x[1]); inbound[os].append((od,ia,tr))
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for oa,odp in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          aft=[(da,dd) for da,dd in evs if da>odp and 0<(da-odp).total_seconds()<=7200]
+                          if aft:
+                              da,dd=min(aft,key=lambda x:x[0]); outbound[ds].append((odp,da,tr))
+          for st in inbound: inbound[st]=sorted(set(inbound[st]))
+          for st in outbound: outbound[st]=sorted(set(outbound[st]))
+
+          # Passenger cohort. No identifier is persisted.
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a.get('service_subway_id')!=IN_LINE or b.get('service_subway_id')!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or not (START<=t0<ENTRY_END) or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  os=a.get('service_statn_id');ds=b.get('service_statn_id')
+                  if os in inbound and ds in outbound:passengers.append((t0,t1,os,ds))
+              f.close()
+
+          # Enumerate a bounded but non-parametric feasible service-chain set per passenger.
+          # Entry/exit AFC minute stamps are intervals [t,t+59]. No fixed transfer time is imposed.
+          chain_rows=[]; passenger_stats=[]; od_counts=Counter(); all_A=[];all_K=[];all_Elo=[];all_Ehi=[]
+          for pi,(t0,t1,os,ds) in enumerate(passengers):
+              od_counts[(os,ds)]+=1; inc=[x for x in inbound[os] if t0<=x[0]<=t0+timedelta(minutes=45) and x[1]<t1+timedelta(seconds=59)]
+              # retain first 8 services reaching transfer earliest after entry
+              inc=sorted(inc,key=lambda x:(x[1],x[0],x[2]))[:8]
+              cand=[]
+              for idep,iarr,itr in inc:
+                  outs=[x for x in outbound[ds] if x[0]>=iarr and x[1]<=t1+timedelta(seconds=59)]
+                  outs=sorted(outs,key=lambda x:(x[1],x[0],x[2]))[:8]
+                  prev=None
+                  for odep,darr,otr in outs:
+                      access_upper=(idep-t0).total_seconds()
+                      transfer_upper=(odep-iarr).total_seconds()
+                      elo=max(0.0,(t1-darr).total_seconds())
+                      ehi=(t1+timedelta(seconds=59)-darr).total_seconds()
+                      if access_upper<0 or transfer_upper<0 or ehi<0:continue
+                      transfer_lower_if_earliest=max(0.0,(prev-iarr).total_seconds()) if prev else 0.0
+                      cand.append((access_upper,transfer_lower_if_earliest,transfer_upper,elo,ehi,itr,otr))
+                      prev=odep
+              if cand:
+                  au=[x[0] for x in cand];ku=[x[2] for x in cand];el=[x[3] for x in cand];eh=[x[4] for x in cand]
+                  all_A+=au;all_K+=ku;all_Elo+=el;all_Ehi+=eh
+                  passenger_stats.append({'n':len(cand),'access_upper_min':min(au),'transfer_upper_min':min(ku),'egress_low_min':min(el),'egress_high_max':max(eh),'heldout_od':od_holdout(os,ds),'od':(os,ds),'candidates':cand})
+
+          # Joint scalar feasibility surface is a diagnostic of constraint shrinkage, not the final distributional model.
+          AGRID=list(range(0,301,30));KGRID=list(range(60,361,30));EGRID=list(range(0,601,60))
+          def score(params,subset):
+              A,K,E=params;ok=0;unique=0;chain_sum=0
+              for p in subset:
+                  n=0
+                  for au,kl,ku,elo,ehi,itr,otr in p['candidates']:
+                      if A<=au and kl<K<=ku and elo<=E<=ehi:n+=1
+                  ok+=n>0;unique+=n==1;chain_sum+=n
+              return ok/len(subset) if subset else 0,unique/len(subset) if subset else 0,chain_sum/len(subset) if subset else 0
+          train=[p for p in passenger_stats if not p['heldout_od']];test=[p for p in passenger_stats if p['heldout_od']]
+          surface=[]
+          for A in AGRID:
+              for K in KGRID:
+                  for E in EGRID:
+                      cov,uni,nc=score((A,K,E),train)
+                      # reward coverage, then parsimony/uniqueness; no service truth used.
+                      objective=cov+0.15*uni-0.002*max(0,nc-1)
+                      surface.append((objective,cov,uni,nc,A,K,E))
+          surface.sort(reverse=True);best=surface[0]
+          _,trcov,truni,trnc,A,K,E=best;tecov,teuni,tenc=score((A,K,E),test)
+          near=[x for x in surface if x[0]>=best[0]-0.01]
+          nearA=[x[4] for x in near];nearK=[x[5] for x in near];nearE=[x[6] for x in near]
+          cdist=[p['n'] for p in passenger_stats]
+          result={
+            'schema':'mppd.u2-jamsil-joint-constraint-field.v1','date':'2026-09-04','status':'JOINT_CONSTRAINT_FIELD_COMPLETED',
+            'cohort':{'incoming_line':IN_LINE,'outgoing_line':OUT_LINE,'station':'Jamsil','entry_window':'07:00-08:29','passenger_rows':len(passengers),'passengers_with_any_unfixed_chain':len(passenger_stats),'od_pairs':len(od_counts),'heldout_od_pairs':len({p['od'] for p in test})},
+            'candidate_chain_count':summ(cdist),
+            'unfixed_bounds':{'access_upper_sec':summ(all_A),'transfer_gap_upper_sec':summ(all_K),'egress_interval_low_sec':summ(all_Elo),'egress_interval_high_sec':summ(all_Ehi)},
+            'diagnostic_joint_scalar_grid':{'grid_A_sec':AGRID,'grid_K_sec':KGRID,'grid_E_sec':EGRID,'best':{'A_sec':A,'K_sec':K,'E_sec':E,'train_coverage':trcov,'train_unique_chain_share':truni,'train_mean_feasible_chains':trnc,'heldout_od_coverage':tecov,'heldout_od_unique_chain_share':teuni,'heldout_od_mean_feasible_chains':tenc},'near_optimal_within_objective_0p01':{'n':len(near),'A_range':[min(nearA),max(nearA)],'K_range':[min(nearK),max(nearK)],'E_range':[min(nearE),max(nearE)]}},
+            'scientific_boundary':['All direct service events are used only to construct the current service-chain constraint field; this run does NOT yet reconstruct hidden service.','The scalar grid is an identifiability diagnostic, not the canonical station-time model; V3 requires distributions and joint service inference.','Transfer waiting is induced by the selected downstream service gate; it is not an independent free parameter.','Exit has no next-service waiting term.','No raw card identifier is retained.'],
+            'next_gate':'Hide selected whole-train service states and jointly optimize hidden service timing plus station-time distributions against the same held-out-OD/passenger constraints.'}
+          (OUT/'u2_jamsil_joint_constraint_field_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          # Save only aggregate/top surface, no passenger records.
+          with (OUT/'u2_jamsil_joint_scalar_surface_top500.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f);w.writerow(['objective','train_coverage','train_unique','train_mean_chains','A_sec','K_sec','E_sec']);w.writerows(surface[:500])
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist safe aggregate result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

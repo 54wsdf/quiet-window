@@ -35,14 +35,14 @@ jobs:
           echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/g0f/out"
           rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/g0f/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-      - name: Audit codes 9000 and 9001
+      - name: Audit contiguous new-station codes 9000 through 9006
         shell: bash
         run: |
           set -euo pipefail
           python -m py_compile scripts/mppd_g0f_residual_station_code_audit_20260904.py
           python -m scripts.mppd_g0f_residual_station_code_audit_20260904 \
             --p1c "$RUNNER_TEMP/g0f/p1c.json" \
-            --codes 9000 9001 \
+            --codes 9000 9001 9002 9003 9004 9005 9006 \
             --out "$RUNNER_TEMP/g0f/out" | tee "$RUNNER_TEMP/g0f/out/g0f_residual_station_code_audit.log"
           cat "$RUNNER_TEMP/g0f/out/g0f_residual_station_code_audit.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Persist G0F audit

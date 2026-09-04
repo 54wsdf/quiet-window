@@ -1,0 +1,74 @@
+name: MPPD Same-Line Closure Result Bridge 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-same-line-result-bridge-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-summary:
+    runs-on: ubuntu-24.04
+    outputs:
+      n: ${{ steps.x.outputs.n }}
+      s1: ${{ steps.x.outputs.s1 }}
+      s2: ${{ steps.x.outputs.s2 }}
+      s3: ${{ steps.x.outputs.s3 }}
+      f1: ${{ steps.x.outputs.f1 }}
+      f2: ${{ steps.x.outputs.f2 }}
+      f3: ${{ steps.x.outputs.f3 }}
+      q0: ${{ steps.x.outputs.q0 }}
+      q300: ${{ steps.x.outputs.q300 }}
+      q600: ${{ steps.x.outputs.q600 }}
+      q1800: ${{ steps.x.outputs.q1800 }}
+      late_med: ${{ steps.x.outputs.late_med }}
+      late_p90: ${{ steps.x.outputs.late_p90 }}
+      acc_med: ${{ steps.x.outputs.acc_med }}
+      egr_med: ${{ steps.x.outputs.egr_med }}
+    steps:
+      - name: Read persisted aggregate summary only
+        id: x
+        shell: bash
+        env:
+          CFG: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$CFG" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          P='ResearchData/rail_transit/mppd_core_closure_20260904/direct_service_evidence_same_line_closure/direct_service_same_line_closure_summary.json'
+          rclone copyto "$R:$P" "$RUNNER_TEMP/s.json" --config "$C" --retries 6 --low-level-retries 15
+          get(){ jq -r "$1 // 0" "$RUNNER_TEMP/s.json"; }
+          echo "n=$(get '.cohort_n')" >> "$GITHUB_OUTPUT"
+          echo "s1=$(get '.stage_counts.S1_same_train_structural_segment_exists.n')" >> "$GITHUB_OUTPUT"
+          echo "s2=$(get '.stage_counts.S2_origin_departure_after_entry_exists.n')" >> "$GITHUB_OUTPUT"
+          echo "s3=$(get '.stage_counts.S3_strict_exit_interval_compatible_chain_exists.n')" >> "$GITHUB_OUTPUT"
+          echo "f1=$(get '.first_failure_counts.F1_no_same_train_structural_segment.n')" >> "$GITHUB_OUTPUT"
+          echo "f2=$(get '.first_failure_counts.F2_no_origin_departure_after_entry_within_45m.n')" >> "$GITHUB_OUTPUT"
+          echo "f3=$(get '.first_failure_counts.F3_destination_arrival_after_recorded_exit_minute.n')" >> "$GITHUB_OUTPUT"
+          echo "q0=$(get '.exit_slack_staircase_sec["0"].n')" >> "$GITHUB_OUTPUT"
+          echo "q300=$(get '.exit_slack_staircase_sec["300"].n')" >> "$GITHUB_OUTPUT"
+          echo "q600=$(get '.exit_slack_staircase_sec["600"].n')" >> "$GITHUB_OUTPUT"
+          echo "q1800=$(get '.exit_slack_staircase_sec["1800"].n')" >> "$GITHUB_OUTPUT"
+          echo "late_med=$(get '.minimum_lateness_when_strict_exit_fails_sec.median')" >> "$GITHUB_OUTPUT"
+          echo "late_p90=$(get '.minimum_lateness_when_strict_exit_fails_sec.p90')" >> "$GITHUB_OUTPUT"
+          echo "acc_med=$(get '.selected_supported_access_wait_sec.median')" >> "$GITHUB_OUTPUT"
+          echo "egr_med=$(get '.selected_supported_egress_low_sec.median')" >> "$GITHUB_OUTPUT"
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  cohort-and-failures:
+    needs: read-summary
+    runs-on: ubuntu-24.04
+    name: "SLC cohort=${{ needs.read-summary.outputs.n }} S1=${{ needs.read-summary.outputs.s1 }} S2=${{ needs.read-summary.outputs.s2 }} S3=${{ needs.read-summary.outputs.s3 }} F1=${{ needs.read-summary.outputs.f1 }} F2=${{ needs.read-summary.outputs.f2 }} F3=${{ needs.read-summary.outputs.f3 }}"
+    steps:
+      - run: echo aggregate-metrics-bridge
+
+  slack-and-times:
+    needs: read-summary
+    runs-on: ubuntu-24.04
+    name: "SLC slack0=${{ needs.read-summary.outputs.q0 }} slack300=${{ needs.read-summary.outputs.q300 }} slack600=${{ needs.read-summary.outputs.q600 }} slack1800=${{ needs.read-summary.outputs.q1800 }} lateMed=${{ needs.read-summary.outputs.late_med }} lateP90=${{ needs.read-summary.outputs.late_p90 }} accessMed=${{ needs.read-summary.outputs.acc_med }} egressMed=${{ needs.read-summary.outputs.egr_med }}"
+    steps:
+      - run: echo aggregate-metrics-bridge

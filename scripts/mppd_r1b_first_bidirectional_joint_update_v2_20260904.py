@@ -50,7 +50,19 @@ def route_beam_joint_v2(cand, meta, rides_fn, tin, tout, beam, kernels, max_skip
 
 
 def update_kernels_v2(factors, kernels):
-    raw, diag = _orig_update_kernels(factors, kernels)
+    proxy_egress = [
+        f for f in factors
+        if f.get("type") == "EGRESS"
+        and (f.get("station_only_proxy") or f.get("fit_eligible") is False)
+    ]
+    fit_factors = [
+        f for f in factors
+        if not (
+            f.get("type") == "EGRESS"
+            and (f.get("station_only_proxy") or f.get("fit_eligible") is False)
+        )
+    ]
+    raw, diag = _orig_update_kernels(fit_factors, kernels)
     updated = {
         "schema": "mppd.r1b-kernels.v2-damped-mixture-capable-k1-first-pass",
         "access": blend_kernel(kernels["access"], raw["access"], KERNEL_DAMPING, "R1B_DAMPED_POSTERIOR_UPDATE"),
@@ -84,6 +96,11 @@ def update_kernels_v2(factors, kernels):
             item["damped_median_sec"] = k["median_sec"]
             item["damped_sigma"] = k["sigma"]
     diag["kernel_damping"] = KERNEL_DAMPING
+    diag["station_only_egress_proxy_filter"] = {
+        "excluded_factor_count": len(proxy_egress),
+        "excluded_posterior_weight": sum(float(f.get("weight", 0.0)) for f in proxy_egress),
+        "policy": "EXCLUDE_STATION_ONLY_OR_FIT_INELIGIBLE_EGRESS_FROM_THETA_E_MSTEP",
+    }
     diag["update_role"] = "DAMPED_ONE_STEP_R1B_SMOKE_NOT_R1C_FINAL_KERNEL"
     return updated, diag
 

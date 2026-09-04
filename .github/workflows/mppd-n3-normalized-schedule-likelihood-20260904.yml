@@ -20,7 +20,6 @@ jobs:
       OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n3_normalized_schedule_likelihood
     steps:
       - uses: actions/checkout@v4
-
       - name: Prepare inputs and protected Drive config
         id: prep
         shell: bash
@@ -37,18 +36,17 @@ jobs:
           rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
           rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
           rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service.csv --config "$C" --retries 6 --low-level-retries 15
-
       - name: Run normalized candidate-schedule likelihood
         shell: bash
         run: |
           set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
           python -m py_compile scripts/mppd_n3_shared_kernel_joint_likelihood_20260904.py scripts/mppd_n3_normalized_schedule_likelihood_20260904.py
           python scripts/mppd_n3_normalized_schedule_likelihood_20260904.py \
             --taims "$RUNNER_TEMP/n3norm/TAIMS.zip" \
             --p1c "$RUNNER_TEMP/n3norm/p1c.json" \
             --service "$RUNNER_TEMP/n3norm/service.csv" \
             --out "$RUNNER_TEMP/n3norm/out"
-
       - name: Persist normalized N3 result
         shell: bash
         env:
@@ -60,7 +58,6 @@ jobs:
           test "$(find . -maxdepth 1 -type f | wc -l)" -gt 0
           for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
           rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
-
       - name: Clean protected config
         if: always()
         shell: bash

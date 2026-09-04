@@ -1,0 +1,71 @@
+name: MPPD R0 Route Ensemble G0C Topology 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r0-full-network-route-ensemble-g0c-topology-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r0-route-ensemble-g0c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0c_topology
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore topology and city-day cohort cache
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/ensemble_g0c/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/ensemble_g0c/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/r0_city_day_cache/seoul_20260829_0700_1000_afc_time_cohorts.csv.gz" "$RUNNER_TEMP/ensemble_g0c/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+
+      - name: Generate route ensemble on G0C repaired topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/mppd_topology_patch_20260904.py scripts/mppd_r0_full_network_route_ensemble_20260904.py
+          /usr/bin/time -v python -m scripts.mppd_r0_full_network_route_ensemble_20260904 \
+            --p1c "$RUNNER_TEMP/ensemble_g0c/p1c.json" \
+            --cohorts "$RUNNER_TEMP/ensemble_g0c/cohorts.csv.gz" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0c_20260904.json \
+            --out "$RUNNER_TEMP/ensemble_g0c/out" \
+            2>&1 | tee "$RUNNER_TEMP/ensemble_g0c/out/route_ensemble_execution.log"
+
+      - name: Persist G0C route ensemble
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ensemble_g0c/out"
+          test "$(find . -maxdepth 1 -type f | wc -l)" -gt 0
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

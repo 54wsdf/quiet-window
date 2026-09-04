@@ -20,7 +20,7 @@ jobs:
       ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
       G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
       MONO_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_context_aware_service_offset_consistency
-      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_distributed_parity_1of50
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_distributed_parity_1of50_v2_raw_movement
     steps:
       - uses: actions/checkout@v4
       - name: Restore parity substrate
@@ -40,34 +40,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail; ROOT="$RUNNER_TEMP/parity"
-          python -m scripts.mppd_r1c_distributed_posterior_shard_20260905 --phase E0 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --beam 8 --max-skip 2 --out "$ROOT/e0/shard_00"
+          python -m scripts.mppd_r1c_distributed_posterior_shard_v3_raw_movement_20260905 --phase E0 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --beam 8 --max-skip 2 --out "$ROOT/e0/shard_00"
           python - <<'PY'
-          import json,os,pathlib
+          import gzip,json,os,pathlib
           r=pathlib.Path(os.environ['RUNNER_TEMP'])/'parity'; e=json.loads((r/'e0/shard_00/shard_summary.json').read_text()); m=json.loads((r/'monolithic.json').read_text()); assert e['scope']['shard_cohort_count']==11061 and e['scope']['shard_passenger_mass']==12457; assert abs(e['posterior']['finite_posterior_mass']-m['iteration']['E0_passenger_posterior']['finite_posterior_mass'])<1e-9; assert e['posterior']['failure_mass']==m['iteration']['E0_passenger_posterior']['failure_mass']
+          raw_groups=set()
+          with gzip.open(r/'e0/shard_00/e0_kernel_sufficient_stats.jsonl.gz','rt',encoding='utf-8') as f:
+              for line in f:
+                  if line.strip():
+                      x=json.loads(line)
+                      if x.get('scope')=='TRANSFER_MOVEMENT_RAW_WEIGHT' and float(x.get('weight',0))>=50: raw_groups.add(x.get('group'))
+          assert len(raw_groups)==89, len(raw_groups)
           PY
       - name: Aggregate kernels and offsets
         shell: bash
         run: |
           set -euo pipefail; ROOT="$RUNNER_TEMP/parity"
-          python -m scripts.mppd_r1c_distributed_kernel_aggregator_20260905 --stats-root "$ROOT/e0" --out "$ROOT/kernels"
+          python -m scripts.mppd_r1c_distributed_kernel_aggregator_v2_raw_movement_20260905 --stats-root "$ROOT/e0" --out "$ROOT/kernels"
+          python - <<'PY'
+          import json,os,pathlib
+          r=pathlib.Path(os.environ['RUNNER_TEMP'])/'parity'; d=json.loads((r/'kernels/kernel_aggregation_diagnostics.json').read_text()); assert d['counts']['transfer_movement_count']==89; assert d['counts']['transfer_raw_movement_ge50_count']==89
+          PY
           python -m scripts.mppd_r1c_distributed_offset_score_shard_20260905 --offset-stats "$ROOT/e0/shard_00/e0_offset_sufficient_stats.jsonl.gz" --kernels "$ROOT/kernels/global_kernels.json" --out "$ROOT/scores/shard_00"
           python -m scripts.mppd_r1c_distributed_offset_aggregator_20260905 --score-root "$ROOT/scores" --e0-root "$ROOT/e0" --service-init "$ROOT/service.json" --min-service-usage 25 --out "$ROOT/offsets"
       - name: Run distributed E1 and compare monolithic authority
         shell: bash
         run: |
           set -euo pipefail; ROOT="$RUNNER_TEMP/parity"
-          python -m scripts.mppd_r1c_distributed_posterior_shard_20260905 --phase E1 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --kernels "$ROOT/kernels/global_kernels.json" --offsets "$ROOT/offsets/global_offsets.json" --beam 8 --max-skip 2 --out "$ROOT/e1/shard_00"
+          python -m scripts.mppd_r1c_distributed_posterior_shard_v3_raw_movement_20260905 --phase E1 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --kernels "$ROOT/kernels/global_kernels.json" --offsets "$ROOT/offsets/global_offsets.json" --beam 8 --max-skip 2 --out "$ROOT/e1/shard_00"
           python - <<'PY'
           import gzip,json,math,os,pathlib
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'parity'; mono=json.loads((root/'monolithic.json').read_text()); e0=json.loads((root/'e0/shard_00/shard_summary.json').read_text()); e1=json.loads((root/'e1/shard_00/shard_summary.json').read_text()); kernels=json.loads((root/'kernels/global_kernels.json').read_text())['kernels']; offsets=json.loads((root/'offsets/global_offsets.json').read_text())
-          m0=mono['iteration']['E0_passenger_posterior']; m1=mono['iteration']['E1_passenger_posterior']; mk=mono['iteration']['M_kernel_update']['kernels_after']; mo=mono['iteration']['M_service_timing_update']
-          assert e1['posterior']['finite_posterior_mass']==m1['finite_posterior_mass']; assert e1['posterior']['failure_mass']==m1['failure_mass']
+          m1=mono['iteration']['E1_passenger_posterior']; mk=mono['iteration']['M_kernel_update']['kernels_after']; mo=mono['iteration']['M_service_timing_update']
+          assert e1['posterior']['finite_posterior_mass']==m1['finite_posterior_mass']; assert e1['posterior']['failure_mass']==m1['failure_mass']; assert len(kernels['transfer_by_movement'])==len(mk['transfer_by_movement'])==89
           kernel_diffs={}
           for key in ('access','egress','transfer_global'):
               a=kernels[key]['components'][0]; b=mk[key]['components'][0]; kernel_diffs[key]={'median_abs':abs(a['median_sec']-b['median_sec']),'sigma_abs':abs(a['sigma']-b['sigma'])}
-          assert max(v['median_abs'] for v in kernel_diffs.values()) < 0.02; assert max(v['sigma_abs'] for v in kernel_diffs.values()) < 2e-4
+          movement_kernel_max={'median_abs':0.0,'sigma_abs':0.0}
+          for movement in mk['transfer_by_movement']:
+              a=kernels['transfer_by_movement'][movement]['components'][0]; b=mk['transfer_by_movement'][movement]['components'][0]; movement_kernel_max['median_abs']=max(movement_kernel_max['median_abs'],abs(a['median_sec']-b['median_sec'])); movement_kernel_max['sigma_abs']=max(movement_kernel_max['sigma_abs'],abs(a['sigma']-b['sigma']))
+          assert max(v['median_abs'] for v in kernel_diffs.values()) < 0.02; assert max(v['sigma_abs'] for v in kernel_diffs.values()) < 2e-4; assert movement_kernel_max['median_abs'] < 0.03; assert movement_kernel_max['sigma_abs'] < 3e-4
           mono_offsets={k:int(v) for k,v in mo['nonzero_offsets'].items()}; dist_offsets={k:int(v) for k,v in offsets['nonzero_offsets'].items()}; offset_disagreement={k:(mono_offsets.get(k,0),dist_offsets.get(k,0)) for k in set(mono_offsets)|set(dist_offsets) if mono_offsets.get(k,0)!=dist_offsets.get(k,0)}
-          # Posterior comparison from shard files.
           a={}
           with gzip.open(root/'e0/shard_00/e0_cohort_posterior.jsonl.gz','rt',encoding='utf-8') as f:
               for line in f:
@@ -76,15 +89,15 @@ jobs:
           with gzip.open(root/'e1/shard_00/e1_cohort_posterior.jsonl.gz','rt',encoding='utf-8') as f:
               for line in f:
                   if not line.strip(): continue
-                  b=json.loads(line); x=a[b['cohort_id']]; mass=float(x['mass']);
+                  b=json.loads(line); x=a[b['cohort_id']]; mass=float(x['mass'])
                   if x['status']=='FINITE_POSTERIOR' and b['status']=='FINITE_POSTERIOR':
                       finite_both+=mass; route_changed+=mass*(x.get('top_route')!=b.get('top_route')); first_changed+=mass*(x.get('top_first_root')!=b.get('top_first_root')); keys=set(x.get('route_probs',{}))|set(b.get('route_probs',{})); tv_num+=mass*0.5*sum(abs(float(x.get('route_probs',{}).get(k,0))-float(b.get('route_probs',{}).get(k,0))) for k in keys)
           movement={'top_route_changed_mass':route_changed,'top_first_service_changed_mass':first_changed,'mean_route_total_variation':tv_num/finite_both}
-          # Near ties can change a small number of 30-second grid decisions after 1 ms sufficient-stat rounding; require posterior-level parity, not bit identity of those nuisance decisions.
-          assert abs(e1['posterior']['weighted_mean_route_entropy_nats']-m1['weighted_mean_route_entropy_nats']) < 5e-4
-          assert abs(movement['top_route_changed_mass']-mono['iteration']['posterior_redistribution']['top_route_changed_mass']) <= 10
-          assert abs(movement['top_first_service_changed_mass']-mono['iteration']['posterior_redistribution']['top_first_service_changed_mass']) <= 30
-          result={'schema':'mppd.r1c-distributed-parity-1of50.v1','date':'2026-09-05','status':'R1C_DISTRIBUTED_PARITY_1OF50_PASS','scope':{'cohort_count':11061,'passenger_mass':12457},'kernel_diffs':kernel_diffs,'offset_disagreement_count':len(offset_disagreement),'offset_disagreement':offset_disagreement,'monolithic_nonzero_offset_count':len(mono_offsets),'distributed_nonzero_offset_count':len(dist_offsets),'distributed_E1':e1['posterior'],'monolithic_E1':m1,'distributed_movement':movement,'monolithic_movement':mono['iteration']['posterior_redistribution'],'scientific_boundary':['Parity is evaluated at posterior and kernel-likelihood level; millisecond sufficient-stat rounding is allowed to alter only near-tied nuisance offset grid decisions if posterior-level tolerances remain satisfied.','This parity run uses exactly the same deterministic hash modulo-50 cohort as the monolithic authority.'],'no_email_notification_logic':True}
+          entropy_abs=abs(e1['posterior']['weighted_mean_route_entropy_nats']-m1['weighted_mean_route_entropy_nats'])
+          assert entropy_abs < 2e-4, entropy_abs
+          assert abs(movement['top_route_changed_mass']-mono['iteration']['posterior_redistribution']['top_route_changed_mass']) <= 5
+          assert abs(movement['top_first_service_changed_mass']-mono['iteration']['posterior_redistribution']['top_first_service_changed_mass']) <= 10
+          result={'schema':'mppd.r1c-distributed-parity-1of50.v2-raw-movement-membership','date':'2026-09-05','status':'R1C_DISTRIBUTED_PARITY_1OF50_PASS','scope':{'cohort_count':11061,'passenger_mass':12457},'kernel_diffs':kernel_diffs,'movement_kernel_max_diff':movement_kernel_max,'offset_disagreement_count':len(offset_disagreement),'offset_disagreement':offset_disagreement,'monolithic_nonzero_offset_count':len(mono_offsets),'distributed_nonzero_offset_count':len(dist_offsets),'distributed_E1':e1['posterior'],'monolithic_E1':m1,'distributed_movement':movement,'monolithic_movement':mono['iteration']['posterior_redistribution'],'entropy_abs_diff':entropy_abs,'scientific_boundary':['Parity uses the exact deterministic hash modulo-50 cohort and reproduces canonical raw-movement membership before cleaned interval fitting.','Millisecond sufficient-stat rounding is permitted only within explicit kernel/posterior tolerances; no scientific threshold is relaxed.'],'no_email_notification_logic':True}
           (root/'out/parity_result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)); print(json.dumps(result,ensure_ascii=False,indent=2))
           PY
       - name: Persist parity result

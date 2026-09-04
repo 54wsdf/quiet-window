@@ -1,0 +1,84 @@
+name: MPPD U1 Seoul Count-Free Cross-Line Replication 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-seoul-count-free-crossline-replication-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replicate:
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ['1002','1007']
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_count_free_crossline_${{ matrix.line }}
+    steps:
+      - name: Restore Seoul AFC, service evidence, and line crosswalk
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone curl
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/xline/out"; cd "$RUNNER_TEMP/xline"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Reuse exact qualified Line-8 five-fold engine with line substitution only
+        shell: bash
+        env:
+          TARGET_LINE: ${{ matrix.line }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/xline"
+          curl -fsSL 'https://raw.githubusercontent.com/54wsdf/quiet-window/5cb2d5cdf7e7723e18ec65fa6997ea828802afbe/.github/workflows/mppd-u1-seoul-count-free-fivefold-cv-20260904.yml' -o source.yml
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          text=Path('source.yml').read_text(encoding='utf-8')
+          marker="          python - <<'PY'\n"
+          start=text.index(marker)+len(marker)
+          end=text.index("\n          PY",start)
+          lines=text[start:end].splitlines()
+          code='\n'.join(line[10:] if line.startswith('          ') else line for line in lines)+'\n'
+          target=os.environ['TARGET_LINE']
+          old="LINE='1008'"
+          assert old in code
+          code=code.replace(old,f"LINE='{target}'",1)
+          Path('run_line.py').write_text(code,encoding='utf-8')
+          print(f'engine_source_commit=5cb2d5cdf7e7723e18ec65fa6997ea828802afbe target_line={target} change=LINE_ONLY')
+          PY
+          python run_line.py
+
+      - name: Persist line-specific results
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/xline/out"
+          test "$(find . -maxdepth 1 -type f | wc -l)" -gt 0
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

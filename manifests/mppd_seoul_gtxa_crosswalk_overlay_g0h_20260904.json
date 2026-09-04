@@ -1,0 +1,207 @@
+{
+  "schema": "mppd.seoul-gtxa-crosswalk-overlay.g0h.v1",
+  "date": "2026-09-04",
+  "status": "QUALIFIED_HYPOTHESIS_FOR_G0H_RAW_AFC_REBUILD",
+  "authority": "00_CURRENT_CORE_CLOSURE_WORKPLAN_V6_FULL_NETWORK_STATE_RECONSTRUCTION_20260904.md",
+  "business_date": "2026-08-29",
+  "line": "1032",
+  "trigger_evidence": {
+    "raw_gtxa_rows": 12105,
+    "raw_gtxa_rows_with_both_endpoints_in_family": 12105,
+    "strict_p1c_unmapped_rows": 11948,
+    "strict_p1c_wrong_line_suspect_rows": 3266,
+    "finding": "P1C same-name mapping rules systematically absorb or exclude GTX-A station-code family 9000-9010."
+  },
+  "operational_components": [
+    {
+      "component_id": "GTXA_NORTH_20260829",
+      "status": "ACTIVE",
+      "stations_in_service_order": ["9000", "9001", "9002", "9004", "9005"],
+      "excluded_reserved_or_nonstopping_codes": ["9003"],
+      "service_extent": "운정중앙-킨텍스-대곡-연신내-서울역"
+    },
+    {
+      "component_id": "GTXA_SOUTH_20260829",
+      "status": "ACTIVE",
+      "stations_in_service_order": ["9007", "9008", "9009", "9010"],
+      "excluded_reserved_or_nonstopping_codes": ["9006"],
+      "service_extent": "수서-성남-구성-동탄"
+    }
+  ],
+  "forbidden_operational_edges": [
+    {
+      "u_code": "9005",
+      "v_code": "9007",
+      "reason": "SEOUL_SUSEO_CENTRAL_SECTION_NOT_QUALIFIED_OPEN_ON_2026_08_29"
+    }
+  ],
+  "stations": [
+    {
+      "code": "9000",
+      "name": "운정중앙",
+      "sequence": 1,
+      "node": "1032|GTXA_X101_UNJEONGJUNGANG",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1063|1063075329",
+      "old_p1c_tier": "B_UNIQUE_NAME",
+      "mapping_action": "OVERRIDE_WRONG_LINE_SAME_NAME_COLLISION",
+      "transfer_targets": []
+    },
+    {
+      "code": "9001",
+      "name": "킨텍스",
+      "sequence": 2,
+      "node": "1032|1032000347",
+      "active": true,
+      "reuse_existing_p1c_node": true,
+      "old_p1c_mapping": "1032|1032000347",
+      "old_p1c_tier": "B_UNIQUE_NAME",
+      "mapping_action": "PRESERVE_CORRECT_LINE_MAPPING",
+      "transfer_targets": []
+    },
+    {
+      "code": "9002",
+      "name": "대곡",
+      "sequence": 3,
+      "node": "1032|GTXA_X103_DAEGOK",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1003|1003000314",
+      "old_p1c_tier": "D_ALIAS_SINGLETON_LINE",
+      "mapping_action": "OVERRIDE_WRONG_LINE_ALIAS_COLLISION",
+      "transfer_targets": [
+        {"line": "1003", "station_names": ["대곡"]},
+        {"line": "1063", "station_names": ["대곡"]},
+        {"line": "1093", "station_names": ["대곡"]}
+      ]
+    },
+    {
+      "code": "9003",
+      "name": "창릉",
+      "sequence": 4,
+      "node": "1032|GTXA_X104_CHANGNEUNG",
+      "active": false,
+      "reuse_existing_p1c_node": false,
+      "mapping_action": "RESERVED_NOT_ACTIVE_NO_AFC_MAPPING",
+      "transfer_targets": []
+    },
+    {
+      "code": "9004",
+      "name": "연신내",
+      "sequence": 5,
+      "node": "1032|GTXA_X105_YEONSINNAE",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1003|1003000321",
+      "old_p1c_tier": "D_ALIAS_SINGLETON_LINE",
+      "mapping_action": "OVERRIDE_WRONG_LINE_ALIAS_COLLISION",
+      "transfer_targets": [
+        {"line": "1003", "station_names": ["연신내"]},
+        {"line": "1006", "station_names": ["연신내"]}
+      ]
+    },
+    {
+      "code": "9005",
+      "name": "서울",
+      "sequence": 6,
+      "node": "1032|GTXA_X106_SEOUL",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1001|1001000133",
+      "old_p1c_tier": "D_ALIAS_SINGLETON_LINE",
+      "mapping_action": "OVERRIDE_WRONG_LINE_ALIAS_COLLISION",
+      "transfer_targets": [
+        {"line": "1001", "station_names": ["서울", "서울역"]},
+        {"line": "1004", "station_names": ["서울", "서울역"]},
+        {"line": "1063", "station_names": ["서울", "서울역"]},
+        {"line": "1065", "station_names": ["서울", "서울역"]}
+      ]
+    },
+    {
+      "code": "9006",
+      "name": "삼성",
+      "sequence": 7,
+      "node": "1032|GTXA_X107_SAMSUNG",
+      "active": false,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1002|1002000219",
+      "old_p1c_tier": "B_UNIQUE_NAME",
+      "mapping_action": "NONSTOP_NOT_ACTIVE_NO_AFC_MAPPING",
+      "transfer_targets": []
+    },
+    {
+      "code": "9007",
+      "name": "수서",
+      "sequence": 8,
+      "node": "1032|GTXA_X108_SUSEO",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1003|1003000349",
+      "old_p1c_tier": "D_ALIAS_SINGLETON_LINE",
+      "mapping_action": "OVERRIDE_WRONG_LINE_ALIAS_COLLISION",
+      "transfer_targets": [
+        {"line": "1003", "station_names": ["수서"]},
+        {"line": "1075", "station_names": ["수서"]}
+      ]
+    },
+    {
+      "code": "9008",
+      "name": "성남",
+      "sequence": 9,
+      "node": "1032|1032000354",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1032|1032000354",
+      "old_p1c_tier": "D_ALIAS_SINGLETON_LINE",
+      "mapping_action": "PROMOTE_LINE_CORRECT_LOW_TIER_NODE",
+      "transfer_targets": [
+        {"line": "1081", "station_names": ["성남"]}
+      ]
+    },
+    {
+      "code": "9009",
+      "name": "구성",
+      "sequence": 10,
+      "node": "1032|1032000355",
+      "active": true,
+      "reuse_existing_p1c_node": false,
+      "old_p1c_mapping": "1032|1032000355",
+      "old_p1c_tier": "D_ALIAS_SINGLETON_LINE",
+      "mapping_action": "PROMOTE_LINE_CORRECT_LOW_TIER_NODE",
+      "transfer_targets": [
+        {"line": "1075", "station_names": ["구성"]}
+      ]
+    },
+    {
+      "code": "9010",
+      "name": "동탄",
+      "sequence": 11,
+      "node": "1032|1032000356",
+      "active": true,
+      "reuse_existing_p1c_node": true,
+      "old_p1c_mapping": "1032|1032000356",
+      "old_p1c_tier": "B_UNIQUE_NAME",
+      "mapping_action": "PRESERVE_CORRECT_LINE_MAPPING",
+      "transfer_targets": []
+    }
+  ],
+  "inline_edges": [
+    {"u_code": "9000", "v_code": "9001", "weight": 1.0, "component_id": "GTXA_NORTH_20260829"},
+    {"u_code": "9001", "v_code": "9002", "weight": 1.0, "component_id": "GTXA_NORTH_20260829"},
+    {"u_code": "9002", "v_code": "9004", "weight": 2.0, "component_id": "GTXA_NORTH_20260829"},
+    {"u_code": "9004", "v_code": "9005", "weight": 1.0, "component_id": "GTXA_NORTH_20260829"},
+    {"u_code": "9007", "v_code": "9008", "weight": 1.0, "component_id": "GTXA_SOUTH_20260829"},
+    {"u_code": "9008", "v_code": "9009", "weight": 1.0, "component_id": "GTXA_SOUTH_20260829"},
+    {"u_code": "9009", "v_code": "9010", "weight": 1.0, "component_id": "GTXA_SOUTH_20260829"}
+  ],
+  "scientific_boundary": [
+    "The overlay supersedes same-name crosswalk assignments only for the explicitly listed GTX-A station-code family and leaves the base P1C immutable.",
+    "Synthetic line-1032 nodes are topology/crosswalk entities, not observed ATS events or inferred passenger paths.",
+    "The north and south operating components remain disconnected on 2026-08-29; no Seoul-Suseo through-service edge is inserted.",
+    "Inactive Changneung and non-stopping Samsung are not mapped as active AFC endpoints.",
+    "Transfer targets must resolve against the existing line-aware graph and are recorded in the application result.",
+    "Downstream AFC cohorts must be regenerated from raw TAIMS after this overlay; old strict-P1C cohorts remain historical baselines only."
+  ],
+  "no_email_notification_logic": true
+}

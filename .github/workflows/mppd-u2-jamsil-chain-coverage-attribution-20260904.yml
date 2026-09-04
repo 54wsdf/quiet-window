@@ -1,0 +1,184 @@
+name: MPPD U2 Jamsil Chain Coverage Attribution 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u2-jamsil-chain-coverage-attribution-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage-attribution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u2_jamsil_chain_coverage_attribution
+
+    steps:
+      - name: Restore qualified AFC and service-event layers
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u2cov/out"; cd "$RUNNER_TEMP/u2cov"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Attribute every complete-chain loss stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2cov"
+          python - <<'PY'
+          import csv,io,json,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          IN_LINE='1008'; OUT_LINE='1002'; IN_TRANSFER='1008000814'; OUT_TRANSFER='1002000216'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7,0); ENTRY_END=datetime(2026,8,29,8,30)
+          OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def pct(n,d):return n/d if d else None
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT}
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip()
+                  if line not in {IN_LINE,OUT_LINE}:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+
+          inbound=defaultdict(list);outbound=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line==IN_LINE and IN_TRANSFER in sts:
+                  for ia,idp in sts[IN_TRANSFER]:
+                      for os,evs in sts.items():
+                          if os==IN_TRANSFER:continue
+                          for oa,od in evs:
+                              if od<ia and 0<(ia-od).total_seconds()<=7200:
+                                  inbound[os].append((od,ia,tr))
+              if line==OUT_LINE and OUT_TRANSFER in sts:
+                  for oa,odp in sts[OUT_TRANSFER]:
+                      for ds,evs in sts.items():
+                          if ds==OUT_TRANSFER:continue
+                          for da,dd in evs:
+                              if da>odp and 0<(da-odp).total_seconds()<=7200:
+                                  outbound[ds].append((odp,da,tr))
+          for st in inbound:inbound[st]=sorted(set(inbound[st]))
+          for st in outbound:outbound[st]=sorted(set(outbound[st]))
+
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a.get('service_subway_id')!=IN_LINE or b.get('service_subway_id')!=OUT_LINE:continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or not (START<=t0<ENTRY_END) or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  passengers.append((t0,t1,a.get('service_statn_id'),b.get('service_statn_id')))
+              f.close()
+
+          stages=Counter();first_fail=Counter();od_fail=Counter();slack_counts=Counter();transfer_lb_counts=Counter()
+          for t0,t1,os,ds in passengers:
+              stages['S0_strict_line_cohort']+=1
+              has_in=os in inbound
+              has_out=ds in outbound
+              if has_in:stages['S1_inbound_origin_service_segment_exists']+=1
+              else:first_fail['F1_no_inbound_origin_segment']+=1;od_fail[('F1',os,ds)]+=1
+              if has_out:stages['S2_outbound_destination_service_segment_exists']+=1
+              elif has_in:first_fail['F2_no_outbound_destination_segment']+=1;od_fail[('F2',os,ds)]+=1
+              if not (has_in and has_out):continue
+              stages['S3_both_structural_service_segments_exist']+=1
+
+              inc0=[x for x in inbound[os] if t0<=x[0]<=t0+timedelta(minutes=45) and x[1]<t1+timedelta(seconds=59)]
+              if not inc0:
+                  first_fail['F3_no_temporally_feasible_inbound_service_after_entry']+=1;od_fail[('F3',os,ds)]+=1;continue
+              stages['S4_temporally_feasible_inbound_exists']+=1
+
+              # Transfer-order feasibility ignores destination exit closure.
+              transfer_pairs=[]
+              for idep,iarr,itr in inc0:
+                  for odep,darr,otr in outbound[ds]:
+                      if odep>=iarr:transfer_pairs.append((idep,iarr,odep,darr,itr,otr))
+              if not transfer_pairs:
+                  first_fail['F4_no_downstream_departure_after_inbound_arrival']+=1;od_fail[('F4',os,ds)]+=1;continue
+              stages['S5_transfer_order_feasible_pair_exists']+=1
+
+              # Exit-closure slack staircase: maximum allowed destination-arrival time is exit-minute upper edge + slack.
+              for slack in (0,60,120,300,600,900,1800):
+                  lim=t1+timedelta(seconds=59+slack)
+                  if any(darr<=lim for _,_,_,darr,_,_ in transfer_pairs):slack_counts[slack]+=1
+              strict=[p for p in transfer_pairs if p[3]<=t1+timedelta(seconds=59)]
+              if not strict:
+                  first_fail['F5_destination_service_arrival_after_recorded_exit_minute']+=1;od_fail[('F5',os,ds)]+=1;continue
+              stages['S6_complete_unfixed_chain_exit_interval_compatible']+=1
+
+              # Among strict chains, test physical transfer lower-bound sensitivity. K here means platform-ready lower bound only.
+              for ksec in (0,60,120,150,158,180,240,300):
+                  if any((odep-iarr).total_seconds()>=ksec for _,iarr,odep,darr,_,_ in strict):transfer_lb_counts[ksec]+=1
+
+          N=stages['S0_strict_line_cohort']
+          stage_order=['S0_strict_line_cohort','S1_inbound_origin_service_segment_exists','S2_outbound_destination_service_segment_exists','S3_both_structural_service_segments_exist','S4_temporally_feasible_inbound_exists','S5_transfer_order_feasible_pair_exists','S6_complete_unfixed_chain_exit_interval_compatible']
+          result={
+            'schema':'mppd.u2-jamsil-chain-coverage-attribution.v1','date':'2026-09-04','status':'CHAIN_COVERAGE_ATTRIBUTION_COMPLETED',
+            'cohort_n':N,
+            'stage_counts':{k:{'n':stages[k],'share_of_cohort':pct(stages[k],N)} for k in stage_order},
+            'first_failure_counts':{k:{'n':v,'share_of_cohort':pct(v,N)} for k,v in first_fail.items()},
+            'exit_closure_slack_staircase_sec':{str(k):{'n':slack_counts[k],'share_of_cohort':pct(slack_counts[k],N),'share_of_transfer_order_feasible':pct(slack_counts[k],stages['S5_transfer_order_feasible_pair_exists'])} for k in (0,60,120,300,600,900,1800)},
+            'physical_transfer_lower_bound_sensitivity_sec':{str(k):{'n':transfer_lb_counts[k],'share_of_cohort':pct(transfer_lb_counts[k],N),'share_of_strict_complete':pct(transfer_lb_counts[k],stages['S6_complete_unfixed_chain_exit_interval_compatible'])} for k in (0,60,120,150,158,180,240,300)},
+            'top_failure_od_cells':[{'failure_stage':k[0],'origin_service_statn_id':k[1],'destination_service_statn_id':k[2],'n':v} for k,v in od_fail.most_common(30)],
+            'scientific_boundary':['This is an attribution diagnostic, not passenger-to-train assignment and not hidden-service reconstruction.','Service segments use freshness-qualified direct operational-status event candidates and therefore inherit the P3C2 direct-evidence closure boundary.','Exit-minute slack is diagnostic only and must not be reinterpreted as measured egress time.','No raw card identifiers are retained or exported.'],
+            'decision_rule':'If F5 dominates and large exit slack is required to recover coverage, current direct service-event timing is not suitable as passenger-chain truth. If F1/F2/F4 dominate, repair service-chain/direction coverage instead.'
+          }
+          (OUT/'u2_jamsil_chain_coverage_attribution_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:v for k,v in result.items() if k!='top_failure_od_cells'},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist diagnostic output
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2cov/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,57 @@
+name: MPPD N1 Seoul P1C Transfer Schema Probe 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-seoul-p1c-transfer-schema-probe-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+    steps:
+      - name: Restore P1C and inspect safe transfer semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          python - <<'PY'
+          import json,re
+          from collections import defaultdict
+          d=json.load(open('p1c.json',encoding='utf-8'))
+          arr=d.get('canonical_entries',[])
+          print('TOP_KEYS',sorted(d.keys()))
+          print('ENTRY_KEYS',sorted(set().union(*(x.keys() for x in arr[:200]))))
+          print('ENTRY_COUNT',len(arr))
+          # Explicit known Jamsil nodes and name-like fields.
+          targets={'1008000814','1002000216'}
+          for x in arr:
+              if str(x.get('service_statn_id')) in targets:
+                  print('JAMSIL_ENTRY',json.dumps(x,ensure_ascii=False,sort_keys=True))
+          # Find duplicated name-like values across lines using candidate fields.
+          cand=['dv_name','station_name','statn_nm','out_stn_name','transfer_name','physical_station_name','canonical_name','name']
+          for fld in cand:
+              groups=defaultdict(list)
+              for x in arr:
+                  v=str(x.get(fld) or '').strip(); line=str(x.get('service_subway_id') or '').strip(); st=str(x.get('service_statn_id') or '').strip()
+                  if v and line and st: groups[v].append((line,st,x.get('out_stn_num'),x.get('tier')))
+              multi=[(k,v) for k,v in groups.items() if len({z[0] for z in v})>=2]
+              if multi:
+                  print('MULTILINE_FIELD',fld,'GROUPS',len(multi))
+                  for k,v in sorted(multi,key=lambda z:(-len({x[0] for x in z[1]}),z[0]))[:40]: print('GROUP',fld,k,v)
+          # Print transfer/code-like fields and values count without raw passenger identifiers.
+          keys=sorted(set().union(*(x.keys() for x in arr))) if arr else []
+          print('TRANSFERLIKE_KEYS',[k for k in keys if any(t in k.lower() for t in ['trans','xfer','station','statn','name','code'])])
+          PY
+          shred -u "$C" 2>/dev/null || rm -f "$C"

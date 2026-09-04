@@ -15,9 +15,9 @@ jobs:
     timeout-minutes: 300
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
-      HZ_DRIVE: ResearchData/rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
-      SH_DRIVE: ResearchData/transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
-      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_hz_sh_train_discovery_adaptation
+      HZ_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      SH_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+      OUT_DRIVE: rail_transit/mppd_core_closure_20260904/u1_hz_sh_train_discovery_adaptation
 
     steps:
       - name: Prepare runner and protected Drive config

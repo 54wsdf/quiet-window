@@ -1,0 +1,175 @@
+{
+  "schema": "mppd.seoul-topology-patch.g0c.v1",
+  "date": "2026-09-04",
+  "status": "QUALIFIED_HYPOTHESIS_FOR_G0C_REROUTE",
+  "authority": "00_CURRENT_CORE_CLOSURE_WORKPLAN_V6_FULL_NETWORK_STATE_RECONSTRUCTION_20260904.md",
+  "baseline": {
+    "builder": "scripts/mppd_g0_full_network_coverage_20260904.py::build_network",
+    "nodes": 645,
+    "edges": 792,
+    "connected_components": 13,
+    "largest_component_nodes": 548,
+    "unrouted_od_count": 13272,
+    "unrouted_passenger_mass": 28825
+  },
+  "evidence_policy": {
+    "required_internal_identity_evidence": [
+      "P1C_EXACT_NORMALIZED_DV_NAME_MATCH",
+      "P1C_EXACT_NORMALIZED_SERVICE_NAME_MATCH"
+    ],
+    "required_residual_evidence": "AFC_CROSS_COMPONENT_STRUCTURAL_ROUTE_RESIDUAL",
+    "edge_semantics": "PHYSICAL_TRANSFER_CONNECTIVITY_HYPOTHESIS",
+    "not_observed_ats": true,
+    "automatic_global_promotion": false,
+    "g0c_application_scope": "QUALIFICATION_ONLY_UNTIL_REROUTE_PASS"
+  },
+  "edges": [
+    {
+      "edge_id": "G0C_SILLIM_L2_SILLIM",
+      "u": "1002|1002000230",
+      "v": "1094|1094000408",
+      "line_u": "1002",
+      "line_v": "1094",
+      "physical_station": "신림",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 9],
+      "component_pair_residual_mass": 7383,
+      "component_pair_residual_od": 2820,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:신림", "service_name:신림"],
+      "external_corroboration": {
+        "status": "PRIMARY_OPERATOR_CONFIRMED",
+        "source": "Sillim Line operator station information",
+        "claim": "Sillim Line Sillim station transfers with Line 2"
+      }
+    },
+    {
+      "edge_id": "G0C_SILLIM_L7_BORAMAE",
+      "u": "1007|1007000742",
+      "v": "1094|1094000404",
+      "line_u": "1007",
+      "line_v": "1094",
+      "physical_station": "보라매",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 9],
+      "component_pair_residual_mass": 7383,
+      "component_pair_residual_od": 2820,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:보라매", "service_name:보라매"],
+      "external_corroboration": {
+        "status": "PRIMARY_OPERATOR_CONFIRMED",
+        "source": "Sillim Line operator transfer information",
+        "claim": "Sillim Line Boramae station transfers with Line 7"
+      }
+    },
+    {
+      "edge_id": "G0C_SILLIM_L9_SAETGANG",
+      "u": "1009|1009000916",
+      "v": "1094|1094000401",
+      "line_u": "1009",
+      "line_v": "1094",
+      "physical_station": "샛강",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 9],
+      "component_pair_residual_mass": 7383,
+      "component_pair_residual_od": 2820,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:샛강", "service_name:샛강"],
+      "external_corroboration": {
+        "status": "PRIMARY_OPERATOR_CONFIRMED",
+        "source": "Sillim Line operator station information",
+        "claim": "Sillim Line Saetgang station transfers with Line 9"
+      }
+    },
+    {
+      "edge_id": "G0C_GYEONGCHUN_L6_SINNAE",
+      "u": "1006|1006000648",
+      "v": "1067|1067080122",
+      "line_u": "1006",
+      "line_v": "1067",
+      "physical_station": "신내",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 2],
+      "component_pair_residual_mass": 4567,
+      "component_pair_residual_od": 2500,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:신내", "service_name:신내"],
+      "external_corroboration": {
+        "status": "PUBLIC_AUTHORITY_CONFIRMED",
+        "source": "Seoul public authority Line 6 Sinnae operating material",
+        "claim": "Line 6 Sinnae station transfers with Gyeongchun Line"
+      }
+    },
+    {
+      "edge_id": "G0C_GYEONGCHUN_L8_BYEOLNAE",
+      "u": "1008|1008000804",
+      "v": "1067|1067080124",
+      "line_u": "1008",
+      "line_v": "1067",
+      "physical_station": "별내",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 2],
+      "component_pair_residual_mass": 4567,
+      "component_pair_residual_od": 2500,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:별내", "service_name:별내"],
+      "external_corroboration": {
+        "status": "WEB_CORROBORATED_CURRENT_NETWORK",
+        "source": "Current network references",
+        "claim": "Byeollae station transfers between Line 8 and Gyeongchun Line"
+      }
+    },
+    {
+      "edge_id": "G0C_SEOHAE_L4_CHOJI",
+      "u": "1004|1004000452",
+      "v": "1093|1093004020",
+      "line_u": "1004",
+      "line_v": "1093",
+      "physical_station": "초지",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 10],
+      "component_pair_residual_mass": 2571,
+      "component_pair_residual_od": 1355,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:초지", "service_name:초지"],
+      "external_corroboration": {
+        "status": "WEB_CORROBORATED_CURRENT_NETWORK",
+        "source": "Current network references",
+        "claim": "Choji station transfers between Line 4 and Seohae Line"
+      }
+    },
+    {
+      "edge_id": "G0C_SHINBUNDANG_GYEONGGANG_PANGYO",
+      "u": "1077|1077006811",
+      "v": "1081|1081037409",
+      "line_u": "1077",
+      "line_v": "1081",
+      "physical_station": "판교",
+      "kind": "transfer_repaired",
+      "weight": 2.5,
+      "prior_component_pair": [0, 4],
+      "component_pair_residual_mass": 2533,
+      "component_pair_residual_od": 1203,
+      "evidence_class": "P1C_IDENTITY_PLUS_AFC_RESIDUAL_SUPPORTED_TRANSFER_PATCH",
+      "internal_evidence": ["dv_name:판교", "service_name:판교"],
+      "external_corroboration": {
+        "status": "OPERATOR_AND_NETWORK_CORROBORATED",
+        "source": "Shinbundang/current network references",
+        "claim": "Pangyo station transfers between Shinbundang and Gyeonggang Line"
+      }
+    }
+  ],
+  "scientific_boundary": [
+    "The patch repairs network topology representation; it does not assert passenger route truth.",
+    "The seven edges are not observed ATS events and do not create service-event observations.",
+    "The original G0 graph remains the immutable historical baseline.",
+    "G0C must reroute the complete previously-unrouted AFC set and report both recovered and remaining mass before the patch can be used downstream."
+  ],
+  "no_email_notification_logic": true
+}

@@ -1,0 +1,74 @@
+name: MPPD R0 Service State Cache Merge 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r0-service-state-cache-merge-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r0-service-state-cache:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_service_state_cache
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore evidence-typed service initialization assets
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/svcache/out"
+          rclone copyto "$R:$BASE_DRIVE/g1_full_network_service_bootstrap/g1_full_network_direct_service_anchors.json" "$RUNNER_TEMP/svcache/direct.json" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$BASE_DRIVE/g1_full_network_service_bootstrap/g1_full_network_inferred_service_field.json" "$RUNNER_TEMP/svcache/inferred.json" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$BASE_DRIVE/g1b_weak_latent_service_init/g1b_weak_latent_service_field.json" "$RUNNER_TEMP/svcache/weak.json" --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Merge canonical service-state initialization cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/mppd_r0_service_state_cache_merge_20260904.py
+          python scripts/mppd_r0_service_state_cache_merge_20260904.py \
+            --direct "$RUNNER_TEMP/svcache/direct.json" \
+            --inferred "$RUNNER_TEMP/svcache/inferred.json" \
+            --weak "$RUNNER_TEMP/svcache/weak.json" \
+            --out "$RUNNER_TEMP/svcache/out"
+
+      - name: Persist canonical service-state cache
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/svcache/out"
+          test -f seoul_20260829_0700_1000_service_state_initialization.json
+          for f in *; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

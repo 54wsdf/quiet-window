@@ -1,0 +1,77 @@
+name: MPPD R1B Missing Service Support Proposal Audit Debug V1 2026-09-04
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/mppd_r1b_missing_service_support_proposal_audit_20260904.py
+      - .github/workflows/mppd-r1b-missing-service-support-proposal-audit-debug-v1-20260904.yml
+
+permissions:
+  contents: read
+
+jobs:
+  debug-proposal-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      SERVICE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1d_gtxa_date_aware_service_init
+      R1B_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_first_bidirectional_joint_update_smoke
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_missing_service_support_proposal_audit_debug_v1
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+      - name: Restore inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1b_support_debug"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SERVICE_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v3_gtxa_date_aware.json" "$ROOT/service_init.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/r1b_v1_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Run classifier debug
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_support_debug"
+          python -m py_compile scripts/mppd_r1b_missing_service_support_proposal_audit_20260904.py
+          python -m scripts.mppd_r1b_missing_service_support_proposal_audit_20260904 \
+            --p1c "$ROOT/p1c.json" \
+            --service-init "$ROOT/service_init.json" \
+            --r1b-summary "$ROOT/r1b_v1_summary.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --nearby-edges 3 \
+            --out "$ROOT/out" | tee "$ROOT/out/debug.log"
+          cat "$ROOT/out/r1b_missing_service_support_proposal_audit_summary.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Persist debug classifier outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_support_debug/out"
+          for f in "$ROOT"/*; do
+            test -s "$f"
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

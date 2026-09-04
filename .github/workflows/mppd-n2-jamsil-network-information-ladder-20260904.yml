@@ -1,0 +1,278 @@
+name: MPPD N2 Jamsil Same-Target Network Information Ladder 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n2-jamsil-network-information-ladder-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n2-ladder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n2_jamsil_network_information_ladder
+    steps:
+      - name: Restore AFC crosswalk and partial service anchors
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/n2lad/out"; cd "$RUNNER_TEMP/n2lad"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service.csv --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Hold same Line-2 target and open network information monotonically
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n2lad"
+          python - <<'PY'
+          import csv,io,json,math,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          OUT=Path('out');OUT.mkdir(exist_ok=True)
+          L2='1002';L8='1008';J2='1002000216';J8='1008000814'
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'};A_TIER='A_TRANSFER_CODE_LINE_NAME'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          START=datetime(2026,8,29,7);ENTRY_END=datetime(2026,8,29,8,30);TARGET_START=datetime(2026,8,29,7,20);TARGET_END=datetime(2026,8,29,9,30)
+          AMAX=(1200,2700);KSET=(120,158,240,360);EMAX=(300,600,900);STEP=30
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();return io.TextIOWrapper(z.open(n),encoding=detect(h),errors='replace',newline='')
+          def z4(s):
+              d=''.join(c for c in str(s or '') if c.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(c for c in str(v or '') if c.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def med(x):return statistics.median(x) if x else None
+          def quant(x,p):
+              if not x:return None
+              a=sorted(x);return a[round((len(a)-1)*p)]
+
+          p=json.loads(Path('p1c.json').read_text(encoding='utf-8'));entries=[x for x in p['canonical_entries'] if x.get('tier') in STRICT]
+          cw={}
+          for x in entries:
+              k=str(x.get('out_stn_num') or '')
+              if k and (k not in cw or x.get('tier')==A_TIER):cw[k]=x
+          meta={};groups=defaultdict(dict)
+          for x in entries:
+              line=str(x.get('service_subway_id') or '');st=str(x.get('service_statn_id') or '');dv=str(x.get('dv_name') or '').strip()
+              if line and st:meta[(line,st)]={'seq':int(x['service_statn_sn']) if str(x.get('service_statn_sn') or '').isdigit() else None,'dv':dv,'tier':x.get('tier')}
+              if x.get('tier')==A_TIER and dv and line and st:groups[dv][line]=st
+          # Other-line -> Line2 physical transfer pairs, highest-tier only.
+          transfer_to_l2=defaultdict(list)
+          for dv,g in groups.items():
+              if L2 not in g:continue
+              for line,st in g.items():
+                  if line!=L2:transfer_to_l2[line].append((st,g[L2],dv))
+
+          # Partial service events by train/station.
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('service.csv',encoding='utf-8',newline='') as f:
+              for r in csv.DictReader(f):
+                  line=str(r.get('subway_id') or '').strip();tr=str(r.get('btrain_no') or '').strip();st=str(r.get('statn_id') or '').strip();a=dt(r.get('arrival_detect_time'));d=dt(r.get('departure_detect_time'))
+                  if line and tr and st and a and d:trains[(line,tr)][st].append((a,d))
+          for k in trains:
+              for s in trains[k]:trains[k][s]=sorted(set(trains[k][s]))
+
+          # Line2 target universe at Jamsil and direction signatures; runtime relative to Jamsil includes upstream/downstream stations.
+          l2={};by_sig=defaultdict(list)
+          for (line,tr),sts in trains.items():
+              if line!=L2 or J2 not in sts:continue
+              dep=min(d for a,d in sts[J2]);rels={}
+              after=[]
+              for st,evs in sts.items():
+                  # representative event nearest in time to Jamsil, allow +/- 2h
+                  cand=[(a,d) for a,d in evs if abs((a-dep).total_seconds())<=7200]
+                  if not cand:continue
+                  a,d=min(cand,key=lambda x:abs((x[0]-dep).total_seconds()))
+                  rel_dep=(d-dep).total_seconds();rel_arr=(a-dep).total_seconds();rels[st]=(rel_arr,rel_dep)
+                  if rel_arr>0:after.append((rel_arr,st))
+              after.sort()
+              if not after:continue
+              sig=after[0][1];l2[tr]={'dep':dep,'sig':sig,'rel':rels};by_sig[sig].append((dep,tr))
+          for s in by_sig:by_sig[s].sort()
+
+          # Build upstream visible-train trajectories into every highest-tier Line2 interchange.
+          inbound=defaultdict(list)
+          for other,pairs in transfer_to_l2.items():
+              for ost,l2st,dv in pairs:
+                  for (line,tr),sts in trains.items():
+                      if line!=other or ost not in sts:continue
+                      ta=min(a for a,d in sts[ost])
+                      for os,evs in sts.items():
+                          if os==ost:continue
+                          prior=[(a,d) for a,d in evs if d<ta and 0<(ta-d).total_seconds()<=7200]
+                          if prior:
+                              a0,d0=max(prior,key=lambda x:x[1]);inbound[(other,os,l2st)].append((d0,ta,tr,dv))
+          for k in inbound:inbound[k]=sorted(set(inbound[k]))
+
+          # Aggregate individual AFC observations only in memory; no card identifier retained.
+          direct=[];trans=[];eligible=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv')
+              for r in csv.DictReader(f):
+                  if str(r.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  t0=dt(r.get('RIDE_DTM'));t1=dt(r.get('ALGH_DTM'))
+                  if not t0 or not t1 or not(START<=t0<ENTRY_END) or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  a=cw.get(z4(r.get('RIDE_BSST_ID')));b=cw.get(z4(r.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  ol=str(a.get('service_subway_id'));os=str(a.get('service_statn_id'));dl=str(b.get('service_subway_id'));ds=str(b.get('service_statn_id'))
+                  eligible+=1
+                  if ol==L2 and dl==L2:direct.append((t0,t1,os,ds))
+                  elif dl==L2 and ol in transfer_to_l2:
+                      opts=[(ol,os,l2st,dv) for ost,l2st,dv in transfer_to_l2[ol] if (ol,os,l2st) in inbound]
+                      if opts:trans.append((t0,t1,ol,os,ds,opts))
+              f.close()
+
+          # For each held target, visible Line2 trains provide runtime templates and visible gates only.
+          PARAM=[(A,K,E) for A in AMAX for K in KSET for E in EMAX]
+          tiers=['LOCAL_SINGLE_LINE','SINGLE_LINE_MULTI_OD','PLUS_JAMSIL_8_TO_2','NETWORK_ONE_TRANSFER_TO_LINE2']
+          target_rows=[]
+          for sig,seq in by_sig.items():
+              if len(seq)<4:continue
+              for ix in range(1,len(seq)-1):
+                  truth,tr=seq[ix]
+                  if not(TARGET_START<=truth<TARGET_END):continue
+                  visible=[(d,t) for d,t in seq if t!=tr]
+                  prev=max((d for d,t in visible if d<truth),default=None);nxt=min((d for d,t in visible if d>truth),default=None)
+                  if not prev or not nxt or (nxt-prev).total_seconds()>1800:continue
+                  # Candidate grid depends only on visible neighbor gap, not target truth.
+                  cands=[];c=prev+timedelta(seconds=STEP)
+                  while c<nxt:
+                      cands.append(c);c+=timedelta(seconds=STEP)
+                  if not cands:continue
+                  midpoint=prev+(nxt-prev)/2
+                  # Runtime template from visible trains of same direction signature.
+                  pool_arr=defaultdict(list);pool_dep=defaultdict(list)
+                  for _,ot in visible:
+                      for st,(ra,rd) in l2[ot]['rel'].items():pool_arr[st].append(ra);pool_dep[st].append(rd)
+                  rta={st:statistics.median(v) for st,v in pool_arr.items() if len(v)>=2};rtd={st:statistics.median(v) for st,v in pool_dep.items() if len(v)>=2}
+                  if J2 not in rtd:rtd[J2]=0.0
+                  # visible departures at stations for first-feasible checks
+                  vdep=defaultdict(list)
+                  for d,ot in visible:
+                      for st,rd in l2[ot]['rel'].items():vdep[st].append(d+timedelta(seconds=rd[1]))
+                  for st in vdep:vdep[st].sort()
+
+                  # same-line passengers whose candidate train can cross origin -> Jamsil -> destination in this direction
+                  d_all=[];d_local=[]
+                  for psg in direct:
+                      t0,t1,os,ds=psg
+                      if os not in rtd or ds not in rta:continue
+                      if rtd[os]>0 or rta[ds]<0:continue
+                      d_all.append(psg)
+                      if -600<=rtd[os]<=0:d_local.append(psg)
+                  # transfer passengers joining Line2 upstream of/equal Jamsil and exiting downstream
+                  t_j8=[];t_net=[]
+                  for psg in trans:
+                      t0,t1,ol,os,ds,opts=psg
+                      if ds not in rta or rta[ds]<0:continue
+                      good=[]
+                      for opt in opts:
+                          _,_,x,dv=opt
+                          if x in rtd and rtd[x]<=0:good.append(opt)
+                      if not good:continue
+                      q=(t0,t1,ol,os,ds,good);t_net.append(q)
+                      if ol==L8 and any(x==J2 for _,_,x,_ in good):t_j8.append(q)
+                  cohorts={
+                    'LOCAL_SINGLE_LINE':('direct',d_local,[]),
+                    'SINGLE_LINE_MULTI_OD':('direct',d_all,[]),
+                    'PLUS_JAMSIL_8_TO_2':('mixed',d_all,t_j8),
+                    'NETWORK_ONE_TRANSFER_TO_LINE2':('mixed',d_all,t_net)
+                  }
+
+                  tier_result={}
+                  for tier in tiers:
+                      _,dset,tset=cohorts[tier]
+                      # avoid meaningless tiny cohorts
+                      if len(dset)+len(tset)<20:
+                          tier_result[tier]={'status':'TOO_SMALL','direct_n':len(dset),'transfer_n':len(tset)};continue
+                      curves={p:[] for p in PARAM}
+                      for cdep in cands:
+                          for A,K,E in PARAM:
+                              support=0
+                              for t0,t1,os,ds in dset:
+                                  dep_o=cdep+timedelta(seconds=rtd[os]);arr_d=cdep+timedelta(seconds=rta[ds])
+                                  if dep_o<t0 or (dep_o-t0).total_seconds()>A:continue
+                                  eg=(t1-arr_d).total_seconds()
+                                  if eg < -59 or eg>E:continue
+                                  support+=1
+                              for t0,t1,ol,os,ds,opts in tset:
+                                  arr_d=cdep+timedelta(seconds=rta[ds]);eg=(t1-arr_d).total_seconds()
+                                  if eg < -59 or eg>E:continue
+                                  ok=False
+                                  for _,_,x,dv in opts:
+                                      dep_x=cdep+timedelta(seconds=rtd[x])
+                                      for od,ta,utr,_dv in inbound[(ol,os,x)]:
+                                          if od<t0 or (od-t0).total_seconds()>A:continue
+                                          ready=ta+timedelta(seconds=K)
+                                          if ready>dep_x:continue
+                                          if any(ready<=vd<dep_x for vd in vdep.get(x,[])):continue
+                                          ok=True;break
+                                      if ok:break
+                                  if ok:support+=1
+                              curves[(A,K,E)].append(support)
+                      robust=[]
+                      for j in range(len(cands)):
+                          vals=[]
+                          for pkey,sc in curves.items():
+                              lo=min(sc);hi=max(sc);vals.append(0.0 if hi==lo else (sc[j]-lo)/(hi-lo))
+                          robust.append(sum(vals)/len(vals))
+                      mx=max(robust);best_idx=[i for i,v in enumerate(robust) if abs(v-mx)<1e-12]
+                      # choose best candidate closest to visible-neighbor midpoint only as deterministic tie-breaker
+                      bi=min(best_idx,key=lambda i:abs((cands[i]-midpoint).total_seconds()));best=cands[bi]
+                      hi_idx=[i for i,v in enumerate(robust) if v>=0.9*mx] if mx>0 else list(range(len(cands)))
+                      width=(cands[max(hi_idx)]-cands[min(hi_idx)]).total_seconds() if hi_idx else None
+                      truth_rank=1+sum(v>robust[min(range(len(cands)),key=lambda i:abs((cands[i]-truth).total_seconds()))]+1e-12 for v in robust)
+                      tier_result[tier]={'status':'OK','direct_n':len(dset),'transfer_n':len(tset),'total_n':len(dset)+len(tset),'best_time':best.isoformat(),'abs_error_sec':abs((best-truth).total_seconds()),'within60':abs((best-truth).total_seconds())<=60,'within120':abs((best-truth).total_seconds())<=120,'near_optimal_width_sec':width,'curve_range':max(robust)-min(robust),'candidate_n':len(cands),'true_nearest_rank':truth_rank}
+                  target_rows.append({'train':tr,'direction_signature':sig,'true_departure':truth.isoformat(),'visible_prev':prev.isoformat(),'visible_next':nxt.isoformat(),'midpoint_error_sec':abs((midpoint-truth).total_seconds()),'tiers':tier_result})
+
+          aggregate={}
+          for tier in tiers:
+              ok=[r['tiers'][tier] for r in target_rows if r['tiers'].get(tier,{}).get('status')=='OK']
+              errs=[x['abs_error_sec'] for x in ok];width=[x['near_optimal_width_sec'] for x in ok if x['near_optimal_width_sec'] is not None]
+              aggregate[tier]={'targets':len(ok),'median_abs_error_sec':med(errs),'p90_abs_error_sec':quant(errs,.9),'within60_share':sum(e<=60 for e in errs)/len(errs) if errs else None,'within120_share':sum(e<=120 for e in errs)/len(errs) if errs else None,'median_near_optimal_width_sec':med(width),'median_constraints':med([x['total_n'] for x in ok])}
+          base=[r['midpoint_error_sec'] for r in target_rows]
+          result={'schema':'mppd.n2-same-target-network-information-ladder.v1','date':'2026-09-04','status':'N2_CONTROLLED_INFORMATION_GAIN_DIAGNOSTIC_COMPLETED','target_definition':'Whole Line-2 train departure at Jamsil; each target hidden one-at-a-time. Candidate search interval is strictly the gap between visible predecessor and successor of the same direction signature; target truth is not used to center or size the search grid.','target_count':len(target_rows),'midpoint_baseline':{'median_abs_error_sec':med(base),'p90_abs_error_sec':quant(base,.9)},'cohort_order':tiers,'aggregate':aggregate,'targets':target_rows,'parameter_family':{'access_max_sec':list(AMAX),'transfer_sec':list(KSET),'egress_max_sec':list(EMAX),'candidate_step_sec':STEP},'scientific_boundary':['This is a controlled information-topology diagnostic using the same broad support-family objective at every tier; it is not the final N3 joint latent-event likelihood solver.','The ladder is monotone in information: later tiers retain earlier same-line observations and add cross-line constraints.','Target truth is used only to identify the held train and compute final error; candidate grid uses visible-neighbor service gates only.','BMS is partial service evidence and is used for visible trajectory/runtime templates and upstream anchors, not as exhaustive passenger-chain truth.','Transfer groups require highest-tier P1C transfer-code line-name evidence.','Movement parameters are broad families, not fitted K4 distributions.','No raw card identifier is persisted.'],'decision_rule':'Evidence for H-NET at this diagnostic stage requires NETWORK_ONE_TRANSFER_TO_LINE2 to reduce timing error and/or near-optimal width relative to LOCAL_SINGLE_LINE/SINGLE_LINE_MULTI_OD across multiple held targets without target leakage. Failure is retained and triggers N3 rather than tuning the local objective.','next_gate':'Read whether same-target feasible/near-optimal time regions contract monotonically. Then implement N3 joint shared-kernel likelihood on high-ECD network patches.'}
+          (OUT/'n2_jamsil_network_information_ladder_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:v for k,v in result.items() if k!='targets'},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist N2 ladder output
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n2lad/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

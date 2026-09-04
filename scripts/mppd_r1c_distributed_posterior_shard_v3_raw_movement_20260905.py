@@ -4,6 +4,11 @@ from collections import Counter
 
 import scripts.mppd_r1c_distributed_posterior_shard_20260905 as base_worker
 
+# Preserve microsecond-level relative-time geometry in distributed sufficient
+# statistics. The predecessor 1 ms rounding was posterior-negligible but caused
+# avoidable movement-kernel parameter drift in strict parity qualification.
+base_worker.ROUND_DIGITS = 9
+
 _orig_init_stats = base_worker.init_stats
 _orig_add_mstep_stats = base_worker.add_mstep_stats
 _orig_write_kernel_stats = base_worker.write_kernel_stats

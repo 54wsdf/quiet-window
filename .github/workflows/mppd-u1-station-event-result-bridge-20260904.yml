@@ -1,0 +1,72 @@
+name: MPPD U1 Station-Event Result Bridge 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-station-event-result-bridge-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-summary:
+    runs-on: ubuntu-24.04
+    outputs:
+      ht: ${{ steps.x.outputs.ht }}
+      ct: ${{ steps.x.outputs.ct }}
+      te: ${{ steps.x.outputs.te }}
+      pe: ${{ steps.x.outputs.pe }}
+      m30: ${{ steps.x.outputs.m30 }}
+      r30: ${{ steps.x.outputs.r30 }}
+      p30: ${{ steps.x.outputs.p30 }}
+      f30: ${{ steps.x.outputs.f30 }}
+      m60: ${{ steps.x.outputs.m60 }}
+      r60: ${{ steps.x.outputs.r60 }}
+      p60: ${{ steps.x.outputs.p60 }}
+      f60: ${{ steps.x.outputs.f60 }}
+      e60: ${{ steps.x.outputs.e60 }}
+      m120: ${{ steps.x.outputs.m120 }}
+      r120: ${{ steps.x.outputs.r120 }}
+      p120: ${{ steps.x.outputs.p120 }}
+      f120: ${{ steps.x.outputs.f120 }}
+    steps:
+      - name: Read persisted station-event summary
+        id: x
+        shell: bash
+        env:
+          CFG: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$CFG" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          P='ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_count_free_station_event_qualification/u1_seoul_count_free_station_event_qualification_summary.json'
+          rclone copyto "$R:$P" "$RUNNER_TEMP/s.json" --config "$C" --retries 6 --low-level-retries 15
+          j(){ jq -r "$1" "$RUNNER_TEMP/s.json"; }
+          echo "ht=$(j '.hidden_train_count')" >> "$GITHUB_OUTPUT"
+          echo "ct=$(j '.free_candidate_train_count')" >> "$GITHUB_OUTPUT"
+          echo "te=$(j '.eligible_hidden_station_events')" >> "$GITHUB_OUTPUT"
+          echo "pe=$(j '.predicted_station_events')" >> "$GITHUB_OUTPUT"
+          for t in 30 60 120; do
+            echo "m$t=$(j ".heldout_station_event_metrics[\"$t\"].matched")" >> "$GITHUB_OUTPUT"
+            echo "r$t=$(j ".heldout_station_event_metrics[\"$t\"].recall")" >> "$GITHUB_OUTPUT"
+            echo "p$t=$(j ".heldout_station_event_metrics[\"$t\"].precision")" >> "$GITHUB_OUTPUT"
+            echo "f$t=$(j ".heldout_station_event_metrics[\"$t\"].f1")" >> "$GITHUB_OUTPUT"
+          done
+          echo "e60=$(j '.heldout_station_event_metrics["60"].median_abs_error_sec')" >> "$GITHUB_OUTPUT"
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  size-and-60s:
+    needs: read-summary
+    runs-on: ubuntu-24.04
+    name: "U1EV hiddenTr=${{ needs.read-summary.outputs.ht }} candTr=${{ needs.read-summary.outputs.ct }} truthEv=${{ needs.read-summary.outputs.te }} predEv=${{ needs.read-summary.outputs.pe }} M60=${{ needs.read-summary.outputs.m60 }} R60=${{ needs.read-summary.outputs.r60 }} P60=${{ needs.read-summary.outputs.p60 }} F60=${{ needs.read-summary.outputs.f60 }} E60=${{ needs.read-summary.outputs.e60 }}"
+    steps:
+      - run: echo station-event-metrics
+
+  tolerance-detail:
+    needs: read-summary
+    runs-on: ubuntu-24.04
+    name: "U1EV M30=${{ needs.read-summary.outputs.m30 }} R30=${{ needs.read-summary.outputs.r30 }} P30=${{ needs.read-summary.outputs.p30 }} F30=${{ needs.read-summary.outputs.f30 }} M120=${{ needs.read-summary.outputs.m120 }} R120=${{ needs.read-summary.outputs.r120 }} P120=${{ needs.read-summary.outputs.p120 }} F120=${{ needs.read-summary.outputs.f120 }}"
+    steps:
+      - run: echo station-event-metrics

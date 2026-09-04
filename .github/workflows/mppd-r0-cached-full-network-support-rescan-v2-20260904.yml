@@ -1,0 +1,65 @@
+name: MPPD R0 Cached Full Network Support Rescan V2 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r0-cached-full-network-support-rescan-v2-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r0-cached-support-rescan-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_cached_full_network_support_rescan_v2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore complete-network cached inputs with G1C service state
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/rescanv2/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/rescanv2/p1c.json" --config "$C"
+          rclone copyto "$R:$BASE_DRIVE/r0_city_day_cache/seoul_20260829_0700_1000_afc_time_cohorts.csv.gz" "$RUNNER_TEMP/rescanv2/cohorts.csv.gz" --config "$C"
+          rclone copyto "$R:$BASE_DRIVE/r0_full_network_factor_engine_v2/r0_route_candidates_by_od.jsonl.gz" "$RUNNER_TEMP/rescanv2/routes.jsonl.gz" --config "$C"
+          rclone copyto "$R:$BASE_DRIVE/g1c_service_trajectory_completion/seoul_20260829_0700_1000_service_state_initialization_v2.json" "$RUNNER_TEMP/rescanv2/service_init.json" --config "$C"
+      - name: Rescan complete-network chain support after trajectory completion
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE"
+          python -m py_compile scripts/mppd_r0_cached_full_network_support_rescan_20260904.py
+          /usr/bin/time -v python scripts/mppd_r0_cached_full_network_support_rescan_20260904.py \
+            --p1c "$RUNNER_TEMP/rescanv2/p1c.json" --cohorts "$RUNNER_TEMP/rescanv2/cohorts.csv.gz" \
+            --routes "$RUNNER_TEMP/rescanv2/routes.jsonl.gz" --service-init "$RUNNER_TEMP/rescanv2/service_init.json" \
+            --out "$RUNNER_TEMP/rescanv2/out" \
+            2>&1 | tee "$RUNNER_TEMP/rescanv2/out/r0_cached_support_v2_execution.log"
+      - name: Persist rescan v2 outputs
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/rescanv2/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE"; done
+      - name: Clean protected configuration
+        if: always()
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        shell: bash
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

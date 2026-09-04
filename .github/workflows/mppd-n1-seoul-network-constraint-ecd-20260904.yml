@@ -1,0 +1,226 @@
+name: MPPD N1 Seoul Network Constraint Graph and ECD 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-seoul-network-constraint-ecd-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n1-network-ecd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n1_seoul_network_constraint_ecd
+    steps:
+      - name: Restore qualified Seoul passenger and partial service evidence
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/n1/out"; cd "$RUNNER_TEMP/n1"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service.csv --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Build timestamped network constraint graph and ECD components
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n1"
+          python - <<'PY'
+          import csv, io, json, math, re, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime
+          from pathlib import Path
+          import networkx as nx
+
+          OUT=Path('out'); OUT.mkdir(exist_ok=True)
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          START=datetime(2026,8,29,7,0); END=datetime(2026,8,29,10,0)
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def norm_name(s):
+              s=str(s or '').strip().lower(); s=re.sub(r'\([^)]*\)','',s); s=re.sub(r'\s+','',s)
+              return s
+          def entropy(counter):
+              n=sum(counter.values())
+              if n<=0:return 0.0
+              return -sum((v/n)*math.log(v/n+1e-15,2) for v in counter.values() if v)
+          def node(line,st): return f'{line}|{st}'
+
+          # Qualified external-code -> line-aware service node.
+          p1c=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id') and x.get('service_statn_id')}
+
+          # Reconstruct line topology and partial direct-service anchors from BMS event candidates.
+          service=[]; trains=defaultdict(list); station_name={}; anchor_counts=Counter()
+          with open('service.csv',encoding='utf-8',newline='') as f:
+              for r in csv.DictReader(f):
+                  line=(r.get('subway_id') or '').strip(); tr=(r.get('btrain_no') or '').strip(); st=(r.get('statn_id') or '').strip()
+                  a=dt(r.get('arrival_detect_time')); d=dt(r.get('departure_detect_time'))
+                  if not line or not tr or not st or not a or not d: continue
+                  nm=(r.get('statn_nm') or r.get('station_name') or '').strip()
+                  if nm: station_name[(line,st)]=nm
+                  trains[(line,tr)].append((d,st,nm)); anchor_counts[(line,st)]+=1
+                  service.append((line,tr,st,a,d,nm))
+
+          G=nx.Graph(); inline_edges=set()
+          for (line,tr),evs in trains.items():
+              seq=[]; seen=set()
+              for d,st,nm in sorted(evs):
+                  if st not in seen: seq.append(st); seen.add(st)
+              for st in seq: G.add_node(node(line,st),line=line,station=st,name=station_name.get((line,st),''))
+              for a,b in zip(seq,seq[1:]):
+                  u,v=node(line,a),node(line,b); key=tuple(sorted((u,v)))
+                  inline_edges.add(key); G.add_edge(u,v,kind='inline',weight=1.0,line=line)
+
+          # Candidate interchange edges from exact normalized station names seen on multiple lines.
+          byname=defaultdict(list)
+          for (line,st),nm in station_name.items():
+              nn=norm_name(nm)
+              if nn: byname[nn].append((line,st,nm))
+          interchange_groups=[]
+          for nn,arr in byname.items():
+              lines=sorted({x[0] for x in arr})
+              if len(lines)<2: continue
+              uniq={(x[0],x[1]):x for x in arr}; vals=list(uniq.values())
+              interchange_groups.append({'normalized_name':nn,'lines':lines,'members':[{'line':x[0],'station':x[1],'name':x[2]} for x in vals]})
+              for i in range(len(vals)):
+                  for j in range(i+1,len(vals)):
+                      l1,s1,_=vals[i]; l2,s2,_=vals[j]
+                      if l1==l2: continue
+                      G.add_edge(node(l1,s1),node(l2,s2),kind='transfer',weight=2.5,transfer=f'{l1}->{l2}')
+
+          # Morning AFC aggregation. No card identifier is retained.
+          od_bins=Counter(); raw_rows=0; mapped_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv'); rr=csv.DictReader(f)
+              for r in rr:
+                  if (r.get('TRNS_MNS_CD') or '').strip() not in RAIL: continue
+                  t0=dt(r.get('RIDE_DTM')); t1=dt(r.get('ALGH_DTM'))
+                  if not t0 or not t1 or not (START<=t0<END) or t1<t0: continue
+                  raw_rows+=1
+                  a=cw.get(z4(r.get('RIDE_BSST_ID'))); b=cw.get(z4(r.get('ALGH_BSST_ID')))
+                  if not a or not b: continue
+                  o=node(str(a['service_subway_id']),str(a['service_statn_id'])); d=node(str(b['service_subway_id']),str(b['service_statn_id']))
+                  if o not in G or d not in G or o==d: continue
+                  mapped_rows+=1; bin5=(t0.hour*60+t0.minute)//5
+                  od_bins[(o,d,bin5)]+=1
+              f.close()
+
+          od_mass=Counter(); phase_by_od=defaultdict(Counter)
+          for (o,d,b),m in od_bins.items(): od_mass[(o,d)]+=m; phase_by_od[(o,d)][b]+=m
+
+          # Structural route proxy over the BMS-derived service graph. This is NOT observed route choice.
+          seg_od=defaultdict(set); seg_orig=defaultdict(set); seg_dest=defaultdict(set); seg_routes=defaultdict(set)
+          seg_up=defaultdict(set); seg_down=defaultdict(set); seg_trans=defaultdict(set); seg_phase=defaultdict(Counter); seg_mass=Counter(); seg_pathcount=Counter()
+          routed_mass=0; unrouted_mass=0; route_rows=[]
+          for (o,d),mass in od_mass.most_common():
+              try: path=nx.shortest_path(G,o,d,weight='weight')
+              except (nx.NetworkXNoPath,nx.NodeNotFound): unrouted_mass+=mass; continue
+              routed_mass+=mass
+              lines=[x.split('|',1)[0] for x in path]
+              comp=[]
+              for l in lines:
+                  if not comp or comp[-1]!=l: comp.append(l)
+              route_family='>'.join(comp); transfers=[f'{comp[i]}->{comp[i+1]}' for i in range(len(comp)-1)]
+              route_rows.append((o,d,mass,route_family,len(transfers)))
+              phases=phase_by_od[(o,d)]
+              for u,v in zip(path,path[1:]):
+                  dat=G.get_edge_data(u,v) or {}
+                  if dat.get('kind')!='inline': continue
+                  key='--'.join(sorted((u,v))); line=u.split('|',1)[0]
+                  seg_od[key].add((o,d)); seg_orig[key].add(o); seg_dest[key].add(d); seg_routes[key].add(route_family)
+                  seg_trans[key].update(transfers); seg_mass[key]+=mass; seg_pathcount[key]+=1
+                  idx=lines.index(line) if line in lines else 0
+                  seg_up[key].update(comp[:max(0,comp.index(line))]) if line in comp else None
+                  seg_down[key].update(comp[comp.index(line)+1:]) if line in comp else None
+                  for b,m in phases.items(): seg_phase[key][b]+=m
+
+          rows=[]
+          for key,mass in seg_mass.items():
+              u,v=key.split('--'); lu,su=u.split('|',1); lv,sv=v.split('|',1)
+              ac=anchor_counts[(lu,su)]+anchor_counts[(lv,sv)] if lu==lv else 0
+              rows.append({
+                  'segment':key,'line':lu,'station_u':su,'station_v':sv,
+                  'n_independent_od':len(seg_od[key]),'n_origins':len(seg_orig[key]),'n_destinations':len(seg_dest[key]),
+                  'n_upstream_lines':len(seg_up[key]),'n_downstream_lines':len(seg_down[key]),
+                  'n_transfer_directions':len(seg_trans[key]),'n_shared_route_families':len(seg_routes[key]),
+                  'service_phase_entropy_5min':round(entropy(seg_phase[key]),6),'endpoint_anchor_diversity':len(seg_dest[key]),
+                  'direct_service_anchor_events_at_endpoints':ac,'passenger_mass':mass,
+                  'ecd_rank_tuple':[len(seg_od[key]),len(seg_routes[key]),len(seg_trans[key]),round(entropy(seg_phase[key]),6),mass]
+              })
+          rows.sort(key=lambda r:(r['n_independent_od'],r['n_shared_route_families'],r['n_transfer_directions'],r['service_phase_entropy_5min'],r['passenger_mass']),reverse=True)
+
+          with (OUT/'n1_seoul_segment_ecd_top500.csv').open('w',encoding='utf-8',newline='') as f:
+              fields=[k for k in rows[0].keys() if k!='ecd_rank_tuple'] if rows else ['segment']
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows([{k:v for k,v in r.items() if k!='ecd_rank_tuple'} for r in rows[:500]])
+          with (OUT/'n1_seoul_route_family_top500.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f); w.writerow(['origin_node','destination_node','passenger_mass','route_family','transfer_count']); w.writerows(sorted(route_rows,key=lambda x:x[2],reverse=True)[:500])
+
+          result={
+            'schema':'mppd.n1-seoul-network-constraint-ecd.v1','date':'2026-09-04','status':'N1_NETWORK_CONSTRAINT_GRAPH_COMPLETED',
+            'scope':'Seoul 2026-08-29 07:00-10:00; AFC aggregated to line-aware OD x 5-min entry bins; BMS used as partial topology/service-anchor evidence.',
+            'graph':{'nodes':G.number_of_nodes(),'edges':G.number_of_edges(),'inline_edges':sum(1 for _,_,d in G.edges(data=True) if d.get('kind')=='inline'),'transfer_edges':sum(1 for _,_,d in G.edges(data=True) if d.get('kind')=='transfer'),'candidate_interchange_groups':len(interchange_groups)},
+            'afc':{'eligible_morning_rail_rows':raw_rows,'mapped_graph_rows':mapped_rows,'unique_od_pairs':len(od_mass),'od_time_bins':len(od_bins),'routed_mass':routed_mass,'unrouted_mass':unrouted_mass,'routing_mass_share':routed_mass/(routed_mass+unrouted_mass) if routed_mass+unrouted_mass else 0},
+            'service':{'partial_direct_event_rows':len(service),'train_keys':len(trains)},
+            'top_ecd_segments':rows[:30],
+            'interchange_groups_top':sorted(interchange_groups,key=lambda x:len(x['lines']),reverse=True)[:30],
+            'scientific_boundary':[
+              'BMS-derived topology and direct events are partial service evidence, not exhaustive ATS truth.',
+              'Shortest paths are structural route proxies, not observed passenger route choice.',
+              'ECD is stored as components/rank tuple; no scalar ECD law is claimed yet.',
+              'No raw card identifier is retained.',
+              'This N1 run ranks fair network-certification targets; it does not itself prove H-NET or service recovery.'
+            ],
+            'next_gate':'Select high-ECD targets with partial direct-service anchors and run same-target LOCAL_SINGLE_LINE -> NETWORK_OVERLAP_MULTI_OD controlled holdout.'
+          }
+          (OUT/'n1_seoul_network_constraint_ecd_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist aggregate N1 outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n1/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

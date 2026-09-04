@@ -1,0 +1,202 @@
+name: MPPD N1 Seoul Network Constraint Graph ECD V2 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-seoul-network-constraint-ecd-v2-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n1-network-ecd-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n1_seoul_network_constraint_ecd_v2
+    steps:
+      - name: Restore qualified crosswalk passenger and partial service evidence
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/n1v2/out"; cd "$RUNNER_TEMP/n1v2"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service.csv --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Build qualified line-aware network and ECD components
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n1v2"
+          python - <<'PY'
+          import csv,io,json,math,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime
+          from pathlib import Path
+          import networkx as nx
+
+          OUT=Path('out'); OUT.mkdir(exist_ok=True)
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          TRANSFER_TIER='A_TRANSFER_CODE_LINE_NAME'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          START=datetime(2026,8,29,7,0); END=datetime(2026,8,29,10,0)
+          def node(line,st): return f'{line}|{st}'
+          def num(v):
+              try:return int(str(v).strip())
+              except:return None
+          def dt(v):
+              d=''.join(c for c in str(v or '') if c.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def z4(v):
+              d=''.join(c for c in str(v or '') if c.isdigit())
+              return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def entropy(c):
+              n=sum(c.values())
+              return -sum((v/n)*math.log(v/n+1e-15,2) for v in c.values() if v) if n else 0.0
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();return io.TextIOWrapper(z.open(n),encoding=detect(h),errors='replace',newline='')
+
+          p=json.loads(Path('p1c.json').read_text(encoding='utf-8'))
+          entries=[x for x in p['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id') and x.get('service_statn_id')]
+          # External AFC station code -> qualified line-aware service node.
+          cw={}
+          for x in entries:
+              k=str(x.get('out_stn_num') or '')
+              if k and (k not in cw or x.get('tier')==TRANSFER_TIER): cw[k]=x
+
+          # Canonical station metadata from qualified P1C. This fixes V1's missing BMS station-name problem.
+          meta={}; by_line_seq=defaultdict(lambda:defaultdict(set)); by_dv=defaultdict(dict)
+          for x in entries:
+              line=str(x['service_subway_id']); st=str(x['service_statn_id']); n=node(line,st)
+              seq=num(x.get('service_statn_sn')); dv=str(x.get('dv_name') or '').strip(); sname=str(x.get('service_name') or '').strip()
+              cur=meta.get(n)
+              if cur is None or x.get('tier')==TRANSFER_TIER:
+                  meta[n]={'line':line,'station':st,'seq':seq,'dv_name':dv,'service_name':sname,'tier':x.get('tier')}
+              if seq is not None: by_line_seq[line][seq].add(n)
+              if x.get('tier')==TRANSFER_TIER and dv: by_dv[dv][n]=x
+
+          G=nx.Graph()
+          for n,m in meta.items(): G.add_node(n,**m)
+          ambiguous_seq=[]
+          # Conservative P1C station-order topology: only singleton adjacent sequence groups are linked.
+          for line,groups in by_line_seq.items():
+              seqs=sorted(groups)
+              for s in seqs:
+                  if len(groups[s])>1: ambiguous_seq.append({'line':line,'seq':s,'nodes':sorted(groups[s])})
+              for a,b in zip(seqs,seqs[1:]):
+                  if b-a!=1 or len(groups[a])!=1 or len(groups[b])!=1: continue
+                  u=next(iter(groups[a]));v=next(iter(groups[b]));G.add_edge(u,v,kind='inline',weight=1.0,line=line,evidence='P1C_SERVICE_STATN_SN')
+              # Seoul Line 2 is circular; close only when min/max groups are singleton.
+              if line=='1002' and seqs and len(groups[seqs[0]])==1 and len(groups[seqs[-1]])==1:
+                  u=next(iter(groups[seqs[0]]));v=next(iter(groups[seqs[-1]]));G.add_edge(u,v,kind='inline',weight=1.0,line=line,evidence='LINE2_CIRCULAR_CLOSURE')
+
+          # Physical transfer edges require highest-tier transfer-code evidence and same dv_name across >=2 lines.
+          transfer_groups=[]
+          for dv,nodes_map in by_dv.items():
+              vals=[n for n in nodes_map if n in G]; lines={meta[n]['line'] for n in vals}
+              if len(lines)<2: continue
+              transfer_groups.append({'dv_name':dv,'members':sorted(vals),'lines':sorted(lines)})
+              for i in range(len(vals)):
+                  for j in range(i+1,len(vals)):
+                      if meta[vals[i]]['line']==meta[vals[j]]['line']: continue
+                      G.add_edge(vals[i],vals[j],kind='transfer',weight=2.5,transfer=f"{meta[vals[i]]['line']}->{meta[vals[j]]['line']}",evidence=TRANSFER_TIER)
+
+          # Partial direct BMS anchors; BMS is not used to invent topology.
+          anchors=Counter(); service_rows=0; train_keys=set()
+          with open('service.csv',encoding='utf-8',newline='') as f:
+              for r in csv.DictReader(f):
+                  line=str(r.get('subway_id') or '').strip();st=str(r.get('statn_id') or '').strip();tr=str(r.get('btrain_no') or '').strip()
+                  a=dt(r.get('arrival_detect_time'));d=dt(r.get('departure_detect_time'))
+                  if line and st and tr and a and d:
+                      anchors[(line,st)]+=1;service_rows+=1;train_keys.add((line,tr))
+
+          # AFC OD x 5-min entry bins; no card identifiers retained.
+          od_bins=Counter();eligible=0;mapped=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv')
+              for r in csv.DictReader(f):
+                  if str(r.get('TRNS_MNS_CD') or '').strip() not in RAIL: continue
+                  t0=dt(r.get('RIDE_DTM'));t1=dt(r.get('ALGH_DTM'))
+                  if not t0 or not t1 or not(START<=t0<END) or t1<t0:continue
+                  eligible+=1;a=cw.get(z4(r.get('RIDE_BSST_ID')));b=cw.get(z4(r.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  o=node(str(a['service_subway_id']),str(a['service_statn_id']));d=node(str(b['service_subway_id']),str(b['service_statn_id']))
+                  if o not in G or d not in G or o==d:continue
+                  mapped+=1;od_bins[(o,d,(t0.hour*60+t0.minute)//5)]+=1
+              f.close()
+          od_mass=Counter();phase=defaultdict(Counter)
+          for (o,d,b),m in od_bins.items():od_mass[(o,d)]+=m;phase[(o,d)][b]+=m
+
+          seg_od=defaultdict(set);seg_o=defaultdict(set);seg_d=defaultdict(set);seg_rf=defaultdict(set);seg_td=defaultdict(set);seg_up=defaultdict(set);seg_dn=defaultdict(set);seg_ph=defaultdict(Counter);seg_mass=Counter()
+          x_od=defaultdict(set);x_rf=defaultdict(set);x_mass=Counter();route_mass=Counter();route_cells=Counter();transfer_count_mass=Counter()
+          routed=0;unrouted=0;route_rows=[]
+          for (o,d),mass in od_mass.items():
+              try:path=nx.shortest_path(G,o,d,weight='weight')
+              except (nx.NetworkXNoPath,nx.NodeNotFound):unrouted+=mass;continue
+              routed+=mass;lines=[meta[n]['line'] for n in path];comp=[]
+              for l in lines:
+                  if not comp or comp[-1]!=l:comp.append(l)
+              rf='>'.join(comp);td=[f'{a}->{b}' for a,b in zip(comp,comp[1:])]
+              route_mass[rf]+=mass;route_cells[rf]+=1;transfer_count_mass[max(0,len(comp)-1)]+=mass;route_rows.append((o,d,mass,rf,len(td)))
+              for u,v in zip(path,path[1:]):
+                  ed=G.get_edge_data(u,v) or {}
+                  if ed.get('kind')=='transfer':
+                      k='--'.join(sorted((u,v)));x_od[k].add((o,d));x_rf[k].add(rf);x_mass[k]+=mass;continue
+                  k='--'.join(sorted((u,v)));line=meta[u]['line'];seg_od[k].add((o,d));seg_o[k].add(o);seg_d[k].add(d);seg_rf[k].add(rf);seg_td[k].update(td);seg_mass[k]+=mass
+                  if line in comp:
+                      ix=comp.index(line);seg_up[k].update(comp[:ix]);seg_dn[k].update(comp[ix+1:])
+                  for b,m in phase[(o,d)].items():seg_ph[k][b]+=m
+
+          rows=[]
+          for k,m in seg_mass.items():
+              u,v=k.split('--');line=meta[u]['line'];ac=anchors[(line,meta[u]['station'])]+anchors[(line,meta[v]['station'])]
+              rows.append({'segment':k,'line':line,'station_u':meta[u]['station'],'station_v':meta[v]['station'],'name_u':meta[u]['dv_name'],'name_v':meta[v]['dv_name'],'n_independent_od':len(seg_od[k]),'n_origins':len(seg_o[k]),'n_destinations':len(seg_d[k]),'n_upstream_lines':len(seg_up[k]),'n_downstream_lines':len(seg_dn[k]),'n_transfer_directions':len(seg_td[k]),'n_shared_route_families':len(seg_rf[k]),'service_phase_entropy_5min':round(entropy(seg_ph[k]),6),'endpoint_anchor_diversity':len(seg_d[k]),'direct_service_anchor_events_at_endpoints':ac,'passenger_mass':m})
+          rows.sort(key=lambda r:(r['n_shared_route_families'],r['n_transfer_directions'],r['n_independent_od'],r['service_phase_entropy_5min'],r['passenger_mass']),reverse=True)
+          xrows=[{'transfer_edge':k,'n_independent_od':len(x_od[k]),'n_route_families':len(x_rf[k]),'passenger_mass':m} for k,m in x_mass.items()]
+          xrows.sort(key=lambda r:(r['n_route_families'],r['n_independent_od'],r['passenger_mass']),reverse=True)
+          fam=[{'line_sequence':k,'od_pairs':route_cells[k],'passenger_mass':m,'transfer_count':max(0,len(k.split('>'))-1)} for k,m in route_mass.most_common()]
+
+          def write(name,items):
+              with (OUT/name).open('w',encoding='utf-8',newline='') as f:
+                  fields=list(items[0]) if items else ['empty'];w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(items)
+          write('n1_seoul_network_segment_ecd_top1000.csv',rows[:1000]);write('n1_seoul_network_transfer_ecd.csv',xrows);write('n1_seoul_network_route_families.csv',fam)
+          comps=list(nx.connected_components(G));largest=max((len(c) for c in comps),default=0)
+          result={'schema':'mppd.n1-seoul-network-constraint-ecd.v2','date':'2026-09-04','status':'N1_NETWORK_CONSTRAINT_GRAPH_V2_COMPLETED','repair_of_run':33837466360,'graph':{'nodes':G.number_of_nodes(),'edges':G.number_of_edges(),'inline_edges':sum(1 for _,_,d in G.edges(data=True) if d.get('kind')=='inline'),'transfer_edges':sum(1 for _,_,d in G.edges(data=True) if d.get('kind')=='transfer'),'qualified_transfer_groups':len(transfer_groups),'connected_components':len(comps),'largest_component_nodes':largest,'ambiguous_station_sequence_groups':len(ambiguous_seq)},'afc':{'eligible_morning_rail_rows':eligible,'mapped_graph_rows':mapped,'unique_od_pairs':len(od_mass),'od_time_bins':len(od_bins),'routed_mass':routed,'unrouted_mass':unrouted,'routing_mass_share':routed/(routed+unrouted) if routed+unrouted else 0},'service':{'partial_direct_event_rows':service_rows,'train_keys':len(train_keys)},'transfer_count_mass':{str(k):v for k,v in sorted(transfer_count_mass.items())},'top_ecd_segments':rows[:30],'top_transfer_edges':xrows[:30],'top_route_families':fam[:30],'transfer_groups_sample':transfer_groups[:30],'scientific_boundary':['P1C highest-tier transfer-code/name evidence defines physical interchange edges; BMS is not used to infer transfer identity.','P1C station sequence is a conservative structural topology proxy; ambiguous sequence groups are not linked blindly.','Routes are structural shortest-path proxies, not observed passenger route choice.','BMS events are partial service anchors, not exhaustive ATS truth.','No raw card identifier is retained.','ECD is component-wise; no scalar ECD law is claimed yet.'],'next_gate':'Choose high-ECD target segments with partial direct anchors and run same-target local-vs-network information ladder.'}
+          (OUT/'n1_seoul_network_constraint_ecd_v2_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8');print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist aggregate N1 V2 outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n1v2/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

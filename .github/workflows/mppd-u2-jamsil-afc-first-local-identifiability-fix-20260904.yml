@@ -1,0 +1,86 @@
+name: MPPD U2 Jamsil AFC-First Local Identifiability Fix 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u2-jamsil-afc-first-local-identifiability-fix-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identifiability-fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u2_jamsil_afc_first_local_identifiability
+    steps:
+      - name: Restore exact original inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq curl
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u2id/out"; cd "$RUNNER_TEMP/u2id"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Extract original probe and repair only the os-shadow output bug
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2id"
+          curl -fsSL 'https://raw.githubusercontent.com/54wsdf/quiet-window/e781fdbb170d3884b3f060a46cff9256fbe32a3d/.github/workflows/mppd-u2-jamsil-afc-first-local-identifiability-20260904.yml' -o original.yml
+          python - <<'PY'
+          from pathlib import Path
+          text=Path('original.yml').read_text(encoding='utf-8')
+          marker="          python - <<'PY'\n"
+          start=text.index(marker)+len(marker)
+          end=text.index("\n          PY",start)
+          lines=text[start:end].splitlines()
+          code='\n'.join(line[10:] if line.startswith('          ') else line for line in lines)+'\n'
+          old="os.environ['GITHUB_OUTPUT']"
+          new="__import__('os').environ['GITHUB_OUTPUT']"
+          assert old in code
+          code=code.replace(old,new)
+          Path('probe_fixed.py').write_text(code,encoding='utf-8')
+          print('repair=ONLY_OS_ENVIRON_SHADOW_REFERENCE')
+          PY
+
+      - name: Run unchanged scientific probe
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2id"
+          python probe_fixed.py
+          echo '--- persisted-local-summary ---'
+          jq '{schema,status,target_count,wins_vs_midpoint,ties_vs_midpoint,losses_vs_midpoint,midpoint_error_sec,afc_robust_peak_error_sec,flat_curve_count,parameter_family,scientific_boundary,next_gate}' out/u2_jamsil_afc_first_local_identifiability_summary.json
+
+      - name: Persist repaired diagnostic result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u2id/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

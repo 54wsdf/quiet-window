@@ -1,0 +1,62 @@
+name: MPPD R0 Full Network Route Ensemble 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r0-full-network-route-ensemble-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r0-route-ensemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore topology and city-day cohort cache
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/ensemble/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$RUNNER_TEMP/ensemble/p1c.json" --config "$C"
+          rclone copyto "$R:$BASE_DRIVE/r0_city_day_cache/seoul_20260829_0700_1000_afc_time_cohorts.csv.gz" "$RUNNER_TEMP/ensemble/cohorts.csv.gz" --config "$C"
+      - name: Generate deterministic full-network route ensemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE"
+          python -m py_compile scripts/mppd_r0_full_network_route_ensemble_20260904.py
+          /usr/bin/time -v python scripts/mppd_r0_full_network_route_ensemble_20260904.py \
+            --p1c "$RUNNER_TEMP/ensemble/p1c.json" --cohorts "$RUNNER_TEMP/ensemble/cohorts.csv.gz" --out "$RUNNER_TEMP/ensemble/out" \
+            2>&1 | tee "$RUNNER_TEMP/ensemble/out/route_ensemble_execution.log"
+      - name: Persist route ensemble
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ensemble/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE"; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected configuration
+        if: always()
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        shell: bash
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

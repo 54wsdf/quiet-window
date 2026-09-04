@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/u2id"
           python - <<'PY'
-          import csv,io,json,math,os,statistics,zipfile
+          import csv,io,json,math,os as osmod,statistics,zipfile
           from collections import Counter,defaultdict
           from datetime import datetime,timedelta
           from pathlib import Path
@@ -140,7 +140,6 @@ jobs:
                   next_dep=min(d for d,t in visible if d>true_dep) if any(d>true_dep for d,t in visible) else None
                   if prev_dep is None or next_dep is None:continue
                   midpoint=prev_dep+(next_dep-prev_dep)/2
-                  # Leave-one trajectory template from other trains in same structural direction signature.
                   rtpool=defaultdict(list)
                   for _,otr in visible:
                       for ds,rt in out_train[otr]['runtime'].items():rtpool[ds].append(rt)
@@ -156,7 +155,6 @@ jobs:
                           support=0
                           for t0,t1,os,ds in relevant:
                               carr=cdep+timedelta(seconds=rtmed[ds])
-                              # Exit-minute interval intersects a broad nonnegative egress interval [0,E].
                               if carr>t1+timedelta(seconds=59) or (t1-carr).total_seconds()>E:continue
                               inc=[x for x in inbound[os] if t0<=x[0]<=t0+timedelta(seconds=A)]
                               if not inc:continue
@@ -164,14 +162,12 @@ jobs:
                               for idep,iarr,itr in inc:
                                   ready=iarr+timedelta(seconds=K)
                                   if cdep<ready:continue
-                                  # Candidate must be the first same-direction Line-2 departure after platform-ready time.
                                   earlier=[d for d,otr in visible if ready<=d<cdep]
                                   if earlier:continue
                                   passenger_support=True;break
                               if passenger_support:support+=1
                           combo_scores[(A,K,E)].append(support)
 
-                  # Robust objective: min-max normalize each plausible-kernel support curve, then average.
                   robust=[]
                   for j,shift in enumerate(SHIFTS):
                       vals=[]
@@ -187,7 +183,7 @@ jobs:
           wins=sum(x['outcome']=='WIN' for x in rows);ties=sum(x['outcome']=='TIE' for x in rows);losses=sum(x['outcome']=='LOSS' for x in rows);errs=[x['afc_robust_abs_error_sec'] for x in rows];base=[x['midpoint_error_sec'] for x in rows]
           result={'schema':'mppd.u2-jamsil-afc-first-local-identifiability.v1','date':'2026-09-04','status':'AFC_FIRST_LOCAL_IDENTIFIABILITY_DIAGNOSTIC_COMPLETED','target_count':len(rows),'wins_vs_midpoint':wins,'ties_vs_midpoint':ties,'losses_vs_midpoint':losses,'midpoint_error_sec':{'median':med(base),'p90':q(base,.9),'max':max(base) if base else None},'afc_robust_peak_error_sec':{'median':med(errs),'p90':q(errs,.9),'max':max(errs) if errs else None,'within60_share':sum(e<=60 for e in errs)/len(errs) if errs else None,'within120_share':sum(e<=120 for e in errs)/len(errs) if errs else None},'flat_curve_count':sum(x['flat_curve'] for x in rows),'targets':rows,'parameter_family':{'access_max_sec':list(AMAX),'transfer_min_sec':list(KMIN),'egress_max_sec':list(EMAX),'candidate_shift_sec':SHIFTS},'scientific_boundary':['This is a local identifiability diagnostic: the ±300 s evaluation window is centered on the held target truth, so it is not a deployable free-search estimator.','No BMS-fixed complete passenger chain is required. Line-8 direct events are partial upstream anchors; other Line-2 trains provide visible service gates and a leave-one running-time template.','The target Line-2 departure is used only to define the local evaluation coordinate and compute final error; passenger support at each candidate does not read the target time.','Movement parameters are broad feasibility families rather than fitted point estimates.','No raw card identifiers are persisted.'],'next_gate':'If AFC-first robust support peaks consistently near truth and beats midpoint, convert the local surface into a gap-bounded hidden-service estimator with fold-specific kernel calibration. If not, transfer passenger evidence is not yet sufficiently identifying under current partial-anchor semantics.'}
           (OUT/'u2_jamsil_afc_first_local_identifiability_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+          with open(osmod.environ['GITHUB_OUTPUT'],'a') as f:
               f.write(f"n={len(rows)}\nwin={wins}\ntie={ties}\nloss={losses}\nbase_med={med(base) if base else 0}\nafc_med={med(errs) if errs else 0}\nafc_p90={q(errs,.9) if errs else 0}\nzero={sum(x['flat_curve'] for x in rows)}\nnear60={sum(e<=60 for e in errs)/len(errs) if errs else 0}\nnear120={sum(e<=120 for e in errs)/len(errs) if errs else 0}\n")
           print(json.dumps({k:v for k,v in result.items() if k!='targets'},ensure_ascii=False,indent=2))
           PY

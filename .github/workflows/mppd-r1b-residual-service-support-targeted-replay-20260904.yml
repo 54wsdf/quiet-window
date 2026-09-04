@@ -1,0 +1,113 @@
+name: MPPD R1B Residual Service Support Targeted Replay 2026-09-04
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - MPPD R1B G1E Residual Record Broad V4 2026-09-04
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  r1b-residual-service-support-targeted-replay:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      G1E_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1e_corrected_service_recompletion
+      R1B_V4_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_g1e_residual_record_broad_v4
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_residual_service_support_targeted_replay
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+      - name: Restore residual authority and substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1b_targeted_replay"; mkdir -p "$ROOT/out" "$ROOT/classify"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1E_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v4_corrected_recompletion.json" "$ROOT/service_g1e.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_V4_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/r1b_v4_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_V4_DRIVE/r1b_weighted_failure_residual_cohorts_e1.jsonl.gz" "$ROOT/residual_e1.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1b_targeted_replay'
+          s=json.loads((root/'r1b_v4_summary.json').read_text())
+          assert s.get('schema')=='mppd.r1b-first-bidirectional-joint-update-smoke.v4-residual-records'
+          assert s.get('iteration',{}).get('E1_passenger_posterior',{}).get('failure_mass_conservation_pass') is True
+          PY
+      - name: Replay residual cohorts and join support evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_targeted_replay"
+          python -m py_compile scripts/mppd_r1b_residual_service_support_targeted_replay_20260904.py scripts/mppd_r1b_missing_service_support_proposal_audit_20260904.py
+          python -m scripts.mppd_r1b_residual_service_support_targeted_replay_20260904 \
+            --p1c "$ROOT/p1c.json" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service_g1e.json" \
+            --r1b-summary "$ROOT/r1b_v4_summary.json" --residual-cohorts "$ROOT/residual_e1.jsonl.gz" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --beam 8 --max-skip 2 --out "$ROOT/out" | tee "$ROOT/out/targeted_replay.log"
+          python -m scripts.mppd_r1b_missing_service_support_proposal_audit_20260904 \
+            --p1c "$ROOT/p1c.json" --service-init "$ROOT/service_g1e.json" --r1b-summary "$ROOT/r1b_v4_summary.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --nearby-edges 3 --out "$ROOT/classify" | tee "$ROOT/out/direction_aware_classifier.log"
+          cp "$ROOT/classify/r1b_missing_service_support_proposal_audit_summary.json" "$ROOT/out/direction_aware_support_classification.json"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1b_targeted_replay'; out=root/'out'
+          replay=json.loads((out/'r1b_residual_service_support_targeted_replay_summary.json').read_text())
+          cls=json.loads((out/'direction_aware_support_classification.json').read_text())
+          cmap={r['line']+'|'+r['origin']+'|'+r['destination']:r for r in cls.get('top_segments',[])}
+          joined=[]
+          for r in replay.get('top_missing_segments',[]):
+              c=cmap.get(r['segment'])
+              classification=(c or {}).get('classification','NOT_IN_TOP100_DIRECTION_CLASSIFIER')
+              if classification in ('DIRECTION_COMPATIBLE_EXISTING_ROOT_INTERIOR_HOLE_CANDIDATE','DIRECTION_COMPATIBLE_ROOT_VARIANT_FRAGMENTATION_CANDIDATE','DIRECTION_COMPATIBLE_NEAR_EXISTING_ROOT_EXTENSION_CANDIDATE'):
+                  tier='EXISTING_ROOT_SUPPORT_PROPOSAL_AUDIT_ELIGIBLE'
+              elif classification=='VIABLE_SUPPORT_ALREADY_PRESENT_CONTRADICTION_AUDIT': tier='IMPLEMENTATION_OR_DEDUP_CONTRADICTION_AUDIT'
+              elif classification=='OPPOSITE_DIRECTION_SUPPORT_ONLY': tier='SAME_DIRECTION_SUPPORT_EVIDENCE_REQUIRED'
+              elif classification in ('NO_DIRECTION_COMPATIBLE_ROOT_SUPPORT','NO_NEARBY_EXISTING_ROOT_SUPPORT'): tier='STRICT_NEW_LATENT_ROOT_GATE'
+              else: tier='UNCLASSIFIED_REQUIRES_DEEPER_AUDIT'
+              joined.append({**r,'direction_aware_classification':classification,'recommended_action':(c or {}).get('recommended_action'),'proposal_tier':tier,'nearby_roots':(c or {}).get('nearby_roots',[]),'interior_roots':(c or {}).get('interior_roots',[]),'cross_variant_roots':(c or {}).get('cross_variant_roots',[])})
+          joined.sort(key=lambda x:x['pressure_mass'],reverse=True)
+          result={'schema':'mppd.r1b-residual-service-support-evidence-join.v1','date':'2026-09-04','status':'R1B_RESIDUAL_SERVICE_SUPPORT_EVIDENCE_JOIN_COMPLETED','replay_consistency':replay.get('replay_consistency'),'missing_service_pressure_by_line':replay.get('missing_service_pressure_by_line'),'proposal_tier_pressure':{},'segments':joined,'scientific_boundary':['This joins passenger-side temporal/cross-OD evidence with direction-aware existing-root structural classification; it does not activate service support.','Existing-root proposal eligibility is not acceptance. A candidate must still be trajectory-consistent, direct-anchor compatible, and improve held-out passenger/service closure after rerun.','New latent service roots remain forbidden without stricter multi-cohort/cross-OD temporal evidence.'],'no_email_notification_logic':True}
+          for r in joined: result['proposal_tier_pressure'][r['proposal_tier']]=result['proposal_tier_pressure'].get(r['proposal_tier'],0.0)+float(r['pressure_mass'])
+          (out/'r1b_residual_service_support_evidence_join.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
+          manifest={'schema':'mppd.r1b-residual-service-support-targeted-replay-execution-manifest.v1','date':'2026-09-04','status':'R1B_TARGETED_REPLAY_AND_EVIDENCE_JOIN_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'replay_consistency':replay.get('replay_consistency'),'proposal_tier_pressure':result['proposal_tier_pressure'],'output_files':{},'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='execution_manifest.json': manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'replay_consistency':replay.get('replay_consistency'),'proposal_tier_pressure':result['proposal_tier_pressure'],'top_segments':joined[:20]},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"; find . -maxdepth 1 -type f ! -name output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > output_sha256.txt
+      - name: Persist targeted replay outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1b_targeted_replay/out"
+          for f in "$ROOT"/*; do test -s "$f"; rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

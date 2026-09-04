@@ -1,0 +1,169 @@
+name: MPPD N3 Dangsan-Hapjeong Network Target Qualification 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n3-dangsan-hapjeong-target-qualification-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n3_dangsan_hapjeong_target_qualification
+    steps:
+      - name: Restore qualified AFC mapping and partial service anchors
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/n3q/out"; cd "$RUNNER_TEMP/n3q"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service.csv --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Rank actual Line-2 trains by network observation diversity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n3q"
+          python - <<'PY'
+          import csv,io,json,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime
+          from pathlib import Path
+
+          OUT=Path('out');OUT.mkdir(exist_ok=True)
+          L2='1002';A='1002000237';B='1002000238';STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'};AT='A_TRANSFER_CODE_LINE_NAME'
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          START=datetime(2026,8,29,7);END=datetime(2026,8,29,10)
+          def dt(v):
+              d=''.join(c for c in str(v or '') if c.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def z4(v):
+              d=''.join(c for c in str(v or '') if c.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();return io.TextIOWrapper(z.open(n),encoding=detect(h),errors='replace',newline='')
+
+          p=json.loads(Path('p1c.json').read_text(encoding='utf-8'));entries=[x for x in p['canonical_entries'] if x.get('tier') in STRICT]
+          cw={}
+          for x in entries:
+              k=str(x.get('out_stn_num') or '')
+              if k and (k not in cw or x.get('tier')==AT):cw[k]=x
+          groups=defaultdict(dict)
+          for x in entries:
+              if x.get('tier')==AT and x.get('dv_name') and x.get('service_subway_id') and x.get('service_statn_id'):
+                  groups[str(x['dv_name'])][str(x['service_subway_id'])]=str(x['service_statn_id'])
+          to_l2=defaultdict(list);from_l2=defaultdict(list)
+          for dv,g in groups.items():
+              if L2 not in g:continue
+              for line,st in g.items():
+                  if line==L2:continue
+                  to_l2[line].append((st,g[L2],dv));from_l2[line].append((g[L2],st,dv))
+
+          trains=defaultdict(lambda:defaultdict(list));other_station_event=Counter()
+          with open('service.csv',encoding='utf-8',newline='') as f:
+              for r in csv.DictReader(f):
+                  line=str(r.get('subway_id') or '').strip();tr=str(r.get('btrain_no') or '').strip();st=str(r.get('statn_id') or '').strip();a=dt(r.get('arrival_detect_time'));d=dt(r.get('departure_detect_time'))
+                  if line and tr and st and a and d:
+                      trains[(line,tr)][st].append((a,d));other_station_event[(line,st)]+=1
+          for k in trains:
+              for st in trains[k]:trains[k][st]=sorted(set(trains[k][st]))
+
+          # OD-time mass only; no card identifiers retained.
+          od=Counter();eligible=0;mapped=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv')
+              for r in csv.DictReader(f):
+                  if str(r.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  t0=dt(r.get('RIDE_DTM'));t1=dt(r.get('ALGH_DTM'))
+                  if not t0 or not t1 or not(START<=t0<END) or t1<t0:continue
+                  eligible+=1;a=cw.get(z4(r.get('RIDE_BSST_ID')));b=cw.get(z4(r.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  ol=str(a.get('service_subway_id'));os=str(a.get('service_statn_id'));dl=str(b.get('service_subway_id'));ds=str(b.get('service_statn_id'))
+                  if not ol or not os or not dl or not ds:continue
+                  mapped+=1;od[(ol,os,dl,ds,(t0.hour*60+t0.minute)//5)]+=1
+              f.close()
+
+          rows=[]
+          for (line,tr),sts in trains.items():
+              if line!=L2 or A not in sts or B not in sts:continue
+              ea=min(sts[A],key=lambda x:x[1]);eb=min(sts[B],key=lambda x:x[1]);ta=ea[1];tb=eb[1]
+              if not(START<=min(ta,tb)<END):continue
+              direction='A_TO_B' if ta<tb else 'B_TO_A';seg_time=min(ta,tb)
+              # Representative station time relative to segment for this actual train.
+              rel={}
+              for st,evs in sts.items():
+                  e=min(evs,key=lambda x:abs((x[1]-seg_time).total_seconds()));rel[st]=((e[0]-seg_time).total_seconds(),(e[1]-seg_time).total_seconds())
+              before={st for st,(ra,rd) in rel.items() if rd<=0};after={st for st,(ra,rd) in rel.items() if ra>=0}
+              direct_od=set();in_od=set();out_od=set();double_od=set();phase=Counter();mass=Counter();in_lines=set();out_lines=set();transfer_dirs=set();physical_transfers=set()
+              for (ol,os,dl,ds,bn),m in od.items():
+                  typ=None
+                  if ol==L2 and dl==L2 and os in before and ds in after:
+                      typ='direct';direct_od.add((ol,os,dl,ds));mass['direct']+=m
+                  elif dl==L2 and ol!=L2 and ds in after:
+                      hits=[]
+                      for ost,l2st,dv in to_l2.get(ol,[]):
+                          if l2st in before and other_station_event[(ol,ost)]>0:hits.append((ost,l2st,dv))
+                      if hits:
+                          typ='in';in_od.add((ol,os,dl,ds));mass['inbound_transfer']+=m;in_lines.add(ol);transfer_dirs.add(f'{ol}->{L2}');physical_transfers.update(x[2] for x in hits)
+                  elif ol==L2 and dl!=L2 and os in before:
+                      hits=[]
+                      for l2st,dst,dv in from_l2.get(dl,[]):
+                          if l2st in after and other_station_event[(dl,dst)]>0:hits.append((l2st,dst,dv))
+                      if hits:
+                          typ='out';out_od.add((ol,os,dl,ds));mass['outbound_transfer']+=m;out_lines.add(dl);transfer_dirs.add(f'{L2}->{dl}');physical_transfers.update(x[2] for x in hits)
+                  elif ol!=L2 and dl!=L2:
+                      hin=[];hout=[]
+                      for ost,l2st,dv in to_l2.get(ol,[]):
+                          if l2st in before and other_station_event[(ol,ost)]>0:hin.append((ost,l2st,dv))
+                      for l2st,dst,dv in from_l2.get(dl,[]):
+                          if l2st in after and other_station_event[(dl,dst)]>0:hout.append((l2st,dst,dv))
+                      if hin and hout:
+                          typ='double';double_od.add((ol,os,dl,ds));mass['double_transfer_candidate']+=m;in_lines.add(ol);out_lines.add(dl);transfer_dirs.update([f'{ol}->{L2}',f'{L2}->{dl}']);physical_transfers.update(x[2] for x in hin+hout)
+                  if typ:phase[bn]+=m
+              network_od=direct_od|in_od|out_od|double_od
+              anchor_count=len(sts[A])+len(sts[B])
+              rows.append({'train':tr,'direction':direction,'segment_time':seg_time.isoformat(),'direct_od_pairs':len(direct_od),'inbound_transfer_od_pairs':len(in_od),'outbound_transfer_od_pairs':len(out_od),'double_transfer_candidate_od_pairs':len(double_od),'network_od_pairs':len(network_od),'inbound_lines':len(in_lines),'outbound_lines':len(out_lines),'transfer_directions':len(transfer_dirs),'physical_transfer_groups':len(physical_transfers),'phase_bins_5min':len(phase),'direct_mass':mass['direct'],'inbound_transfer_mass':mass['inbound_transfer'],'outbound_transfer_mass':mass['outbound_transfer'],'double_transfer_candidate_mass':mass['double_transfer_candidate'],'network_mass':sum(mass.values()),'endpoint_direct_service_event_rows':anchor_count})
+          rows.sort(key=lambda x:(x['network_od_pairs'],x['transfer_directions'],x['double_transfer_candidate_od_pairs'],x['network_mass']),reverse=True)
+          with (OUT/'n3_dangsan_hapjeong_target_ranking.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0]) if rows else ['train']);w.writeheader();w.writerows(rows)
+          result={'schema':'mppd.n3-dangsan-hapjeong-target-qualification.v1','date':'2026-09-04','status':'N3_HIGH_ECD_TARGET_QUALIFICATION_COMPLETED','segment':{'line':L2,'station_a':A,'station_b':B,'names':['당산','합정']},'afc':{'eligible_rows':eligible,'mapped_rows':mapped,'od_time_cells':len(od)},'target_train_count':len(rows),'top_targets':rows[:20],'scientific_boundary':['This is target qualification and structural observation counting, not service inversion.','Cross-line and double-transfer observations are candidate constraints based on highest-tier physical transfer identities plus target-train station ordering; they are not observed passenger route assignments.','Other-line service events are only required as partial transfer-side anchor availability, not exhaustive ATS truth.','No card identifier is retained.'],'next_gate':'Choose several high-network-diversity trains across both directions and build N3 shared-kernel likelihood with whole-target service holdout and passenger-side validation.'}
+          (OUT/'n3_dangsan_hapjeong_target_qualification_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8');print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist target qualification outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n3q/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -44,8 +44,8 @@ jobs:
           rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_summary.json" "$RUNNER_TEMP/g2v2_g0e/route_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$BASE_DRIVE/g1c_service_trajectory_completion/seoul_20260829_0700_1000_service_state_initialization_v2.json" "$RUNNER_TEMP/g2v2_g0e/service_init.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           python - <<'PY'
-          import json, pathlib
-          p=pathlib.Path("${RUNNER_TEMP}/g2v2_g0e/route_summary.json")
+          import json, pathlib, os
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'g2v2_g0e/route_summary.json'
           x=json.loads(p.read_text())
           assert x.get('topology',{}).get('topology_patch_applied') is True, x.get('topology')
           patch=x.get('topology',{}).get('topology_patch',{})

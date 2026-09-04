@@ -1,0 +1,161 @@
+name: MPPD N1 Shanghai Topology Reconciliation 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-shanghai-topology-reconciliation-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n1_shanghai_topology_reconciliation
+    steps:
+      - name: Restore small public graph assets and Drive sink
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip
+          python -m pip install --disable-pip-version-check pyshp networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/shrec/out"; cd "$RUNNER_TEMP/shrec"
+          curl -fsSL https://ndownloader.figshare.com/files/46553314 -o sections.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46552816 -o rail.zip
+          unzip -q rail.zip -d rail
+
+      - name: Rebuild line-aware active graph from source station records
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shrec"
+          python - <<'PY'
+          import csv,json,re,glob
+          from collections import defaultdict
+          from pathlib import Path
+          import networkx as nx
+          import shapefile
+
+          OUT=Path('out');OUT.mkdir(exist_ok=True);ACTIVE={1,2,3,4,5,6,7,8,9,10,11,12,13,16}
+          ALIAS={(1,'黄陂南路'):'一大会址·黄陂南路',(4,'浦电路4号线'):'浦电路',(6,'浦电路6号线'):'浦电路',(7,'上海大学站'):'上海大学',(10,'新天地'):'一大会址·新天地',(11,'李子园路'):'李子园',(16,'上海野生动物园'):'野生动物园'}
+          def dec(fn):
+              raw=Path(fn).read_bytes()
+              for e in ('utf-8-sig','gb18030','gb2312','cp936'):
+                  try:return raw.decode(e)
+                  except UnicodeDecodeError:pass
+              raise RuntimeError
+          def nn(s):return re.sub(r'\s+','',str(s or '').strip())
+          def canon(l,n):return nn(ALIAS.get((int(l),nn(n)),nn(n)))
+          def node(l,n):return f'{int(l)}|{canon(l,n)}'
+          def line_from_num(v):
+              try:return int(float(str(v).strip()))//100
+              except:return None
+
+          # Inline edges from section table, exact active OD line world.
+          G=nx.Graph();inline=set();line_names=defaultdict(set)
+          for r in csv.DictReader(dec('sections.csv').splitlines()):
+              l=line_from_num(r.get('Num'))
+              if l not in ACTIVE:continue
+              a=canon(l,r.get('Name1'));b=canon(l,r.get('Name2'));u=node(l,a);v=node(l,b)
+              G.add_node(u,line=l,name=a);G.add_node(v,line=l,name=b);G.add_edge(u,v,kind='inline',line=l);inline.add(tuple(sorted((u,v))));line_names[l].update([a,b])
+
+          shp=glob.glob('rail/**/metrostations_all84.shp',recursive=True)[0]
+          rd=shapefile.Reader(shp,encoding='gb18030',encodingErrors='replace')
+          fields=[x[0] for x in rd.fields[1:]]
+          print('STATION_FIELDS',fields)
+          recs=[]
+          for sr in rd.iterShapeRecords():
+              d=dict(zip(fields,list(sr.record)));d['_x'],d['_y']=sr.shape.points[0] if sr.shape.points else (None,None);recs.append(d)
+          print('SOURCE_RECORD_COUNT',len(recs))
+          print('SAMPLE_RECORDS',json.dumps(recs[:5],ensure_ascii=False,default=str))
+
+          # Detect likely field names without assuming them in advance.
+          lk={f.lower():f for f in fields}
+          def pick(keys):
+              for k in keys:
+                  for f in fields:
+                      if k in f.lower():return f
+              return None
+          namef=pick(['name','站名']);linef=pick(['line','线路']);poif=pick(['poiid','poi']);transf=pick(['transfer','trans','换乘'])
+          print('PICKED',namef,linef,poif,transf)
+
+          parsed=[]
+          for d in recs:
+              name=nn(d.get(namef)) if namef else ''
+              # line can be number/text; extract first metro line integer.
+              lv=str(d.get(linef) if linef else '')
+              nums=[int(x) for x in re.findall(r'\d+',lv)]
+              line=nums[0] if nums else None
+              if line not in ACTIVE or not name:continue
+              # source uses explicit line-aware Pudian names; normalize only to section identity for inline matching.
+              section_name=name
+              if name.startswith('浦电路') and line in (4,6):section_name='浦电路'
+              section_name=canon(line,section_name)
+              parsed.append({'line':line,'source_name':name,'section_name':section_name,'poi':str(d.get(poif) or '') if poif else '', 'transfer_raw':d.get(transf) if transf else None,'x':d['_x'],'y':d['_y']})
+
+          # Source station records may have repeated rows per line/metadata. Deduplicate by line + source name + poi + coordinates.
+          uniq={}
+          for x in parsed:
+              k=(x['line'],x['source_name'],x['poi'],round(float(x['x']),6) if x['x'] is not None else None,round(float(x['y']),6) if x['y'] is not None else None);uniq[k]=x
+          parsed=list(uniq.values())
+
+          # Transfer grouping: use common poiID where available; otherwise exact source name only when transfer flag says transfer.
+          # Never group Pudian Road because the source explicitly has two POIs and transfer_flag=0.
+          bypoi=defaultdict(list);byname=defaultdict(list)
+          for x in parsed:
+              if x['poi']:bypoi[x['poi']].append(x)
+              byname[x['source_name']].append(x)
+          transfer_edges=set();groups=[]
+          def truthy(v):
+              s=str(v).strip().lower();return s not in ('','0','0.0','false','none','nan')
+          # Primary: same source physical station name across lines, only if at least one record is explicitly transfer-marked.
+          for name,arr in byname.items():
+              lines={x['line'] for x in arr}
+              if len(lines)<2 or not any(truthy(x['transfer_raw']) for x in arr):continue
+              # Pudian hard exclusion.
+              if name.startswith('浦电路'):continue
+              members=[]
+              for x in arr:
+                  n=node(x['line'],x['section_name'])
+                  if n in G:members.append(n)
+              members=sorted(set(members))
+              if len({m.split('|',1)[0] for m in members})<2:continue
+              groups.append({'key':'NAME:'+name,'members':members})
+              for i in range(len(members)):
+                  for j in range(i+1,len(members)):
+                      if members[i].split('|',1)[0]==members[j].split('|',1)[0]:continue
+                      transfer_edges.add(tuple(sorted((members[i],members[j]))))
+          for u,v in transfer_edges:G.add_edge(u,v,kind='transfer')
+
+          comps=list(nx.connected_components(G));pudian_edge=tuple(sorted((node(4,'浦电路'),node(6,'浦电路'))))
+          result={'schema':'mppd.n1-shanghai-topology-reconciliation.v1','date':'2026-09-04','status':'TOPOLOGY_RECONCILIATION_EXECUTED','source_station_fields':fields,'picked_fields':{'name':namef,'line':linef,'poi':poif,'transfer':transf},'source_station_records':len(recs),'parsed_active_records':len(parsed),'graph':{'nodes':G.number_of_nodes(),'edges':G.number_of_edges(),'inline_edges':len(inline),'transfer_edges':len(transfer_edges),'components':len(comps),'largest_component':max(map(len,comps)) if comps else 0},'transfer_group_count':len(groups),'pudian_road_transfer_edge_present':pudian_edge in transfer_edges,'pudian_source_records':[x for x in parsed if x['source_name'].startswith('浦电路')],'transfer_groups_sample':groups[:100],'target_authority':{'nodes':365,'edges':445,'components':1},'matches_qualified_authority':G.number_of_nodes()==365 and G.number_of_edges()==445 and len(comps)==1 and pudian_edge not in transfer_edges,'scientific_boundary':['This audit uses source line-aware station shapefile records and explicit transfer flags rather than the aggregated station Lines field.','Pudian Road Line 4/6 is hard-excluded from transfer grouping in accordance with the existing qualified identity decision.','If the graph still does not reproduce 365/445/1, this run remains a diagnostic and does not replace the existing authority.']}
+          (OUT/'n1_shanghai_topology_reconciliation_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2,default=str),encoding='utf-8');print(json.dumps(result,ensure_ascii=False,indent=2,default=str))
+          PY
+
+      - name: Persist audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shrec/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

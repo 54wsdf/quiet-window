@@ -1,0 +1,238 @@
+name: MPPD U1 Seoul Heldout Train Discovery 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-seoul-heldout-train-discovery-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_heldout_train_discovery
+
+    steps:
+      - name: Prepare and restore qualified Seoul sources
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check numpy pandas scipy scikit-learn
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u1_seoul/out"; cd "$RUNNER_TEMP/u1_seoul"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          test -s TAIMS.zip && test -s BMS.zip && test -s p1c.json
+
+      - name: Discover AFC event modes and score whole-train holdout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1_seoul"
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, io, json, math, re, statistics, unicodedata, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          import numpy as np
+          from scipy.signal import find_peaks
+          from sklearn.cluster import MeanShift
+
+          LINE='1008'; START=datetime(2026,8,29,7); END=datetime(2026,8,29,10)
+          FRESH=120; HOLDOUT_NUM=1; HOLDOUT_DEN=5
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          OUT=Path('out')
+
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try: raw.decode(e); return e
+                  except UnicodeDecodeError: pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n); h=f.read(262144); f.close(); e=detect(h)
+              return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s): return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit()); return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def holdout_train(x): return hashlib.sha1(x.encode()).digest()[0] % HOLDOUT_DEN < HOLDOUT_NUM
+          def sec(t): return (t-START).total_seconds()
+          def fromsec(x): return START+timedelta(seconds=float(x))
+          def minute_floor(t): return t.replace(second=0,microsecond=0)
+          def quant(a,p):
+              if not a:return None
+              b=sorted(a); return b[round((len(b)-1)*p)]
+          def deterministic_sample(x,cap=12000):
+              x=np.sort(np.asarray(x,float))
+              if len(x)<=cap:return x
+              return x[np.linspace(0,len(x)-1,cap).round().astype(int)]
+          def match(truth,pred,tol):
+              used=set(); ds=[]
+              for t in sorted(truth):
+                  cc=[(abs((p-t).total_seconds()),j) for j,p in enumerate(pred) if j not in used and abs((p-t).total_seconds())<=tol]
+                  if cc:
+                      d,j=min(cc); used.add(j); ds.append(d)
+              return ds
+          def metrics(truth,pred,tol):
+              ds=match(truth,pred,tol)
+              return {'truth_n':len(truth),'pred_n':len(pred),'matched':len(ds),'recall':len(ds)/len(truth) if truth else None,'precision':len(ds)/len(pred) if pred else None,'median_abs_error_sec':float(np.median(ds)) if ds else None}
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          canonical=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in canonical}
+          stations={x['service_statn_id']:{'name':x.get('dv_name')} for x in canonical}
+
+          # Passenger exit observations only; no service truth enters candidate generation.
+          exits=defaultdict(list); afc_rows=0
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv'); r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL: continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID'))); b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b: continue
+                  t0=dt(row.get('RIDE_DTM')); t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or t1<t0 or (t1-t0).total_seconds()>10800: continue
+                  if not (START<=t0<END and START<=t1<END): continue
+                  if a['service_statn_id']==b['service_statn_id']: continue
+                  exits[b['service_statn_id']].append(t1); afc_rows+=1
+              f.close()
+
+          # Fresh direct operational arrival candidates used only for train holdout scoring/calibration.
+          pat=re.compile(r'subarr_(260829(\d{6}))'); obs=defaultdict(dict)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000': infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,snap in infos:
+                  f=zr(z,x.filename); r=csv.DictReader(f); r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      if (row.get('subway_id') or '').strip()!=LINE: continue
+                      state=(row.get('arvl_cd') or '').strip()
+                      if state not in {'0','1','2'}: continue
+                      t=dt(row.get('recptn_dt')); tr=(row.get('btrain_no') or '').strip(); st=(row.get('statn_id') or '').strip()
+                      if not t or not tr or st not in stations: continue
+                      age=(snap-t).total_seconds(); key=(tr,st); sig=(t,state)
+                      old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old): obs[key][sig]=age
+                  f.close()
+          truth=[]
+          for (tr,st),d in obs.items():
+              items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH); trans=[]
+              for t,s,a in items:
+                  if not trans or trans[-1][1]!=s: trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1': truth.append({'train':tr,'station':st,'time':t})
+                  prev=s
+          truth.sort(key=lambda z:(z['station'],z['time'],z['train']))
+          held={tr for tr in {x['train'] for x in truth} if holdout_train(tr)}
+          train=defaultdict(list); hidden=defaultdict(list)
+          for x in truth:
+              (hidden if x['train'] in held else train)[x['station']].append(x['time'])
+
+          # Candidate generators. Parameters are selected only against visible (non-held) service events.
+          def mean_shift_candidates(ts,bw):
+              xs=deterministic_sample([sec(minute_floor(t)) for t in ts])
+              if len(xs)<30:return []
+              ms=MeanShift(bandwidth=bw,bin_seeding=True,min_bin_freq=2,cluster_all=True,max_iter=300)
+              lab=ms.fit_predict(xs.reshape(-1,1)); out=[]
+              for k in np.unique(lab):
+                  v=xs[lab==k]
+                  if len(v)>=4: out.append(fromsec(np.median(v)))
+              return sorted(out)
+          def peak_candidates(ts,prom):
+              hist=np.zeros(180,dtype=float)
+              for t in ts:
+                  i=int((minute_floor(t)-START).total_seconds()//60)
+                  if 0<=i<len(hist): hist[i]+=1
+              med=np.median(hist); mad=np.median(np.abs(hist-med)); scale=max(1.0,1.4826*mad)
+              z=(hist-med)/scale
+              pk,_=find_peaks(z,distance=2,prominence=prom)
+              return [START+timedelta(minutes=int(i),seconds=30) for i in pk]
+          method_params=[('MEAN_SHIFT',bw) for bw in (60,90,120,180,240)]+[('HIST_PEAK',p) for p in (0.5,1.0,1.5,2.0)]
+          candidate_cache={}
+          dense=[st for st,n in sorted(((s,len(v)) for s,v in exits.items()),key=lambda x:-x[1])[:20]]
+          for st in dense:
+              for m,p in method_params:
+                  candidate_cache[(st,m,p)]=mean_shift_candidates(exits[st],p) if m=='MEAN_SHIFT' else peak_candidates(exits[st],p)
+
+          # Visible-truth-only lag calibration and global hyperparameter selection.
+          eval_grid=[]
+          for m,p in method_params:
+              station_cfg={}; total_match=total_truth=total_pred=0; errs=[]
+              for st in dense:
+                  base=candidate_cache[(st,m,p)]; vt=train.get(st,[])
+                  best=None
+                  for lag in range(-600,601,30):
+                      pred=[x+timedelta(seconds=lag) for x in base]
+                      ds=match(vt,pred,60)
+                      score=(len(ds),-abs(lag),-(np.median(ds) if ds else 9999))
+                      if best is None or score>best[0]: best=(score,lag,pred,ds)
+                  if best:
+                      _,lag,pred,ds=best; station_cfg[st]=lag
+                      total_match+=len(ds); total_truth+=len(vt); total_pred+=len(pred); errs+=ds
+              f1=(2*total_match/(total_truth+total_pred)) if total_truth+total_pred else 0
+              eval_grid.append({'method':m,'param':p,'train_f1':f1,'train_recall':total_match/total_truth if total_truth else 0,'train_precision':total_match/total_pred if total_pred else 0,'train_median_abs_error_sec':float(np.median(errs)) if errs else None,'station_lags':station_cfg})
+          chosen=max(eval_grid,key=lambda z:(z['train_f1'],z['train_recall'],z['train_precision']))
+          m=chosen['method']; p=chosen['param']; lags=chosen['station_lags']
+
+          # Holdout score: subtract candidates explained by visible events, then score residual candidates against hidden whole-train events.
+          hold_metrics={30:[],60:[],120:[]}; station_rows=[]
+          for st in dense:
+              base=candidate_cache[(st,m,p)]; pred=[x+timedelta(seconds=lags.get(st,0)) for x in base]
+              visible=train.get(st,[]); residual=[]
+              for x in pred:
+                  if not any(abs((x-v).total_seconds())<=60 for v in visible): residual.append(x)
+              row={'station':st,'name':stations[st]['name'],'afc_exits':len(exits[st]),'visible_truth':len(visible),'hidden_truth':len(hidden.get(st,[])),'all_candidates':len(pred),'residual_candidates':len(residual),'lag_sec':lags.get(st,0)}
+              for tol in (30,60,120):
+                  mm=metrics(hidden.get(st,[]),residual,tol); row[f'holdout_{tol}']=mm; hold_metrics[tol].append(mm)
+              station_rows.append(row)
+
+          pooled={}
+          for tol,arr in hold_metrics.items():
+              tn=sum(x['truth_n'] for x in arr); pn=sum(x['pred_n'] for x in arr); mn=sum(x['matched'] for x in arr)
+              pooled[str(tol)]={'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else None,'precision':mn/pn if pn else None}
+          summary={'schema':'mppd.u1-seoul-heldout-train-discovery.v1','date':'2026-09-04','status':'HELDOUT_WHOLE_TRAIN_BASELINE_COMPLETED','line':'1008','window':'07:00-10:00','afc_rows':afc_rows,'direct_truth_events':len(truth),'direct_truth_trains':len({x['train'] for x in truth}),'heldout_train_count':len(held),'candidate_generation_uses_service_truth':False,'calibration_uses_visible_service_only':True,'chosen':{k:v for k,v in chosen.items() if k!='station_lags'},'holdout_pooled':pooled,'hard_boundary':'This is a reproduction adaptation, not exact Lee/Min reproduction. Passenger AFC timestamps are minute-quantized; direct service is freshness-qualified candidate evidence, not proprietary ATS truth.','station_rows':station_rows,'hyperparameter_grid':[{k:v for k,v in z.items() if k!='station_lags'} for z in eval_grid]}
+          (OUT/'u1_seoul_heldout_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          with (OUT/'u1_seoul_station_metrics.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=['station','name','afc_exits','visible_truth','hidden_truth','all_candidates','residual_candidates','lag_sec','holdout_30','holdout_60','holdout_120']);w.writeheader();w.writerows(station_rows)
+          print(json.dumps({k:v for k,v in summary.items() if k not in {'station_rows','hyperparameter_grid'}},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist results
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1_seoul/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

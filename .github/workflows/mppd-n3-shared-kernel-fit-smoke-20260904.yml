@@ -1,0 +1,72 @@
+name: MPPD N3 Shared-Kernel Fit Smoke 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n3-shared-kernel-fit-smoke-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-fit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n3_shared_kernel_fit_smoke
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check numpy scipy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/n3k/out"; cd "$RUNNER_TEMP/n3k"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" service.csv --config "$C" --retries 6 --low-level-retries 15
+      - name: Fit visible-chain shared kernels
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math
+          from pathlib import Path
+          import scripts.mppd_n3_shared_kernel_joint_likelihood_20260904 as m
+          old_sample=m.stable_sample
+          def capped(rows,cap,salt): return old_sample(rows,min(cap,5000),salt)
+          m.stable_sample=capped
+          tp,te,bl,rows=m.load_inputs('$RUNNER_TEMP/n3k/TAIMS.zip','$RUNNER_TEMP/n3k/p1c.json','$RUNNER_TEMP/n3k/service.csv')
+          excluded={(m.L2,'2056')}
+          gp=m.make_path_cache(te,bl,excluded)
+          A,E,ah=m.fit_access_egress(rows,gp)
+          Kg,Kb,kh=m.fit_transfer(rows,tp,gp,A,E)
+          out={'schema':'mppd.n3-shared-kernel-fit-smoke.v1','date':'2026-09-04','status':'SHARED_KERNEL_FIT_SMOKE_COMPLETED','excluded_target':'1002|2056','afc_rows':len(rows),'access':A,'egress':E,'transfer_global':Kg,'specific_transfer_kernel_count':len(Kb),'access_median_sec':math.exp(A['mu']),'egress_median_sec':math.exp(E['mu']),'transfer_global_median_sec':math.exp(Kg['mu']),'top_specific':[{'key':k,'n':v['n'],'median_sec':math.exp(v['mu']),'sigma':v['sigma']} for k,v in sorted(Kb.items(),key=lambda kv:kv[1]['n'],reverse=True)[:30]],'access_egress_history':ah,'transfer_history':kh,'boundary':['Visible-service calibration only; held target 1002|2056 excluded.','Access and transfer use interval-censored first-feasible-service likelihood; waiting is not separately fitted.','Specific transfer kernels require >=35 assigned intervals in this smoke run; otherwise pooled K is used.','Kernel fit alone is not service inversion evidence.']}
+          p=Path('$RUNNER_TEMP/n3k/out/n3_shared_kernel_fit_smoke_summary.json'); p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist kernel diagnostics
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/n3k/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,190 @@
+name: MPPD U1 Seoul Count-Free Station-Event Qualification 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-seoul-count-free-station-event-qualification-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  station-event-qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      RIDGE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_count_free_station_chain_ridge/u1_seoul_count_free_station_chain_ridge_summary.json
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_count_free_station_event_qualification
+
+    steps:
+      - name: Restore service evidence, crosswalk, and frozen ridge candidates
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u1ev/out"; cd "$RUNNER_TEMP/u1ev"
+          rclone copyto "$R:$ROOT_DRIVE/service/20260830/BMS_20260830.zip" BMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$RIDGE_DRIVE" ridge.json --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Expand free-count train intercepts to station events and score heldout service
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1ev"
+          python - <<'PY'
+          import csv,hashlib,io,json,math,re,statistics,unicodedata,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          LINE='1008'; START=datetime(2026,8,29,7); END=datetime(2026,8,29,10); FRESH=120
+          STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def hdr(s):return unicodedata.normalize('NFKC',str(s).replace('\ufeff','')).strip().lower()
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit());return int(d) if d else None
+          def final_holdout(tr):return hashlib.sha1(tr.encode()).digest()[0]%5<1
+          def pearson(x,y):
+              if len(x)<3:return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              if vx<=0 or vy<=0:return 0.0
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy)
+          def classify(st_times,seq):
+              pairs=sorted((seq[s],t.timestamp()) for s,t in st_times.items() if s in seq and seq[s] is not None)
+              if len(pairs)<4:return None
+              c=pearson([x for x,y in pairs],[y for x,y in pairs]);return ('INC' if c>0 else 'DEC') if abs(c)>=0.35 else None
+          def median_dt(vals):
+              if not vals:return None
+              return datetime.fromtimestamp(statistics.median(sorted(v.timestamp() for v in vals)))
+          def match_station_events(truth,pred,tol):
+              by_t=defaultdict(list);by_p=defaultdict(list)
+              for st,t in truth:by_t[st].append(t)
+              for st,t in pred:by_p[st].append(t)
+              ds=[];matched=0
+              for st,tt in by_t.items():
+                  pp=sorted(by_p.get(st,[]));used=set()
+                  for t in sorted(tt):
+                      cc=[(abs((p-t).total_seconds()),j) for j,p in enumerate(pp) if j not in used and abs((p-t).total_seconds())<=tol]
+                      if cc:
+                          d,j=min(cc);used.add(j);matched+=1;ds.append(d)
+              return matched,ds
+          def metric(truth,pred,tol):
+              mn,ds=match_station_events(truth,pred,tol);tn=len(truth);pn=len(pred)
+              return {'truth_n':tn,'pred_n':pn,'matched':mn,'recall':mn/tn if tn else None,'precision':mn/pn if pn else None,'f1':2*mn/(tn+pn) if tn+pn else 0,'median_abs_error_sec':statistics.median(ds) if ds else None,'p90_abs_error_sec':sorted(ds)[round((len(ds)-1)*.9)] if ds else None}
+
+          p1c=json.loads(Path('p1c.json').read_text())
+          canonical=[x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE and x.get('service_statn_id')]
+          stations={x['service_statn_id']:{'name':x.get('dv_name'),'seq':seqnum(x.get('service_statn_sn'))} for x in canonical};seq={s:v['seq'] for s,v in stations.items()}
+          pat=re.compile(r'subarr_(260829(\d{6}))');obs=defaultdict(dict)
+          with zipfile.ZipFile('BMS.zip') as z:
+              infos=[]
+              for x in z.infolist():
+                  m=pat.search(x.filename)
+                  if m and '070000'<=m.group(2)<'100000':infos.append((x,datetime.strptime('20'+m.group(1),'%Y%m%d%H%M%S')))
+              for x,snap in infos:
+                  f=zr(z,x.filename);r=csv.DictReader(f);r.fieldnames=[hdr(k) for k in (r.fieldnames or [])]
+                  for row in r:
+                      if (row.get('subway_id') or '').strip()!=LINE or (row.get('arvl_cd') or '').strip() not in {'0','1','2'}:continue
+                      t=dt(row.get('recptn_dt'));tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();state=(row.get('arvl_cd') or '').strip()
+                      if not t or not tr or st not in stations:continue
+                      age=(snap-t).total_seconds();key=(tr,st);sig=(t,state);old=obs[key].get(sig)
+                      if old is None or abs(age)<abs(old):obs[key][sig]=age
+                  f.close()
+          truth_raw=[]
+          for (tr,st),d in obs.items():
+              items=sorted((t,s,a) for (t,s),a in d.items() if -30<=a<=FRESH);trans=[]
+              for t,s,a in items:
+                  if not trans or trans[-1][1]!=s:trans.append((t,s,a))
+              prev=None
+              for t,s,a in trans:
+                  if START<=t<END and s=='1' and prev!='1':truth_raw.append((tr,st,t))
+                  prev=s
+          by_train=defaultdict(dict)
+          for tr,st,t in truth_raw:
+              if st not in by_train[tr] or t<by_train[tr][st]:by_train[tr][st]=t
+          directions={tr:classify(sts,seq) for tr,sts in by_train.items()};directions={tr:d for tr,d in directions.items() if d}
+          hidden={tr for tr in directions if final_holdout(tr)};visible={tr for tr in directions if tr not in hidden}
+
+          # Rebuild only trajectory offsets from visible service. Hidden trains never contribute to templates.
+          models={}
+          for direction in ('INC','DEC'):
+              trs=[tr for tr in visible if directions[tr]==direction]
+              coverage=Counter(s for tr in trs for s in by_train[tr]);ref=coverage.most_common(1)[0][0]
+              off=defaultdict(list)
+              for tr in trs:
+                  if ref not in by_train[tr]:continue
+                  rt=by_train[tr][ref]
+                  for s,t in by_train[tr].items():off[s].append((t-rt).total_seconds())
+              offsets={s:statistics.median(v) for s,v in off.items() if len(v)>=3}
+              models[direction]={'reference_station':ref,'offsets':offsets,'template_station_count':len(offsets)}
+
+          ridge=json.loads(Path('ridge.json').read_text())
+          candidates=[(x['direction'],datetime.fromisoformat(x['intercept_time'])) for x in ridge.get('candidate_events',[])]
+          predicted=[]
+          for direction,t0 in candidates:
+              for st,off in models[direction]['offsets'].items():
+                  tp=t0+timedelta(seconds=off)
+                  if START-timedelta(minutes=30)<=tp<END+timedelta(minutes=30):predicted.append((st,tp))
+
+          eligible_truth=[];per_train_eligible={}
+          for tr in sorted(hidden):
+              d=directions[tr];offsets=models[d]['offsets'];rows=[]
+              for st,t in by_train[tr].items():
+                  if st in offsets:
+                      eligible_truth.append((st,t));rows.append((st,t))
+              per_train_eligible[tr]=len(rows)
+
+          metrics={str(tol):metric(eligible_truth,predicted,tol) for tol in (30,60,120)}
+          result={
+            'schema':'mppd.u1-seoul-count-free-station-event-qualification.v1','date':'2026-09-04','status':'COUNT_FREE_STATION_EVENT_QUALIFICATION_COMPLETED',
+            'source_ridge_run':33830305579,'source_ridge_commit':'1144721693d92347dffabdf2c0074e960eb24708',
+            'qualified_direction_trains':len(directions),'hidden_train_count':len(hidden),'free_candidate_train_count':len(candidates),
+            'hidden_train_count_used_for_candidate_generation':False,'gap_inferred_missing_count_used':False,
+            'template_station_counts':{d:models[d]['template_station_count'] for d in models},
+            'eligible_hidden_station_events':len(eligible_truth),'predicted_station_events':len(predicted),'eligible_hidden_events_per_train':per_train_eligible,
+            'heldout_station_event_metrics':metrics,
+            'scientific_boundary':['The train-level candidate intercepts are frozen outputs from the count-free ridge run; this workflow does not regenerate or tune them.','Station trajectory offsets are learned only from final-visible qualified-direction trains.','Only hidden station events whose station has a visible-derived trajectory offset are eligible for scoring.','Public BMS evidence remains freshness-qualified operational-status evidence, not proprietary ATS truth.'],
+            'decision_rule':'A station-event-level improvement over the earlier single-station U1 baselines supports promotion of cross-station continuity as the active U1 mechanism. Full U1 PASS still requires an explicit qualification threshold and replication beyond this one Line-8 window.'
+          }
+          (OUT/'u1_seoul_count_free_station_event_qualification_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist qualification result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1ev/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

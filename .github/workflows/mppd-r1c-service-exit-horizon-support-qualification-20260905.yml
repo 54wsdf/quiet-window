@@ -1,0 +1,92 @@
+name: MPPD R1C Service Exit Horizon Support Qualification 2026-09-05
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/mppd_r1c_service_exit_horizon_support_qualification_20260905.py
+      - .github/workflows/mppd-r1c-service-exit-horizon-support-qualification-20260905.yml
+
+permissions:
+  contents: read
+
+jobs:
+  r1c-service-exit-horizon-support-qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
+      R1C_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_hierarchical_temporal_kernels_first_pass
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_service_exit_horizon_support_qualification
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+      - name: Restore R1C horizon residual substrate
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/r1c_horizon_support"; mkdir -p "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service_g1f.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1C_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/r1c_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1C_DRIVE/r1b_weighted_failure_residual_cohorts_e1.jsonl.gz" "$ROOT/residual_e1.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_horizon_support'
+          s=json.loads((root/'r1c_summary.json').read_text())
+          assert s.get('schema')=='mppd.r1c-hierarchical-temporal-kernels-first-pass.v1'
+          assert abs(float(s['iteration']['E1_passenger_posterior']['failure_mass']['TIME_INCOMPATIBLE_CHAIN'])-217.95943015297865)<1e-6
+          assert s.get('r1c_design',{}).get('service_support_mutation') is False
+          PY
+      - name: Qualify hidden service-support holes
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1c_horizon_support"
+          python -m py_compile scripts/mppd_r1c_service_exit_horizon_support_qualification_20260905.py
+          python -m scripts.mppd_r1c_service_exit_horizon_support_qualification_20260905 \
+            --p1c "$ROOT/p1c.json" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service_g1f.json" \
+            --r1c-summary "$ROOT/r1c_summary.json" --residual-cohorts "$ROOT/residual_e1.jsonl.gz" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --beam 8 --max-skip 2 --out "$ROOT/out" | tee "$ROOT/out/execution.log"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_horizon_support'/'out'
+          r=json.loads((out/'r1c_service_exit_horizon_support_qualification.json').read_text())
+          manifest={'schema':'mppd.r1c-service-exit-horizon-support-qualification-execution-manifest.v1','date':'2026-09-05','status':'R1C_SERVICE_EXIT_HORIZON_SUPPORT_QUALIFICATION_EXECUTION_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'scope':r['scope'],'output_files':{},'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='execution_manifest.json': manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"; find . -maxdepth 1 -type f ! -name output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > output_sha256.txt
+      - name: Persist horizon qualification outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r1c_horizon_support/out"
+          for f in "$ROOT"/*; do test -s "$f"; rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

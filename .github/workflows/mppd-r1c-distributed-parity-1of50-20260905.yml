@@ -1,0 +1,97 @@
+name: MPPD R1C Distributed Parity 1of50 2026-09-05
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mppd-r1c-distributed-parity-1of50-20260905.yml
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+      ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+      G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
+      MONO_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_context_aware_service_offset_consistency
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_distributed_parity_1of50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore parity substrate
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; echo "$C" > "$RUNNER_TEMP/cpath"; echo "$R" > "$RUNNER_TEMP/rname"
+          ROOT="$RUNNER_TEMP/parity"; mkdir -p "$ROOT/e0/shard_00" "$ROOT/kernels" "$ROOT/scores/shard_00" "$ROOT/offsets" "$ROOT/e1/shard_00" "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$ROOT/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$MONO_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/monolithic.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Run distributed E0 on exact hash 1-of-50
+        shell: bash
+        run: |
+          set -euo pipefail; ROOT="$RUNNER_TEMP/parity"
+          python -m scripts.mppd_r1c_distributed_posterior_shard_20260905 --phase E0 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --beam 8 --max-skip 2 --out "$ROOT/e0/shard_00"
+          python - <<'PY'
+          import json,os,pathlib
+          r=pathlib.Path(os.environ['RUNNER_TEMP'])/'parity'; e=json.loads((r/'e0/shard_00/shard_summary.json').read_text()); m=json.loads((r/'monolithic.json').read_text()); assert e['scope']['shard_cohort_count']==11061 and e['scope']['shard_passenger_mass']==12457; assert abs(e['posterior']['finite_posterior_mass']-m['iteration']['E0_passenger_posterior']['finite_posterior_mass'])<1e-9; assert e['posterior']['failure_mass']==m['iteration']['E0_passenger_posterior']['failure_mass']
+          PY
+      - name: Aggregate kernels and offsets
+        shell: bash
+        run: |
+          set -euo pipefail; ROOT="$RUNNER_TEMP/parity"
+          python -m scripts.mppd_r1c_distributed_kernel_aggregator_20260905 --stats-root "$ROOT/e0" --out "$ROOT/kernels"
+          python -m scripts.mppd_r1c_distributed_offset_score_shard_20260905 --offset-stats "$ROOT/e0/shard_00/e0_offset_sufficient_stats.jsonl.gz" --kernels "$ROOT/kernels/global_kernels.json" --out "$ROOT/scores/shard_00"
+          python -m scripts.mppd_r1c_distributed_offset_aggregator_20260905 --score-root "$ROOT/scores" --e0-root "$ROOT/e0" --service-init "$ROOT/service.json" --min-service-usage 25 --out "$ROOT/offsets"
+      - name: Run distributed E1 and compare monolithic authority
+        shell: bash
+        run: |
+          set -euo pipefail; ROOT="$RUNNER_TEMP/parity"
+          python -m scripts.mppd_r1c_distributed_posterior_shard_20260905 --phase E1 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --kernels "$ROOT/kernels/global_kernels.json" --offsets "$ROOT/offsets/global_offsets.json" --beam 8 --max-skip 2 --out "$ROOT/e1/shard_00"
+          python - <<'PY'
+          import gzip,json,math,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'parity'; mono=json.loads((root/'monolithic.json').read_text()); e0=json.loads((root/'e0/shard_00/shard_summary.json').read_text()); e1=json.loads((root/'e1/shard_00/shard_summary.json').read_text()); kernels=json.loads((root/'kernels/global_kernels.json').read_text())['kernels']; offsets=json.loads((root/'offsets/global_offsets.json').read_text())
+          m0=mono['iteration']['E0_passenger_posterior']; m1=mono['iteration']['E1_passenger_posterior']; mk=mono['iteration']['M_kernel_update']['kernels_after']; mo=mono['iteration']['M_service_timing_update']
+          assert e1['posterior']['finite_posterior_mass']==m1['finite_posterior_mass']; assert e1['posterior']['failure_mass']==m1['failure_mass']
+          kernel_diffs={}
+          for key in ('access','egress','transfer_global'):
+              a=kernels[key]['components'][0]; b=mk[key]['components'][0]; kernel_diffs[key]={'median_abs':abs(a['median_sec']-b['median_sec']),'sigma_abs':abs(a['sigma']-b['sigma'])}
+          assert max(v['median_abs'] for v in kernel_diffs.values()) < 0.02; assert max(v['sigma_abs'] for v in kernel_diffs.values()) < 2e-4
+          mono_offsets={k:int(v) for k,v in mo['nonzero_offsets'].items()}; dist_offsets={k:int(v) for k,v in offsets['nonzero_offsets'].items()}; offset_disagreement={k:(mono_offsets.get(k,0),dist_offsets.get(k,0)) for k in set(mono_offsets)|set(dist_offsets) if mono_offsets.get(k,0)!=dist_offsets.get(k,0)}
+          # Posterior comparison from shard files.
+          a={}
+          with gzip.open(root/'e0/shard_00/e0_cohort_posterior.jsonl.gz','rt',encoding='utf-8') as f:
+              for line in f:
+                  if line.strip(): r=json.loads(line); a[r['cohort_id']]=r
+          finite_both=route_changed=first_changed=tv_num=0.0
+          with gzip.open(root/'e1/shard_00/e1_cohort_posterior.jsonl.gz','rt',encoding='utf-8') as f:
+              for line in f:
+                  if not line.strip(): continue
+                  b=json.loads(line); x=a[b['cohort_id']]; mass=float(x['mass']);
+                  if x['status']=='FINITE_POSTERIOR' and b['status']=='FINITE_POSTERIOR':
+                      finite_both+=mass; route_changed+=mass*(x.get('top_route')!=b.get('top_route')); first_changed+=mass*(x.get('top_first_root')!=b.get('top_first_root')); keys=set(x.get('route_probs',{}))|set(b.get('route_probs',{})); tv_num+=mass*0.5*sum(abs(float(x.get('route_probs',{}).get(k,0))-float(b.get('route_probs',{}).get(k,0))) for k in keys)
+          movement={'top_route_changed_mass':route_changed,'top_first_service_changed_mass':first_changed,'mean_route_total_variation':tv_num/finite_both}
+          # Near ties can change a small number of 30-second grid decisions after 1 ms sufficient-stat rounding; require posterior-level parity, not bit identity of those nuisance decisions.
+          assert abs(e1['posterior']['weighted_mean_route_entropy_nats']-m1['weighted_mean_route_entropy_nats']) < 5e-4
+          assert abs(movement['top_route_changed_mass']-mono['iteration']['posterior_redistribution']['top_route_changed_mass']) <= 10
+          assert abs(movement['top_first_service_changed_mass']-mono['iteration']['posterior_redistribution']['top_first_service_changed_mass']) <= 30
+          result={'schema':'mppd.r1c-distributed-parity-1of50.v1','date':'2026-09-05','status':'R1C_DISTRIBUTED_PARITY_1OF50_PASS','scope':{'cohort_count':11061,'passenger_mass':12457},'kernel_diffs':kernel_diffs,'offset_disagreement_count':len(offset_disagreement),'offset_disagreement':offset_disagreement,'monolithic_nonzero_offset_count':len(mono_offsets),'distributed_nonzero_offset_count':len(dist_offsets),'distributed_E1':e1['posterior'],'monolithic_E1':m1,'distributed_movement':movement,'monolithic_movement':mono['iteration']['posterior_redistribution'],'scientific_boundary':['Parity is evaluated at posterior and kernel-likelihood level; millisecond sufficient-stat rounding is allowed to alter only near-tied nuisance offset grid decisions if posterior-level tolerances remain satisfied.','This parity run uses exactly the same deterministic hash modulo-50 cohort as the monolithic authority.'],'no_email_notification_logic':True}
+          (root/'out/parity_result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)); print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist parity result
+        shell: bash
+        run: |
+          set -euo pipefail; C=$(cat "$RUNNER_TEMP/cpath"); R=$(cat "$RUNNER_TEMP/rname"); ROOT="$RUNNER_TEMP/parity"
+          rclone copyto "$ROOT/out/parity_result.json" "$R:$OUT_DRIVE/parity_result.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$ROOT/kernels/global_kernels.json" "$R:$OUT_DRIVE/global_kernels.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$ROOT/offsets/global_offsets.json" "$R:$OUT_DRIVE/global_offsets.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

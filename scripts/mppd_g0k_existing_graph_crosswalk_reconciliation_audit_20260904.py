@@ -119,7 +119,6 @@ def main():
     apply_gtxa_overlay(G, meta, code_to_nodes, load_overlay(args.gtxa_overlay))
     full_idx, base_idx = graph_name_indexes(G, meta)
 
-    target_rows = []
     with open(args.codes, encoding="utf-8", newline="") as f:
         target_rows = list(csv.DictReader(f))
 
@@ -145,9 +144,9 @@ def main():
             qualified_nodes = d_nodes_in_graph
             evidence = ["P1C_D_TIER_LINE_AWARE_NODE", "TAIMS_DV_CARD_STATION_IDENTITY"]
         elif exact_nodes:
-            category = "TAIMS_EXACT_NAME_MATCH_EXISTING_GRAPH"
-            qualified_nodes = exact_nodes
-            evidence = ["TAIMS_DV_CARD_STATION_IDENTITY", "EXACT_KOREAN_STATION_NAME_MATCH_TO_CORRECTED_GRAPH"]
+            category = "TAIMS_EXACT_NAME_MATCH_EXISTING_GRAPH_REVIEW_REQUIRED"
+            qualified_nodes = []
+            evidence = ["TAIMS_DV_CARD_STATION_IDENTITY", "EXACT_KOREAN_STATION_NAME_MATCH_WITHOUT_INDEPENDENT_LINE_IDENTITY"]
         elif base_nodes:
             category = "TAIMS_BASE_NAME_MATCH_EXISTING_GRAPH_REVIEW_REQUIRED"
             qualified_nodes = []
@@ -163,7 +162,7 @@ def main():
         if len(qualified_lines) == 1:
             unique_line_touch[qualified_lines[0]] += touch_mass
 
-        result = {
+        code_results[code] = {
             "code": code,
             "touch_mass": touch_mass,
             "g0i_diagnosis": old_diag,
@@ -176,11 +175,10 @@ def main():
             "qualified_candidate_nodes": qualified_nodes,
             "qualified_candidate_node_records": [node_record(n, meta) for n in qualified_nodes],
             "qualified_candidate_lines": qualified_lines,
-            "exact_name_candidate_nodes": exact_nodes,
+            "exact_name_review_candidate_nodes": exact_nodes,
             "base_name_review_candidate_nodes": base_nodes,
             "p1c_entries": p1c_entries,
         }
-        code_results[code] = result
 
     pair_class = Counter()
     pair_count = Counter()
@@ -201,7 +199,7 @@ def main():
             o_resolved = o_now or o_new
             d_resolved = d_now or d_new
             if o_resolved and d_resolved:
-                cls = "FULLY_RECOVERABLE_BY_EXISTING_GRAPH_CROSSWALK_RECONCILIATION"
+                cls = "FULLY_RECOVERABLE_BY_LINE_AWARE_EXISTING_GRAPH_RECONCILIATION"
                 potential_mass += mass
             else:
                 missing = []
@@ -219,16 +217,16 @@ def main():
                 "passenger_mass": mass,
                 "origin_currently_mapped": o_now,
                 "destination_currently_mapped": d_now,
-                "origin_new_qualified": o_new,
-                "destination_new_qualified": d_new,
+                "origin_new_line_aware_qualified": o_new,
+                "destination_new_line_aware_qualified": d_new,
                 "reconciliation_class": cls,
             })
 
     total_pair_mass = sum(pair_class.values())
     result = {
-        "schema": "mppd.g0k-existing-graph-crosswalk-reconciliation-audit.v1",
+        "schema": "mppd.g0k-existing-graph-crosswalk-reconciliation-audit.v2-line-aware-only",
         "date": "2026-09-04",
-        "status": "G0K_EXISTING_GRAPH_CROSSWALK_RECONCILIATION_AUDIT_COMPLETED",
+        "status": "G0K_LINE_AWARE_EXISTING_GRAPH_CROSSWALK_RECONCILIATION_AUDIT_COMPLETED",
         "authority": "00_CURRENT_CORE_CLOSURE_WORKPLAN_V6_FULL_NETWORK_STATE_RECONSTRUCTION_20260904.md",
         "input": {
             "target_code_count": len(code_results),
@@ -246,13 +244,13 @@ def main():
         "fully_recoverable_share_of_residual": potential_mass / total_pair_mass if total_pair_mass else None,
         "code_results": list(sorted(code_results.values(), key=lambda x: (-x["touch_mass"], x["code"]))),
         "scientific_boundary": [
-            "A D-tier line-aware candidate is promoted only for audit when its exact P1C candidate node already exists in the corrected graph and TAIMS independently confirms the station code identity.",
-            "Exact station-name reconciliation to existing graph nodes is a crosswalk hypothesis, not passenger route truth; multiple same-name line nodes remain an explicit candidate set.",
-            "Parenthetical-stripped name matches are review-only and are not counted as qualified recoverability.",
-            "Stations with no existing corrected-graph name match require a missing-line/operator layer and are not force-mapped to a nearby or same-name node.",
-            "This audit quantifies recoverability but does not mutate the raw-AFC denominator."
+            "Only a P1C D-tier line-aware candidate whose exact candidate node already exists in the corrected graph is counted as qualified existing-graph recoverability.",
+            "TAIMS station-name equality without independent line identity is review-only because same-name collisions can map a valid code to the wrong operator or line, as demonstrated by the GTX-A defect.",
+            "Parenthetical-stripped name matches are also review-only and are never counted as qualified recoverability.",
+            "Stations with no line-aware candidate in the corrected graph require explicit line/operator reconstruction or separate line-identity evidence.",
+            "This audit quantifies conservative recoverability but does not mutate the raw-AFC denominator."
         ],
-        "next_gate": "Apply only the qualified existing-graph code reconciliation as an explicit G0K overlay, rebuild the raw-AFC denominator, then classify the still-blocked station families into missing operator/line layers.",
+        "next_gate": "Apply only line-aware qualified D-tier promotions in an explicit overlay, and separately reconstruct missing station/line/operator layers for the blocked residual before another raw-AFC denominator rebuild.",
         "no_email_notification_logic": True,
     }
 
@@ -264,7 +262,7 @@ def main():
             "taims_name_ko": x["taims_name_ko"], "taims_name_en": x["taims_name_en"], "category": x["category"],
             "qualified_candidate_nodes": "|".join(x["qualified_candidate_nodes"]),
             "qualified_candidate_lines": "|".join(x["qualified_candidate_lines"]),
-            "exact_name_candidate_nodes": "|".join(x["exact_name_candidate_nodes"]),
+            "exact_name_review_candidate_nodes": "|".join(x["exact_name_review_candidate_nodes"]),
             "base_name_review_candidate_nodes": "|".join(x["base_name_review_candidate_nodes"]),
         })
     with (outdir / "g0k_code_reconciliation_summary.csv").open("w", encoding="utf-8", newline="") as f:

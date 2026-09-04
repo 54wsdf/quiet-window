@@ -29,6 +29,7 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
     removed_inactive_codes = []
     inline_records = []
     transfer_records = []
+    unresolved_transfer_targets = []
 
     for code, spec in stations.items():
         node = str(spec.get("node") or "").strip()
@@ -96,7 +97,9 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
         if not spec.get("active"):
             continue
         source = code_to_nodes[code][0]
-        for target in spec.get("transfer_targets", []):
+        declared_targets = list(spec.get("transfer_targets", []))
+        resolved_for_station = 0
+        for target in declared_targets:
             line = str(target["line"])
             aliases = list(target.get("station_names") or [])
             matches = sorted(
@@ -104,7 +107,15 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
                 if n in G and m.get("line") == line and _name_match(m, aliases)
             )
             if not matches:
-                raise ValueError(f"GTX-A transfer target unresolved: code={code}, line={line}, names={aliases}")
+                unresolved_transfer_targets.append({
+                    "code": code,
+                    "source": source,
+                    "target_line": line,
+                    "aliases": aliases,
+                    "action": "UNRESOLVED_IN_BASE_REPRESENTATION",
+                    "scientific_boundary": "The target line/station is not explicit in the current coarse P1C/G0E graph; no synthetic transfer is guessed."
+                })
+                continue
             for target_node in matches:
                 if source == target_node:
                     continue
@@ -120,6 +131,7 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
                         observed_ats=False,
                     )
                     action = "INSERTED"
+                resolved_for_station += 1
                 transfer_records.append({
                     "code": code,
                     "source": source,
@@ -128,6 +140,8 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
                     "aliases": aliases,
                     "action": action,
                 })
+        if declared_targets and resolved_for_station == 0:
+            raise ValueError(f"GTX-A transfer station has no resolvable target in current graph: code={code}, station={spec.get('name')}")
 
     north = [code_to_nodes[c][0] for c in ["9000", "9001", "9002", "9004", "9005"]]
     south = [code_to_nodes[c][0] for c in ["9007", "9008", "9009", "9010"]]
@@ -147,8 +161,11 @@ def apply_gtxa_overlay(G, meta, code_to_nodes, overlay_or_path):
         "removed_inactive_codes": removed_inactive_codes,
         "inline_edge_records": inline_records,
         "transfer_edge_records": transfer_records,
+        "unresolved_transfer_targets": unresolved_transfer_targets,
         "north_active_nodes": north,
         "south_active_nodes": south,
         "north_south_direct_edge_forbidden": True,
-        "scientific_boundary": list(overlay.get("scientific_boundary") or []),
+        "scientific_boundary": list(overlay.get("scientific_boundary") or []) + [
+            "Declared transfer targets absent from the coarse base graph are retained as unresolved provenance records and are never guessed into existence."
+        ],
     }

@@ -1,0 +1,124 @@
+name: MPPD N1 Shanghai Topology Reconciliation V2 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-n1-shanghai-topology-reconciliation-v2-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/n1_shanghai_topology_reconciliation_v2
+    steps:
+      - name: Restore source graph assets
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone unzip
+          python -m pip install --disable-pip-version-check pyshp networkx
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/shrecv2/out"; cd "$RUNNER_TEMP/shrecv2"
+          curl -fsSL https://ndownloader.figshare.com/files/46553314 -o sections.csv
+          curl -fsSL https://ndownloader.figshare.com/files/46552816 -o rail.zip
+          unzip -q rail.zip -d rail
+
+      - name: Reconcile topology with line-aware source POI identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shrecv2"
+          python - <<'PY'
+          import csv,glob,json,re
+          from collections import defaultdict
+          from pathlib import Path
+          import networkx as nx, shapefile
+          OUT=Path('out');OUT.mkdir(exist_ok=True)
+          ACTIVE={1,2,3,4,5,6,7,8,9,10,11,12,13,16}
+          ALIAS={(1,'黄陂南路'):'一大会址·黄陂南路',(4,'浦电路4号线'):'浦电路',(6,'浦电路6号线'):'浦电路',(7,'上海大学站'):'上海大学',(10,'新天地'):'一大会址·新天地',(11,'李子园路'):'李子园',(16,'上海野生动物园'):'野生动物园'}
+          def dec(fn):
+              raw=Path(fn).read_bytes()
+              for e in ('utf-8-sig','gb18030','gb2312','cp936'):
+                  try:return raw.decode(e)
+                  except UnicodeDecodeError:pass
+              raise RuntimeError
+          def nn(s):return re.sub(r'\s+','',str(s or '').strip())
+          def canon(l,n):return nn(ALIAS.get((int(l),nn(n)),nn(n)))
+          def node(l,n):return f'{int(l)}|{canon(l,n)}'
+          def line_from_num(v):
+              try:return int(float(str(v).strip()))//100
+              except:return None
+          def parse_line(s):
+              m=re.search(r'(\d+)\s*号线',str(s or ''))
+              return int(m.group(1)) if m else None
+
+          G=nx.Graph();inline=set()
+          for r in csv.DictReader(dec('sections.csv').splitlines()):
+              l=line_from_num(r.get('Num'))
+              if l not in ACTIVE:continue
+              u=node(l,r.get('Name1'));v=node(l,r.get('Name2'))
+              G.add_node(u,line=l,name=canon(l,r.get('Name1')));G.add_node(v,line=l,name=canon(l,r.get('Name2')));G.add_edge(u,v,kind='inline');inline.add(tuple(sorted((u,v))))
+
+          shp=glob.glob('rail/**/metrostations_all84.shp',recursive=True)[0]
+          rd=shapefile.Reader(shp,encoding='gb18030',encodingErrors='replace');fields=[x[0] for x in rd.fields[1:]]
+          recs=[]
+          for sr in rd.iterShapeRecords():
+              d=dict(zip(fields,list(sr.record)));line=parse_line(d.get('ln'));name=nn(d.get('n'));poi=str(d.get('poiid') or '').strip();t=str(d.get('t') or '').strip()
+              if line not in ACTIVE or not name or not poi:continue
+              # map source physical name to line-section identity; Pudian remains line-aware through distinct POI.
+              secname=name
+              if name.startswith('浦电路') and line in (4,6):secname='浦电路'
+              secname=canon(line,secname);n=node(line,secname)
+              recs.append({'line':line,'source_name':name,'section_name':secname,'node':n,'poiid':poi,'transfer_flag':t,'in_section_graph':n in G})
+
+          bypoi=defaultdict(dict)
+          for x in recs:
+              # one physical POI / line identity
+              bypoi[x['poiid']][x['line']]=x
+          transfer_edges=set();groups=[]
+          for poi,mp in bypoi.items():
+              arr=[x for x in mp.values() if x['in_section_graph']]
+              lines={x['line'] for x in arr}
+              if len(lines)<2:continue
+              # Source POI identity across lines is the transfer identity. t should normally confirm it; record disagreements.
+              members=sorted({x['node'] for x in arr});groups.append({'poiid':poi,'members':members,'source_names':sorted({x['source_name'] for x in arr}),'transfer_flags':sorted({x['transfer_flag'] for x in arr})})
+              for i in range(len(members)):
+                  for j in range(i+1,len(members)):
+                      if members[i].split('|',1)[0]!=members[j].split('|',1)[0]:transfer_edges.add(tuple(sorted((members[i],members[j]))))
+          for u,v in transfer_edges:G.add_edge(u,v,kind='transfer')
+          comps=list(nx.connected_components(G));pudian=tuple(sorted((node(4,'浦电路'),node(6,'浦电路'))))
+          # list transfer/source diagnostics for Pudian and any source transfer-flag rows that did not create transfer identity.
+          tflag=[x for x in recs if x['transfer_flag'] not in ('0','0.0','')]
+          covered_nodes={m for g in groups for m in g['members']};uncovered_tflag=[x for x in tflag if x['node'] not in covered_nodes]
+          result={'schema':'mppd.n1-shanghai-topology-reconciliation.v2','date':'2026-09-04','status':'TOPOLOGY_RECONCILIATION_V2_EXECUTED','supersedes_run':33838655369,'method':'Active line inline edges from sections.csv; transfer edges from identical source poiid appearing on multiple active lines.','source_records_active':len(recs),'source_transfer_flag_records':len(tflag),'graph':{'nodes':G.number_of_nodes(),'edges':G.number_of_edges(),'inline_edges':len(inline),'transfer_edges':len(transfer_edges),'components':len(comps),'largest_component':max(map(len,comps)) if comps else 0},'transfer_group_count':len(groups),'pudian_road_transfer_edge_present':pudian in transfer_edges,'pudian_source_records':[x for x in recs if x['source_name'].startswith('浦电路')],'uncovered_transfer_flag_records':uncovered_tflag[:100],'transfer_groups':groups,'target_authority':{'nodes':365,'edges':445,'components':1},'matches_qualified_authority':G.number_of_nodes()==365 and G.number_of_edges()==445 and len(comps)==1 and pudian not in transfer_edges,'scientific_boundary':['Source poiid is treated as physical station identity; same-name stations with different poiid are not linked.','Pudian Road Line 4 and Line 6 have distinct source identities and must not be connected.','If exact 365/445/1 is not reproduced, the pre-existing qualified graph remains authority and this audit reports the residual discrepancy rather than guessing edges.']}
+          (OUT/'n1_shanghai_topology_reconciliation_v2_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8');print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shrecv2/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

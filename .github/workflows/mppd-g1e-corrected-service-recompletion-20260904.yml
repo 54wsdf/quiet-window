@@ -1,0 +1,111 @@
+name: MPPD G1E Corrected Service Recompletion 2026-09-04
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/mppd_g1e_corrected_service_trajectory_recompletion_20260904.py
+      - .github/workflows/mppd-g1e-corrected-service-recompletion-20260904.yml
+
+permissions:
+  contents: read
+
+jobs:
+  g1e-corrected-service-recompletion:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      SERVICE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1d_gtxa_date_aware_service_init
+      R1B_V1_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1b_first_bidirectional_joint_update_smoke
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1e_corrected_service_recompletion
+    steps:
+      - name: Checkout execution code
+        uses: actions/checkout@v4
+
+      - name: Restore G1D service and corrected graph inputs
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          ROOT="$RUNNER_TEMP/g1e"; mkdir -p "$ROOT/out" "$ROOT/audit"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SERVICE_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v3_gtxa_date_aware.json" "$ROOT/service_init_v3.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_V1_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/r1b_v1_broad_summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          cd "$ROOT"; sha256sum p1c.json service_init_v3.json r1b_v1_broad_summary.json > input_sha256.txt
+
+      - name: Recomplete service trajectories on corrected graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/g1e"
+          python -m py_compile \
+            scripts/mppd_g1e_corrected_service_trajectory_recompletion_20260904.py \
+            scripts/mppd_r1b_missing_service_support_proposal_audit_20260904.py
+          python -m scripts.mppd_g1e_corrected_service_trajectory_recompletion_20260904 \
+            --p1c "$ROOT/p1c.json" \
+            --service-init "$ROOT/service_init_v3.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --out "$ROOT/out" | tee "$ROOT/out/g1e_execution.log"
+
+          python -m scripts.mppd_r1b_missing_service_support_proposal_audit_20260904 \
+            --p1c "$ROOT/p1c.json" \
+            --service-init "$ROOT/out/seoul_20260829_0700_1000_service_state_initialization_v4_corrected_recompletion.json" \
+            --r1b-summary "$ROOT/r1b_v1_broad_summary.json" \
+            --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json \
+            --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json \
+            --nearby-edges 3 \
+            --out "$ROOT/audit" | tee "$ROOT/audit/g1e_support_reaudit.log"
+
+          cp "$ROOT/input_sha256.txt" "$ROOT/out/g1e_input_sha256.txt"
+          cp "$ROOT/audit/r1b_missing_service_support_proposal_audit_summary.json" "$ROOT/out/g1e_r1b_v1_pressure_reaudit_summary.json"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'g1e'; out=root/'out'
+          s=json.loads((out/'g1e_corrected_service_trajectory_recompletion_summary.json').read_text())
+          a=json.loads((out/'g1e_r1b_v1_pressure_reaudit_summary.json').read_text())
+          assert s.get('status') == 'G1E_CORRECTED_SERVICE_TRAJECTORY_RECOMPLETION_COMPLETED'
+          manifest={'schema':'mppd.g1e-corrected-service-recompletion-execution-manifest.v1','date':'2026-09-04','status':'G1E_EXECUTION_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'recompletion_manifest':s.get('manifest'),'pressure_reaudit_by_classification':a.get('pressure_by_classification'),'pressure_reaudit_by_line':a.get('pressure_by_line'),'output_files':{},'scientific_boundary':['G1E regenerates only completion hypotheses on corrected graph; it creates no independent service root.','The attached pressure reaudit uses the superseded R1B v1 broad pressure only as a structural diagnostic.'],'no_email_notification_logic':True}
+          for p in sorted(out.iterdir()):
+              if p.is_file() and p.name!='g1e_execution_manifest.json':
+                  manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (out/'g1e_execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          print(json.dumps({'recompletion':s.get('manifest'),'pressure_reaudit_by_classification':a.get('pressure_by_classification'),'pressure_reaudit_by_line':a.get('pressure_by_line')},ensure_ascii=False,indent=2))
+          PY
+          cd "$ROOT/out"
+          find . -maxdepth 1 -type f ! -name g1e_output_sha256.txt -print0 | sort -z | xargs -0 sha256sum > g1e_output_sha256.txt
+          cat g1e_corrected_service_trajectory_recompletion_summary.json >> "$GITHUB_STEP_SUMMARY"
+          cat g1e_r1b_v1_pressure_reaudit_summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist G1E outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/g1e/out"
+          for f in "$ROOT"/*; do
+            test -s "$f"
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$(basename "$f")" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

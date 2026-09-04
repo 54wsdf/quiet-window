@@ -39,6 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
           python -m py_compile scripts/mppd_n3_shared_kernel_joint_likelihood_20260904.py scripts/mppd_n3_targeted_line2_joint_likelihood_20260904.py
           python scripts/mppd_n3_targeted_line2_joint_likelihood_20260904.py \
             --taims "$RUNNER_TEMP/n3t/TAIMS.zip" \

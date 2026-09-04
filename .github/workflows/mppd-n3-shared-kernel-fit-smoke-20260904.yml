@@ -39,19 +39,20 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json, math
+          import json, math, os
           from pathlib import Path
           import scripts.mppd_n3_shared_kernel_joint_likelihood_20260904 as m
           old_sample=m.stable_sample
           def capped(rows,cap,salt): return old_sample(rows,min(cap,5000),salt)
           m.stable_sample=capped
-          tp,te,bl,rows=m.load_inputs('$RUNNER_TEMP/n3k/TAIMS.zip','$RUNNER_TEMP/n3k/p1c.json','$RUNNER_TEMP/n3k/service.csv')
+          root=Path(os.environ['RUNNER_TEMP'])/'n3k'
+          tp,te,bl,rows=m.load_inputs(str(root/'TAIMS.zip'),str(root/'p1c.json'),str(root/'service.csv'))
           excluded={(m.L2,'2056')}
           gp=m.make_path_cache(te,bl,excluded)
           A,E,ah=m.fit_access_egress(rows,gp)
           Kg,Kb,kh=m.fit_transfer(rows,tp,gp,A,E)
           out={'schema':'mppd.n3-shared-kernel-fit-smoke.v1','date':'2026-09-04','status':'SHARED_KERNEL_FIT_SMOKE_COMPLETED','excluded_target':'1002|2056','afc_rows':len(rows),'access':A,'egress':E,'transfer_global':Kg,'specific_transfer_kernel_count':len(Kb),'access_median_sec':math.exp(A['mu']),'egress_median_sec':math.exp(E['mu']),'transfer_global_median_sec':math.exp(Kg['mu']),'top_specific':[{'key':k,'n':v['n'],'median_sec':math.exp(v['mu']),'sigma':v['sigma']} for k,v in sorted(Kb.items(),key=lambda kv:kv[1]['n'],reverse=True)[:30]],'access_egress_history':ah,'transfer_history':kh,'boundary':['Visible-service calibration only; held target 1002|2056 excluded.','Access and transfer use interval-censored first-feasible-service likelihood; waiting is not separately fitted.','Specific transfer kernels require >=35 assigned intervals in this smoke run; otherwise pooled K is used.','Kernel fit alone is not service inversion evidence.']}
-          p=Path('$RUNNER_TEMP/n3k/out/n3_shared_kernel_fit_smoke_summary.json'); p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(out,ensure_ascii=False,indent=2))
+          p=root/'out'/'n3_shared_kernel_fit_smoke_summary.json'; p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(out,ensure_ascii=False,indent=2))
           PY
       - name: Persist kernel diagnostics
         shell: bash

@@ -1,0 +1,146 @@
+name: MPPD Direct Service Evidence Same-Line Closure 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-service-evidence-single-line-closure-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  same-line-closure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/direct_service_evidence_same_line_closure
+
+    steps:
+      - name: Restore AFC crosswalk and paired service events
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"; test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"; echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/slc/out"; cd "$RUNNER_TEMP/slc"
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Measure direct same-line passenger-chain temporal closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/slc"
+          python - <<'PY'
+          import csv,io,json,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime,timedelta
+          from pathlib import Path
+
+          LINE='1008'; RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'}; STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7); ENTRY_END=datetime(2026,8,29,8,30); OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def pct(n,d):return n/d if d else None
+          def qq(a,p):
+              if not a:return None
+              b=sorted(a);return b[round((len(b)-1)*p)]
+          def summ(a):return None if not a else {'n':len(a),'min':min(a),'p10':qq(a,.1),'median':qq(a,.5),'p90':qq(a,.9),'p99':qq(a,.99),'max':max(a)}
+
+          p1c=json.loads(Path('p1c.json').read_text());cw={x['out_stn_num']:x for x in p1c['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id')==LINE}
+          trains=defaultdict(lambda:defaultdict(list))
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  if (row.get('subway_id') or '').strip()!=LINE:continue
+                  tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'));d=dt(row.get('departure_detect_time'))
+                  if tr and st and a and d:trains[tr][st].append((a,d))
+          for tr in trains:
+              for st in trains[tr]:trains[tr][st]=sorted(set(trains[tr][st]))
+
+          # Precompute same-train directional segments by ordered event time; no timetable station-order assumption.
+          seg=defaultdict(list)
+          for tr,sts in trains.items():
+              for os,oe in sts.items():
+                  for oa,od in oe:
+                      for ds,de in sts.items():
+                          if ds==os:continue
+                          for da,dd in de:
+                              if da>od and 0<(da-od).total_seconds()<=7200:seg[(os,ds)].append((od,da,tr))
+          for k in seg:seg[k]=sorted(set(seg[k]))
+
+          passengers=[]
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b:continue
+                  os=a.get('service_statn_id');ds=b.get('service_statn_id');t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not os or not ds or os==ds or not t0 or not t1 or not (START<=t0<ENTRY_END) or t1<t0 or (t1-t0).total_seconds()>10800:continue
+                  passengers.append((t0,t1,os,ds))
+              f.close()
+
+          stages=Counter();slack=Counter();first_fail=Counter();min_late=[];access_wait=[];egress_nonneg=[]
+          for t0,t1,os,ds in passengers:
+              stages['S0_same_line_cohort']+=1
+              vv=seg.get((os,ds),[])
+              if not vv:first_fail['F1_no_same_train_structural_segment']+=1;continue
+              stages['S1_same_train_structural_segment_exists']+=1
+              after=[x for x in vv if t0<=x[0]<=t0+timedelta(minutes=45)]
+              if not after:first_fail['F2_no_origin_departure_after_entry_within_45m']+=1;continue
+              stages['S2_origin_departure_after_entry_exists']+=1
+              # Diagnostic exit slack staircase.
+              for s in (0,60,120,300,600,900,1800):
+                  if any(da<=t1+timedelta(seconds=59+s) for od,da,tr in after):slack[s]+=1
+              strict=[x for x in after if x[1]<=t1+timedelta(seconds=59)]
+              if not strict:
+                  first_fail['F3_destination_arrival_after_recorded_exit_minute']+=1
+                  min_late.append(min((da-(t1+timedelta(seconds=59))).total_seconds() for od,da,tr in after));continue
+              stages['S3_strict_exit_interval_compatible_chain_exists']+=1
+              # Choose chain with smallest nonnegative egress low bound only for diagnostics.
+              best=min(strict,key=lambda x:max(0,(t1-x[1]).total_seconds()))
+              access_wait.append((best[0]-t0).total_seconds());egress_nonneg.append(max(0,(t1-best[1]).total_seconds()))
+
+          N=stages['S0_same_line_cohort'];transferable=stages['S2_origin_departure_after_entry_exists']
+          result={'schema':'mppd.direct-service-evidence-same-line-closure.v1','date':'2026-09-04','status':'SAME_LINE_TEMPORAL_CLOSURE_DIAGNOSTIC_COMPLETED','line':LINE,'cohort_n':N,'stage_counts':{k:{'n':v,'share_of_cohort':pct(v,N)} for k,v in stages.items()},'first_failure_counts':{k:{'n':v,'share_of_cohort':pct(v,N)} for k,v in first_fail.items()},'exit_slack_staircase_sec':{str(s):{'n':slack[s],'share_of_cohort':pct(slack[s],N),'share_of_origin_temporally_supported':pct(slack[s],transferable)} for s in (0,60,120,300,600,900,1800)},'minimum_lateness_when_strict_exit_fails_sec':summ(min_late),'selected_supported_access_wait_sec':summ(access_wait),'selected_supported_egress_low_sec':summ(egress_nonneg),'scientific_boundary':['This tests whether the current freshness-qualified service-event layer can temporally close same-Line-8 AFC journeys; it is not passenger-to-train ground truth.','AFC timestamps remain minute-quantized.','Exit slack is diagnostic only, not measured egress.','No raw card identifiers are retained.'],'decision_rule':'If same-line strict closure is also weak, current BMS-derived service-event timing must be treated as partial operational anchors rather than exhaustive passenger-chain timing truth. If same-line closure is strong, investigate transfer/Line-2 direction semantics separately.'}
+          (OUT/'direct_service_same_line_closure_summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist aggregate closure diagnostic
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/slc/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

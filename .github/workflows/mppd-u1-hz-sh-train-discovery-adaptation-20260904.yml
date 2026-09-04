@@ -1,0 +1,209 @@
+name: MPPD U1 Hangzhou Shanghai Train Discovery Adaptation 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-hz-sh-train-discovery-adaptation-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-u1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      HZ_DRIVE: ResearchData/rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      SH_DRIVE: ResearchData/transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_hz_sh_train_discovery_adaptation
+
+    steps:
+      - name: Prepare runner and protected Drive config
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check pandas numpy scipy scikit-learn pyarrow
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/u1/hz" "$RUNNER_TEMP/u1/sh" "$RUNNER_TEMP/u1/out"
+
+      - name: Fetch representative high-resolution passenger observations
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1"
+          for d in 08 15 22; do
+            rclone copyto "$REMOTE_NAME:$HZ_DRIVE/record_2019-01-$d.csv.gz" "hz/record_2019-01-$d.csv.gz" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+          rclone copyto "$REMOTE_NAME:$SH_DRIVE/SPTCC-20160701.strict_metro_journeys.parquet" sh/SPTCC-20160701.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$SH_DRIVE/SPTCC-20160802.strict_metro_journeys.parquet" sh/SPTCC-20160802.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$SH_DRIVE/SPTCC-20160901.strict_metro_journeys.parquet" sh/SPTCC-20160901.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+
+      - name: Run unified density-mode and S-epoch-style adaptations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1"
+          python - <<'PY'
+          import json, math, gzip
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          from sklearn.cluster import MeanShift
+
+          OUT=Path('out'); OUT.mkdir(exist_ok=True)
+          RESOLUTIONS=[1,5,15,30,60,300]
+          BANDWIDTHS=[30,45,60,90]
+          WINDOW=(7*3600,10*3600)
+
+          def sec_of_day(ts):
+              return ts.dt.hour*3600+ts.dt.minute*60+ts.dt.second
+
+          def deterministic_sample(x, cap=9000):
+              x=np.sort(np.asarray(x,dtype=float))
+              if len(x)<=cap: return x
+              idx=np.linspace(0,len(x)-1,cap).round().astype(int)
+              return x[idx]
+
+          def cluster_modes(times,res,bw):
+              q=(np.floor(np.asarray(times,dtype=float)/res)*res).astype(float)
+              xs=deterministic_sample(q)
+              if len(xs)<30: return []
+              # Literature parameters are not fully public. This is explicitly an adaptation.
+              ms=MeanShift(bandwidth=float(bw),bin_seeding=True,cluster_all=True,min_bin_freq=2,max_iter=300)
+              labels=ms.fit_predict(xs.reshape(-1,1))
+              centers=[]
+              for lab in np.unique(labels):
+                  vals=xs[labels==lab]
+                  if len(vals)<4: continue
+                  centers.append({'center':float(np.median(vals)),'earliest':float(np.min(vals)),'n_sample':int(len(vals))})
+              centers=sorted(centers,key=lambda z:z['center'])
+              return centers
+
+          def nearest_match(a,b,tol):
+              aa=np.array([x['center'] for x in a],float); bb=np.array([x['center'] for x in b],float)
+              if len(aa)==0 or len(bb)==0: return {'matched':0,'recall':0.0,'precision':0.0,'median_abs_diff':None}
+              used=set(); dif=[]
+              for x in aa:
+                  j=int(np.argmin(np.abs(bb-x)))
+                  if j not in used and abs(bb[j]-x)<=tol:
+                      used.add(j); dif.append(abs(bb[j]-x))
+              return {'matched':len(dif),'recall':len(dif)/len(aa),'precision':len(dif)/len(bb),'median_abs_diff':float(np.median(dif)) if dif else None}
+
+          def summarize_source(source,day,events,station_col,line_col=None,line_value=None):
+              sub=events.copy()
+              if line_col is not None and line_value is not None:
+                  sub=sub[sub[line_col].astype(str)==str(line_value)]
+              sub=sub[(sub['sod']>=WINDOW[0])&(sub['sod']<WINDOW[1])]
+              counts=sub[station_col].value_counts()
+              stations=list(counts.head(12).index)
+              records=[]; candidates=[]
+              for st in stations:
+                  t=sub.loc[sub[station_col]==st,'sod'].to_numpy(dtype=float)
+                  if len(t)<100: continue
+                  per={}
+                  for res in RESOLUTIONS:
+                      per[str(res)]={}
+                      for bw in BANDWIDTHS:
+                          c=cluster_modes(t,res,bw)
+                          per[str(res)][str(bw)]=c
+                          if res in (1,60) and bw==60:
+                              for k,z in enumerate(c):
+                                  candidates.append({'source':source,'day':day,'station':str(st),'resolution_sec':res,'bandwidth_sec':bw,'candidate_index':k,'mode_center_sod':z['center'],'s_epoch_style_earliest_sod':z['earliest'],'sample_support':z['n_sample']})
+                  base=per['1']['60']
+                  for res in RESOLUTIONS:
+                      c=per[str(res)]['60']
+                      centers=[x['center'] for x in c]
+                      h=np.diff(centers) if len(centers)>=2 else np.array([])
+                      records.append({
+                          'source':source,'day':day,'station':str(st),'exit_events':int(len(t)),'resolution_sec':res,'bandwidth_sec':60,
+                          'candidate_count':len(c),'candidate_count_delta_vs_1s':len(c)-len(base),
+                          'median_candidate_headway_sec':float(np.median(h)) if len(h) else None,
+                          'match_to_1s_60':nearest_match(base,c,60),'match_to_1s_120':nearest_match(base,c,120)
+                      })
+                  # bandwidth sensitivity at native resolution
+                  for bw in BANDWIDTHS:
+                      c=per['1'][str(bw)]
+                      centers=[x['center'] for x in c]; h=np.diff(centers) if len(centers)>=2 else np.array([])
+                      records.append({'source':source,'day':day,'station':str(st),'exit_events':int(len(t)),'resolution_sec':1,'bandwidth_sec':bw,'candidate_count':len(c),'candidate_count_delta_vs_1s':None,'median_candidate_headway_sec':float(np.median(h)) if len(h) else None,'match_to_1s_60':None,'match_to_1s_120':None})
+              return records,candidates,{'source':source,'day':day,'window':'07:00-10:00','selected_stations':len(stations),'station_counts':{str(k):int(v) for k,v in counts.head(12).items()}}
+
+          all_records=[]; all_candidates=[]; profiles=[]
+          # Hangzhou: status 0 is exit under the existing source qualification. Use Line B for a dense single-line baseline.
+          for p in sorted(Path('hz').glob('*.csv.gz')):
+              day=p.name[7:17]
+              chunks=[]
+              for c in pd.read_csv(p,compression='gzip',chunksize=500000,usecols=['time','lineID','stationID','status']):
+                  c=c[(c['status']==0)&(c['lineID'].astype(str)=='B')]
+                  if len(c): chunks.append(c)
+              df=pd.concat(chunks,ignore_index=True)
+              ts=pd.to_datetime(df['time'],errors='coerce'); df=df[ts.notna()].copy(); ts=ts[ts.notna()]
+              df['sod']=sec_of_day(ts).to_numpy()
+              r,c,pr=summarize_source('HANGZHOU_AFC_EXIT_LINE_B',day,df,'stationID')
+              all_records+=r; all_candidates+=c; profiles.append(pr)
+
+          # Shanghai: deidentified strict journeys, use exit_line 2 as a dense independent second-level AFC city.
+          for p in sorted(Path('sh').glob('*.parquet')):
+              day=p.stem.split('.')[0].replace('SPTCC-','')
+              df=pd.read_parquet(p,columns=['exit_ts','exit_station','exit_line'])
+              df=df[df['exit_line'].astype(str)=='2'].copy()
+              ts=pd.to_datetime(df['exit_ts'],errors='coerce'); df=df[ts.notna()].copy(); ts=ts[ts.notna()]
+              df['sod']=sec_of_day(ts).to_numpy()
+              r,c,pr=summarize_source('SHANGHAI_SPTCC_STRICT_EXIT_LINE_2',day,df,'exit_station')
+              all_records+=r; all_candidates+=c; profiles.append(pr)
+
+          rdf=pd.DataFrame(all_records); cdf=pd.DataFrame(all_candidates)
+          rdf.to_csv(OUT/'u1_train_discovery_adaptation_metrics.csv',index=False)
+          cdf.to_csv(OUT/'u1_train_discovery_candidate_events.csv',index=False)
+          # Aggregate native-resolution cross-city stability diagnostics.
+          core=rdf[(rdf['bandwidth_sec']==60)&rdf['resolution_sec'].isin(RESOLUTIONS)].copy()
+          agg=[]
+          for (src,res),g in core.groupby(['source','resolution_sec']):
+              agg.append({'source':src,'resolution_sec':int(res),'stations_days':int(len(g)),'candidate_count_median':float(g.candidate_count.median()),'candidate_count_sum':int(g.candidate_count.sum()),'headway_median_of_station_medians':float(g.median_candidate_headway_sec.dropna().median()) if g.median_candidate_headway_sec.notna().any() else None,'match60_recall_median':float(np.median([x['recall'] for x in g.match_to_1s_60 if isinstance(x,dict)])) if res!=1 else 1.0,'match120_recall_median':float(np.median([x['recall'] for x in g.match_to_1s_120 if isinstance(x,dict)])) if res!=1 else 1.0})
+          summary={
+            'schema':'mppd.u1-train-discovery-adaptation.v1','date':'2026-09-04','status':'EXPLORATORY_REPRODUCTION_ADAPTATION_COMPLETED',
+            'methods':{
+              'density_mode':'sklearn MeanShift on deterministic capped 1D exit-time sample; bandwidth sweep 30/45/60/90 s',
+              's_epoch_style':'earliest sampled exit inside each MeanShift-derived density mode; diagnostic only, not exact Min et al. reproduction'
+            },
+            'hard_boundary':'No realized Hangzhou/Shanghai ATS truth is used. Metrics quantify method/resolution stability, not event-recovery accuracy. Exact literature parameters are not claimed.',
+            'profiles':profiles,'aggregate':agg,
+            'next_gate':'Run the identical event-discovery engine on Seoul minute AFC and score against freshness-qualified held-out direct operational events; only then report event recovery accuracy.'
+          }
+          (OUT/'u1_train_discovery_adaptation_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist U1 outputs to Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/u1/out"
+          for f in *; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

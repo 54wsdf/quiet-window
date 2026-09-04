@@ -1,0 +1,153 @@
+name: MPPD U1 Seoul Cross-Line Replication Screen 2026-09-04
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-u1-seoul-cross-line-replication-screen-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_DRIVE: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/u1_seoul_cross_line_replication_screen
+    outputs:
+      top1: ${{ steps.run.outputs.top1 }}
+      top2: ${{ steps.run.outputs.top2 }}
+      top3: ${{ steps.run.outputs.top3 }}
+      top4: ${{ steps.run.outputs.top4 }}
+      top5: ${{ steps.run.outputs.top5 }}
+
+    steps:
+      - name: Restore strict AFC crosswalk and fresh service events
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone jq
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/screen/out"; cd "$RUNNER_TEMP/screen"
+          rclone copyto "$R:$ROOT_DRIVE/passenger/20260902/TAIMS_20260902.zip" TAIMS.zip --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" p1c.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$ROOT_DRIVE/processed/service_events/20260829/am_fresh_service_event_candidates_0700_1000.csv" paired.csv --config "$C" --retries 6 --low-level-retries 15
+
+      - name: Score cross-line replication candidates
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/screen"
+          python - <<'PY'
+          import csv,io,json,math,os,statistics,zipfile
+          from collections import Counter,defaultdict
+          from datetime import datetime
+          from pathlib import Path
+
+          RAIL={'201','202','203','204','205','206','208','209','210','231','232','235','236','237','290'};STRICT={'A_TRANSFER_CODE_LINE_NAME','B_UNIQUE_NAME','C_NAME_PREFIX_LINE'}
+          START=datetime(2026,8,29,7);END=datetime(2026,8,29,10);OUT=Path('out')
+          def detect(raw):
+              for e in ('utf-8-sig','utf-8','cp949','euc-kr'):
+                  try:raw.decode(e);return e
+                  except UnicodeDecodeError:pass
+              return 'cp949'
+          def zr(z,n):
+              f=z.open(n);h=f.read(262144);f.close();e=detect(h);return io.TextIOWrapper(z.open(n),encoding=e,errors='replace',newline='')
+          def z4(s):
+              d=''.join(ch for ch in str(s or '') if ch.isdigit());return d.zfill(4) if d and len(d)<=4 else (d[-4:] if d else '')
+          def dt(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit())
+              try:return datetime.strptime(d[:14],'%Y%m%d%H%M%S') if len(d)>=14 else None
+              except:return None
+          def seqnum(v):
+              d=''.join(ch for ch in str(v or '') if ch.isdigit());return int(d) if d else None
+          def pearson(x,y):
+              if len(x)<3:return 0.0
+              mx=sum(x)/len(x);my=sum(y)/len(y);vx=sum((a-mx)**2 for a in x);vy=sum((b-my)**2 for b in y)
+              if vx<=0 or vy<=0:return 0.0
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/math.sqrt(vx*vy)
+
+          p=json.loads(Path('p1c.json').read_text());entries=[x for x in p['canonical_entries'] if x.get('tier') in STRICT and x.get('service_subway_id') and x.get('service_statn_id')]
+          cw={x['out_stn_num']:x for x in entries};seq_by_line=defaultdict(dict)
+          for x in entries:seq_by_line[x['service_subway_id']][x['service_statn_id']]=seqnum(x.get('service_statn_sn'))
+
+          service=defaultdict(lambda:defaultdict(dict));arrivals=Counter();station_event=Counter()
+          with open('paired.csv',encoding='utf-8',newline='') as f:
+              for row in csv.DictReader(f):
+                  line=(row.get('subway_id') or '').strip();tr=(row.get('btrain_no') or '').strip();st=(row.get('statn_id') or '').strip();a=dt(row.get('arrival_detect_time'))
+                  if not line or not tr or not st or not a or not (START<=a<END):continue
+                  old=service[line][tr].get(st)
+                  if old is None or a<old:service[line][tr][st]=a
+                  arrivals[line]+=1;station_event[(line,st)]+=1
+
+          afc=Counter();afc_stations=defaultdict(Counter)
+          with zipfile.ZipFile('TAIMS.zip') as z:
+              f=zr(z,'VW_KSCC_DX_CARD.csv');r=csv.DictReader(f)
+              for row in r:
+                  if (row.get('TRNS_MNS_CD') or '').strip() not in RAIL:continue
+                  a=cw.get(z4(row.get('RIDE_BSST_ID')));b=cw.get(z4(row.get('ALGH_BSST_ID')))
+                  if not a or not b or a.get('service_subway_id')!=b.get('service_subway_id'):continue
+                  t0=dt(row.get('RIDE_DTM'));t1=dt(row.get('ALGH_DTM'))
+                  if not t0 or not t1 or not (START<=t0<END and START<=t1<END) or t1<t0:continue
+                  line=a['service_subway_id'];afc[line]+=1;afc_stations[line][b['service_statn_id']]+=1
+              f.close()
+
+          rows=[]
+          for line,trs in service.items():
+              seq=seq_by_line.get(line,{})
+              qualified=0;inc=dec=0;coverage=[]
+              for tr,sts in trs.items():
+                  pairs=sorted((seq.get(s),t.timestamp()) for s,t in sts.items() if seq.get(s) is not None)
+                  if len(pairs)<4:continue
+                  c=pearson([x for x,y in pairs],[y for x,y in pairs])
+                  if abs(c)<.35:continue
+                  qualified+=1;inc+=c>0;dec+=c<0;coverage.append(len(pairs))
+              dense_stations=sum(v>=20 for v in afc_stations.get(line,{}).values())
+              # Score favors enough independently qualifiable trains, AFC mass, dense stations, and balanced directions.
+              balance=min(inc,dec) if qualified else 0
+              score=qualified*5 + min(afc.get(line,0),100000)/5000 + dense_stations*2 + balance*2
+              rows.append({'line':line,'service_arrival_rows':arrivals[line],'service_train_count':len(trs),'qualified_direction_trains':qualified,'inc_trains':inc,'dec_trains':dec,'median_qualified_station_coverage':statistics.median(coverage) if coverage else 0,'same_line_afc_rows_0700_1000':afc.get(line,0),'afc_destination_stations_ge20':dense_stations,'replication_score':score,'exclude_primary_line8':line=='1008','circularity_note':'UNKNOWN_FROM_THIS_SCREEN'})
+          rows.sort(key=lambda x:x['replication_score'],reverse=True)
+          candidates=[x for x in rows if x['line']!='1008' and x['qualified_direction_trains']>=12 and x['same_line_afc_rows_0700_1000']>=500]
+          result={'schema':'mppd.u1-seoul-cross-line-replication-screen.v1','date':'2026-09-04','status':'CROSS_LINE_SCREEN_COMPLETED','line_rows':rows,'recommended_candidates':candidates[:10],'scientific_boundary':['This screen ranks executable replication candidates only; it does not establish route topology simplicity or non-circularity.','A chosen line must still be checked for circular/branch/express semantics before running the U1 reconstruction protocol.','AFC timestamps remain minute-quantized; service events remain freshness-qualified operational-status candidates.']}
+          (OUT/'u1_seoul_cross_line_replication_screen.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          outs=[]
+          for x in candidates[:5]:outs.append(f"{x['line']}:Q{x['qualified_direction_trains']}:A{x['same_line_afc_rows_0700_1000']}:D{x['afc_destination_stations_ge20']}:I{x['inc_trains']}:O{x['dec_trains']}")
+          while len(outs)<5:outs.append('NONE')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              for i,v in enumerate(outs,1):f.write(f'top{i}={v}\n')
+          print(json.dumps({'recommended':candidates[:10]},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist screen result
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.prep.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/screen/out"
+          for f in *; do rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15; done
+
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.prep.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  shortlist:
+    needs: screen
+    runs-on: ubuntu-24.04
+    name: "U1 cross-line candidates ${{ needs.screen.outputs.top1 }} | ${{ needs.screen.outputs.top2 }} | ${{ needs.screen.outputs.top3 }} | ${{ needs.screen.outputs.top4 }} | ${{ needs.screen.outputs.top5 }}"
+    steps:
+      - run: echo replication-shortlist

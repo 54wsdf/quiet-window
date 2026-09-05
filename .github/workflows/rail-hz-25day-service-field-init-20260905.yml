@@ -35,6 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile scripts/rail_hz_daily_service_field_init_20260905.py
+          python -m py_compile scripts/rail_hz_service_root_completion_20260905.py
           python -m pip install --disable-pip-version-check --quiet numpy openpyxl
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone
@@ -121,10 +122,16 @@ jobs:
               --substrate substrate_day.json \
               --npz-output "days/record_2019-01-$d.service_init.npz" \
               --json-output "days/record_2019-01-$d.service_init.json"
+            python "$GITHUB_WORKSPACE/scripts/rail_hz_service_root_completion_20260905.py" day \
+              --day-npz "days/record_2019-01-$d.service_init.npz" \
+              --day-json "days/record_2019-01-$d.service_init.json" \
+              --prior relative_service_prior.json \
+              --output "days/record_2019-01-$d.service_roots.json"
             rm -f input.csv.gz substrate_day.json
           done
           test "$(find days -maxdepth 1 -name '*.service_init.json' | wc -l)" -eq 25
           test "$(find days -maxdepth 1 -name '*.service_init.npz' | wc -l)" -eq 25
+          test "$(find days -maxdepth 1 -name '*.service_roots.json' | wc -l)" -eq 25
 
       - name: Aggregate and enforce day-specific initialization gates
         shell: bash
@@ -135,6 +142,9 @@ jobs:
             --days-dir days \
             --prior relative_service_prior.json \
             --output HZ25_SERVICE_FIELD_INIT_SUMMARY_20260905.json
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_service_root_completion_20260905.py" aggregate \
+            --days-dir days \
+            --output HZ25_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json
 
       - name: Persist safe initialized service states to durable storage
         shell: bash
@@ -146,9 +156,10 @@ jobs:
           cd "$RUNNER_TEMP/hz_service"
           rclone copy relative_service_prior.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copy HZ25_SERVICE_FIELD_INIT_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ25_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copy days "$REMOTE_NAME:$OUT_DRIVE/days" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           echo 'persisted service-init products:'
-          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --recursive --files-only | sort | tail -n 60
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --recursive --files-only | sort | tail -n 90
 
       - name: Clean protected configuration
         if: always()

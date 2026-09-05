@@ -6,7 +6,7 @@ on:
     paths:
       - '.github/workflows/rail-hz-single-full-service-day-r1b-20260905.yml'
       - 'scripts/rail_hz_r1b_full_service_day_joint_update_20260905.py'
-      - 'scripts/rail_hz_expanded_route_support_20260905.py'
+      - 'scripts/rail_hz_expanded_route_support_v3_branch_aware_20260905.py'
   workflow_dispatch:
 
 permissions:
@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile scripts/rail_hz_expanded_route_support_20260905.py
+          python -m py_compile scripts/rail_hz_expanded_route_support_v3_branch_aware_20260905.py
           python -m py_compile scripts/rail_hz_r1b_full_service_day_joint_update_20260905.py
           python -m pip install --disable-pip-version-check --quiet numpy pandas pyarrow
           sudo apt-get update -qq
@@ -92,7 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/hz_r1b"
-          python "$GITHUB_WORKSPACE/scripts/rail_hz_expanded_route_support_20260905.py" \
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_expanded_route_support_v3_branch_aware_20260905.py" \
             --prior relative_service_prior_v2.json \
             --output expanded_route_support_k32.json \
             --k 32
@@ -102,7 +102,8 @@ jobs:
           assert x['status']=='QUALIFIED_LINE_AWARE_ROUTE_SUPPORT', x['status']
           assert x['integrity_gates']['all_endpoint_surfaces_reachable']
           assert x['integrity_gates']['no_transfer_count_filter']
-          print('route support qualified:', x['route_pair_count'], x['candidate_count'], 'max_transfer=',x['max_transfer_count_present'])
+          assert x['integrity_gates']['same_line_branch_service_change_is_representable']
+          print('route support qualified:', x['route_pair_count'], x['candidate_count'], 'max_transfer=',x['max_transfer_count_present'],'same_line_branch_pairs=',x['pairs_with_same_line_service_change_support'])
           PY
 
       - name: Execute one full-service-day R1B joint update
@@ -147,10 +148,11 @@ jobs:
             'boarding_redistribution':x['bidirectional_evidence']['updated_state_redistributes_boarding_posterior'],
             'route_or_boarding_redistribution':x['bidirectional_evidence']['updated_state_redistributes_route_posterior'] or x['bidirectional_evidence']['updated_state_redistributes_boarding_posterior'],
           }
+          qualified=all(hard.values()) and scientific['passenger_updates_temporal_kernels'] and scientific['passenger_updates_service_timing'] and scientific['route_or_boarding_redistribution']
           result={
             'schema':'rail.hz-single-full-service-day-r1b-qualification.v1',
             'date':d,
-            'status':'QUALIFIED_SINGLE_FULL_SERVICE_DAY_R1B' if all(hard.values()) and scientific['passenger_updates_temporal_kernels'] and scientific['passenger_updates_service_timing'] and scientific['route_or_boarding_redistribution'] else 'R1B_EXECUTED_SCIENTIFIC_GATE_REQUIRES_DIAGNOSIS',
+            'status':'QUALIFIED_SINGLE_FULL_SERVICE_DAY_R1B' if qualified else 'R1B_EXECUTED_SCIENTIFIC_GATE_REQUIRES_DIAGNOSIS',
             'hard_integrity_gates':hard,
             'scientific_bidirectional_gates':scientific,
             'E0':x['E0'],
@@ -162,7 +164,7 @@ jobs:
               'offset_histogram':x['service_timing_update']['offset_histogram'],
             },
             'kernel_update':x['kernel_update'],
-            'next_stage':'SINGLE_DAY_R1C_FULL_SERVICE_DAY' if all(hard.values()) and scientific['passenger_updates_temporal_kernels'] and scientific['passenger_updates_service_timing'] and scientific['route_or_boarding_redistribution'] else 'R1B_DIAGNOSIS_SAME_DAY',
+            'next_stage':'SINGLE_DAY_R1C_FULL_SERVICE_DAY' if qualified else 'R1B_DIAGNOSIS_SAME_DAY',
             'interpretation':'Small update magnitudes are not failure gates. Only missing bidirectional mechanism evidence or violated integrity requires diagnosis before R1C.'
           }
           open('HZ_SINGLE_FULL_SERVICE_DAY_2019-01-04_R1B_QUALIFICATION_20260905.json','w',encoding='utf-8').write(json.dumps(result,ensure_ascii=False,indent=2))

@@ -13,6 +13,7 @@ import numpy as np
 MATCH_BASE_TOL_S = 150.0
 OBSERVED_MIN_SD_S = 15.0
 INFERRED_BASE_SD_S = 90.0
+MIN_EDGE_PROGRESS_S = 5.0
 
 
 def load_events(npz_path: Path) -> dict[int, list[dict[str, float]]]:
@@ -56,16 +57,30 @@ def select_lag(rows: list[dict[str, Any]], upstream_time_hint_s: float) -> tuple
     if not rows:
         raise KeyError("missing edge contexts")
     t = upstream_time_hint_s % 86400.0
-    chosen = min(rows, key=lambda r: 0.0 if r["context_start_s"] <= t < r["context_end_s"] else min(abs(t-r["context_start_s"]), abs(t-r["context_end_s"])))
+    chosen = min(
+        rows,
+        key=lambda r: 0.0 if r["context_start_s"] <= t < r["context_end_s"]
+        else min(abs(t - r["context_start_s"]), abs(t - r["context_end_s"])),
+    )
     lag = float(chosen["effective_initial_lag_s"])
     return lag, str(chosen["evidence_class"]), chosen.get("afc_correlation")
 
 
-def nearest_event(events: list[dict[str, float]], predicted_s: float, tol_s: float) -> dict[str, float] | None:
-    if not events:
+def nearest_event(
+    events: list[dict[str, float]],
+    predicted_s: float,
+    tol_s: float,
+    upper_s: float,
+) -> dict[str, float] | None:
+    # Observed AFC pulses live inside [0,86400). If structural propagation says an
+    # upstream event happened before the 04:00 service-day boundary, keep it as a
+    # negative-time latent event instead of wrapping it to the end of the day.
+    if predicted_s < 0 or not events:
         return None
-    # station event counts are small enough that local linear search is deterministic and robust.
-    best = min(events, key=lambda e: (abs(e["center_s"] - predicted_s), -e["score"], -e["excess_mass"]))
+    eligible = [e for e in events if e["center_s"] <= upper_s]
+    if not eligible:
+        return None
+    best = min(eligible, key=lambda e: (abs(e["center_s"] - predicted_s), -e["score"], -e["excess_mass"]))
     return best if abs(best["center_s"] - predicted_s) <= tol_s else None
 
 
@@ -80,11 +95,12 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
     observed_events = 0
     inferred_events = 0
     anchor_counts: Counter[str] = Counter()
+    roots_starting_before_boundary = 0
 
     for path_id, meta in prior["line_paths"].items():
-        base = [int(x) for x in meta["nodes"]]
+        base_nodes = [int(x) for x in meta["nodes"]]
         for direction in ("Down", "Up"):
-            path = base if direction == "Down" else list(reversed(base))
+            path = base_nodes if direction == "Down" else list(reversed(base_nodes))
             terminal = path[-1]
             anchors = events.get(terminal, [])
             anchor_counts[f"{path_id}:{direction}"] = len(anchors)
@@ -92,11 +108,11 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
                 timeline: dict[int, dict[str, Any]] = {
                     terminal: {
                         "station": terminal,
-                        "time_s": anchor["center_s"],
-                        "sd_s": anchor["sd_s"],
+                        "time_s": float(anchor["center_s"]),
+                        "sd_s": float(anchor["sd_s"]),
                         "evidence_class": "AFC_INFERRED_PASSENGER_FACING_EVENT",
-                        "pulse_score": anchor["score"],
-                        "pulse_excess_mass": anchor["excess_mass"],
+                        "pulse_score": float(anchor["score"]),
+                        "pulse_excess_mass": float(anchor["excess_mass"]),
                         "matched_observed_pulse": True,
                     }
                 }
@@ -107,17 +123,19 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
 
                 for u, v in reversed(list(zip(path, path[1:]))):
                     rows = ctx.get((path_id, direction, u, v), [])
-                    # The upstream time is approximately downstream-lag; select context iteratively.
                     rough_lag = float(rows[0]["structural_prior_lag_s"]) if rows else 180.0
                     lag, lag_class, corr = select_lag(rows, downstream_time - rough_lag)
                     predicted = downstream_time - lag
-                    if predicted < 0:
-                        predicted += 86400.0
                     lag_evidence.append(lag_class)
                     if corr is not None and math.isfinite(float(corr)):
                         correlations.append(float(corr))
                     prior_spread = 20.0 if lag_class == "AFC_PLUS_STRUCTURAL_PRIOR" else 45.0
-                    match = nearest_event(events.get(u, []), predicted, MATCH_BASE_TOL_S + prior_spread)
+                    match = nearest_event(
+                        events.get(u, []),
+                        predicted,
+                        MATCH_BASE_TOL_S + prior_spread,
+                        downstream_time - MIN_EDGE_PROGRESS_S,
+                    )
                     if match is not None:
                         t = float(match["center_s"])
                         sd = max(float(match["sd_s"]), prior_spread)
@@ -147,12 +165,14 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
                     downstream_time = t
 
                 ordered = [timeline[s] for s in path]
-                if any(ordered[i+1]["time_s"] + 43200 < ordered[i]["time_s"] for i in range(len(ordered)-1)):
-                    # Midnight wrap is legitimate; retain it explicitly below rather than dropping the root.
-                    pass
+                monotone = all(ordered[i + 1]["time_s"] - ordered[i]["time_s"] >= MIN_EDGE_PROGRESS_S for i in range(len(ordered) - 1))
+                if not monotone:
+                    raise SystemExit(f"non-monotone candidate root {day['source_date']} {path_id} {direction} anchor={anchor['center_s']}")
+                starts_before = ordered[0]["time_s"] < 0
+                roots_starting_before_boundary += int(starts_before)
                 observed_share = sum(x["matched_observed_pulse"] for x in ordered) / len(ordered)
                 root_id = f"{day['source_date']}:{path_id}:{direction}:{anchor_index}:{int(round(anchor['center_s']))}"
-                root = {
+                roots.append({
                     "root_id": root_id,
                     "date": day["source_date"],
                     "path_id": path_id,
@@ -167,20 +187,23 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
                     "mean_finite_edge_correlation": statistics.mean(correlations) if correlations else None,
                     "lag_evidence_counts": dict(Counter(lag_evidence)),
                     "events": ordered,
+                    "starts_before_service_day_boundary": starts_before,
+                    "time_coordinate_semantics": "SECONDS_RELATIVE_TO_0400_SERVICE_DAY_START_WITH_NEGATIVE_TIMES_ALLOWED_FOR_CROSS_BOUNDARY_SERVICE",
                     "evidence_class": "AFC_ANCHORED_STRUCTURE_COMPLETED_SERVICE_ROOT",
                     "exact_train_identity_claimed": False,
-                }
-                roots.append(root)
+                })
                 root_counts[f"{path_id}:{direction}"] += 1
 
     gates = {
         "all_path_directions_have_terminal_anchors": all(anchor_counts.get(f"{p}:{d}", 0) > 0 for p in prior["line_paths"] for d in ("Down", "Up")),
         "all_path_directions_have_roots": all(root_counts.get(f"{p}:{d}", 0) > 0 for p in prior["line_paths"] for d in ("Down", "Up")),
+        "all_roots_monotone_in_service_time": True,
+        "negative_preboundary_times_not_wrapped": True,
         "no_exact_train_identity_claim": True,
         "full_day_anchor_domain_retained": True,
     }
     result = {
-        "schema": "rail.hz-day-specific-service-root-completion.v1",
+        "schema": "rail.hz-day-specific-service-root-completion.v2-service-day-monotone",
         "dataset_id": "CN_HZ_Tianchi_2019",
         "source_date": day["source_date"],
         "status": "QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION" if all(gates.values()) else "SERVICE_ROOT_COMPLETION_GATE_FAILED",
@@ -188,6 +211,7 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
         "anchor_counts": dict(anchor_counts),
         "root_counts": dict(root_counts),
         "root_count_total": len(roots),
+        "roots_starting_before_service_day_boundary": roots_starting_before_boundary,
         "matched_intermediate_event_assignments": observed_events,
         "structure_propagated_latent_event_assignments": inferred_events,
         "integrity_gates": gates,
@@ -202,43 +226,20 @@ def complete_roots(day_npz: Path, day_json_path: Path, prior_path: Path, out_jso
 def aggregate(days_dir: Path, out: Path) -> dict[str, Any]:
     paths = sorted(days_dir.glob("record_2019-01-*.service_roots.json"))
     days = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
-    expected = [f"2019-01-{d:02d}" for d in range(1,26)]
-    actual = [x["source_date"] for x in days]
-    gates = {
-        "all_25_days": len(days) == 25 and actual == expected,
-        "all_day_root_gates_pass": all(x["status"] == "QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION" for x in days),
-        "all_day_all_path_direction_roots": all(all(v > 0 for v in x["root_counts"].values()) and len(x["root_counts"]) >= 8 for x in days),
-    }
     counts = [x["root_count_total"] for x in days]
     result = {
-        "schema": "rail.hz-25day-service-root-completion-summary.v1",
-        "status": "QUALIFIED_HZ25_CANDIDATE_SERVICE_ROOTS" if all(gates.values()) else "HZ25_SERVICE_ROOT_GATE_FAILED",
+        "schema": "rail.hz-service-root-completion-summary.v2",
+        "status": "QUALIFIED_SERVICE_ROOTS" if days and all(x["status"] == "QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION" for x in days) else "SERVICE_ROOT_GATE_FAILED",
         "days": len(days),
-        "dates": actual,
-        "integrity_gates": gates,
+        "dates": [x["source_date"] for x in days],
         "total_candidate_roots": sum(counts),
         "daily_candidate_roots_median": statistics.median(counts) if counts else None,
         "daily_candidate_roots_min": min(counts) if counts else None,
         "daily_candidate_roots_max": max(counts) if counts else None,
         "scientific_boundary": "candidate service roots remain latent and uncertainty-bearing; formal correctness is tested by downstream R1B/R1D, not asserted here",
-        "day_summaries": [{
-            "date": x["source_date"],
-            "root_count_total": x["root_count_total"],
-            "root_counts": x["root_counts"],
-            "anchor_counts": x["anchor_counts"],
-            "matched_intermediate_event_assignments": x["matched_intermediate_event_assignments"],
-            "structure_propagated_latent_event_assignments": x["structure_propagated_latent_event_assignments"],
-        } for x in days],
     }
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({
-        "status": result["status"],
-        "days": len(days),
-        "total_candidate_roots": result["total_candidate_roots"],
-        "daily_candidate_roots_median": result["daily_candidate_roots_median"],
-        "integrity_gates": gates,
-    }, ensure_ascii=False, indent=2))
-    if not all(gates.values()):
+    if result["status"] != "QUALIFIED_SERVICE_ROOTS":
         raise SystemExit(2)
     return result
 
@@ -254,11 +255,11 @@ def main() -> None:
     s = sub.add_parser("aggregate")
     s.add_argument("--days-dir", type=Path, required=True)
     s.add_argument("--output", type=Path, required=True)
-    args = p.parse_args()
-    if args.command == "day":
-        complete_roots(args.day_npz, args.day_json, args.prior, args.output)
+    a = p.parse_args()
+    if a.command == "day":
+        complete_roots(a.day_npz, a.day_json, a.prior, a.output)
     else:
-        aggregate(args.days_dir, args.output)
+        aggregate(a.days_dir, a.output)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,116 @@
+name: Rail HZ R1B4 Audit Only Full-Day Parallel 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1b4-audit-only-full-day-parallel-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
+  GENEALOGY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  R1B3_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b3_realized_timetable_v2_2019-01-04_20260905
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b4_audit_2019-01-04_20260905
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  prepare-storage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Prepare canonical audit folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone mkdir "$R:$OUT_DRIVE" --config "$C"
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone mkdir "$R:$OUT_DRIVE/shard-$I" --config "$C"; done
+          rclone mkdir "$R:$OUT_DRIVE/global" --config "$C"
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  audit-genealogy-shard:
+    needs: prepare-storage
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py
+      - name: Audit one exact genealogy partition against final R1B3 timetable
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }})
+          W="$RUNNER_TEMP/r1b4-$I"; mkdir -p "$W/events"; cd "$W"
+          rclone copyto "$R:$GENEALOGY_DRIVE/partitions/genealogy-$I.edges.parquet" genealogy.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          E=()
+          for n in 0 1 2 3 4 5 6 7; do J=$(printf '%02d' "$n"); rclone copyto "$R:$R1B3_DRIVE/shard-$J/events.jsonl.gz" "events/$J.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; E+=(--r1b3-events "events/$J.jsonl.gz"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py" audit-shard \
+            --genealogy genealogy.parquet --routes routes.json "${E[@]}" --shard-index ${{ matrix.shard }} \
+            --out-summary summary.json --out-examples conflicts.jsonl.gz
+          python - <<'PY'
+          import json
+          x=json.load(open('summary.json',encoding='utf-8'))
+          assert x['status']=='COMPLETED_R1B4_AUDIT_SHARD'
+          assert all(x['qualification_gates'].values())
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto summary.json "$R:$OUT_DRIVE/shard-$I/summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto conflicts.jsonl.gz "$R:$OUT_DRIVE/shard-$I/conflicts.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  merge-audit:
+    needs: audit-genealogy-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py
+      - name: Merge full-day audit without any posterior update
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1b4-merge"; mkdir -p "$W"; cd "$W"
+          S=()
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone copyto "$R:$OUT_DRIVE/shard-$I/summary.json" "$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; S+=(--summary "$I.json"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py" merge "${S[@]}" --out-summary HZ_2019-01-04_R1B4_AUDIT_SUMMARY.json
+          python - <<'PY'
+          import json
+          x=json.load(open('HZ_2019-01-04_R1B4_AUDIT_SUMMARY.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1B4_AUDIT_COMPLETE'
+          assert all(x['qualification_gates'].values())
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto HZ_2019-01-04_R1B4_AUDIT_SUMMARY.json "$R:$OUT_DRIVE/global/HZ_2019-01-04_R1B4_AUDIT_SUMMARY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

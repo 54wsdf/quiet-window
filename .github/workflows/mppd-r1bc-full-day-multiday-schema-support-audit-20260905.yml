@@ -1,0 +1,66 @@
+name: MPPD R1BC Full-Day Multi-Day Schema Support Audit 2026-09-05
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r1bc-full-day-multiday-schema-support-audit-20260905.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      HZ_PARENT: rail_transit/CN_HZ_Tianchi_2019
+      HZ_RAW: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      SH_PARENT: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts
+      SH_STRICT: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+    steps:
+      - name: Audit city-day schemas and support assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet pandas pyarrow
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo '=== HANGZHOU PARENT TREE ==='
+          rclone lsf "$R:$HZ_PARENT" --config "$C" --recursive --files-only | sort | head -n 2000
+          echo '=== SHANGHAI PARENT TREE ==='
+          rclone lsf "$R:$SH_PARENT" --config "$C" --recursive --files-only | sort | head -n 2500
+          mkdir -p "$RUNNER_TEMP/audit"
+          rclone copyto "$R:$HZ_RAW/record_2019-01-08.csv.gz" "$RUNNER_TEMP/audit/hz.csv.gz" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$SH_STRICT/SPTCC-20160701.strict_metro_journeys.parquet" "$RUNNER_TEMP/audit/sh.parquet" --config "$C" --retries 6 --low-level-retries 15
+          python - <<'PY'
+          import pandas as pd, gzip, os
+          hz=os.path.join(os.environ['RUNNER_TEMP'],'audit','hz.csv.gz')
+          sh=os.path.join(os.environ['RUNNER_TEMP'],'audit','sh.parquet')
+          h=pd.read_csv(hz,compression='gzip',nrows=200000)
+          print('=== HZ COLUMNS ==='); print(list(h.columns))
+          print('=== HZ HEAD ==='); print(h.head(5).to_string(index=False))
+          if 'time' in h.columns:
+              t=pd.to_datetime(h['time'],errors='coerce'); print('HZ_SAMPLE_TIME_MINMAX',t.min(),t.max())
+          for c in ['lineID','stationID','status','userID','payType']:
+              if c in h.columns: print('HZ_UNIQUE',c,h[c].nunique(dropna=True),h[c].dropna().astype(str).value_counts().head(20).to_dict())
+          s=pd.read_parquet(sh)
+          print('=== SH COLUMNS ==='); print(list(s.columns))
+          print('=== SH HEAD ==='); print(s.head(5).to_string(index=False))
+          for c in ['entry_ts','exit_ts']:
+              if c in s.columns:
+                  t=pd.to_datetime(s[c],errors='coerce'); print('SH_TIME_MINMAX',c,t.min(),t.max())
+          for c in ['entry_station','exit_station','entry_line','exit_line']:
+              if c in s.columns: print('SH_UNIQUE',c,s[c].nunique(dropna=True),s[c].dropna().astype(str).value_counts().head(20).to_dict())
+          print('SH_ROWS',len(s))
+          PY
+          echo '=== AUDIT PASS ==='
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        run: |
+          C="$RUNNER_TEMP/rclone.conf"; if [[ -f "$C" ]]; then shred -u "$C" 2>/dev/null || rm -f "$C"; fi

@@ -1,0 +1,145 @@
+name: Rail HZ 25-Day City-Day Substrate 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-25day-cityday-substrate-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rail-hz-25day-cityday-substrate-20260905
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      AFC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      STATIC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/timetable_topology_aux
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_cityday_substrate_20260905
+
+    steps:
+      - name: Checkout worker code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Validate worker and install runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/rail_hz_25day_cityday_substrate_20260905.py
+          python -m pip install --disable-pip-version-check --quiet openpyxl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 2
+
+      - name: Restore protected durable-storage configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2; exit 3; }
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/hz25/days" "$RUNNER_TEMP/hz25/static"
+
+      - name: Verify all 25 source days before heavy processing
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(rclone lsf "$REMOTE_NAME:$AFC_SOURCE_DRIVE" --config "$CONFIG_FILE" --files-only | grep -E '^record_2019-01-[0-9]{2}\.csv\.gz$' | sort)
+          test "${#FILES[@]}" -eq 25
+          for d in $(seq -w 1 25); do
+            printf '%s\n' "${FILES[@]}" | grep -Fxq "record_2019-01-$d.csv.gz"
+          done
+          printf '%s\n' "${FILES[@]}" > "$RUNNER_TEMP/hz25/source_files.txt"
+          echo "qualified source file count: ${#FILES[@]}"
+
+      - name: Build full-network static substrate and relative service priors
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz25/static"
+          rclone copyto "$REMOTE_NAME:$STATIC_SOURCE_DRIVE/Metro_roadMap.csv" Metro_roadMap.csv --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$STATIC_SOURCE_DRIVE/Train Timetable.xlsx" 'Train Timetable.xlsx' --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_25day_cityday_substrate_20260905.py" static \
+            --roadmap Metro_roadMap.csv \
+            --timetable 'Train Timetable.xlsx' \
+            --output "$RUNNER_TEMP/hz25/static_substrate.json"
+          rm -f Metro_roadMap.csv 'Train Timetable.xlsx'
+
+      - name: Profile 25 complete AFC days without peak or line filtering
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz25"
+          while IFS= read -r src; do
+            echo "processing full city-day source: $src"
+            rclone copyto "$REMOTE_NAME:$AFC_SOURCE_DRIVE/$src" input.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            out="days/${src%.csv.gz}.cityday.json"
+            python "$GITHUB_WORKSPACE/scripts/rail_hz_25day_cityday_substrate_20260905.py" day \
+              --input input.csv.gz \
+              --source-file "$src" \
+              --output "$out"
+            rm -f input.csv.gz
+          done < source_files.txt
+          test "$(find days -maxdepth 1 -name '*.cityday.json' | wc -l)" -eq 25
+
+      - name: Aggregate and enforce qualification gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz25"
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_25day_cityday_substrate_20260905.py" aggregate \
+            --days-dir days \
+            --static static_substrate.json \
+            --output HZ25_CITYDAY_SUBSTRATE_SUMMARY_20260905.json
+
+      - name: Persist safe derived substrate to durable storage
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz25"
+          rclone copy source_files.txt "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy static_substrate.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ25_CITYDAY_SUBSTRATE_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy days "$REMOTE_NAME:$OUT_DRIVE/days" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          echo 'persisted files:'
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --recursive --files-only | sort | tail -n 40
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

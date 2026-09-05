@@ -1,0 +1,117 @@
+name: Rail HZ R1C2 Chain Genealogy Reweight Parallel 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1c2-chain-genealogy-reweight-parallel-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
+  SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
+  R1B1_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  R1B_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b3_fixed_joint_2019-01-04_20260905
+  R1C_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1c_transfer_2019-01-04_20260905
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  prepare-storage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Prepare exact R1C2 output paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone mkdir "$R:$R1C_DRIVE/reweight_k1/partitions" --config "$C"
+          rclone mkdir "$R:$R1C_DRIVE/reweight_k1/summaries" --config "$C"
+          rclone mkdir "$R:$R1C_DRIVE/reweight_k1/global" --config "$C"
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  reweight-shard:
+    needs: prepare-storage
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1c2_transfer_posterior_chain_reweight_20260906.py
+      - name: Reweight one exact full-day genealogy partition
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/r1c2-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$R1B1_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_2019-01-04.service_roots.json" old_roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/global/E0_GLOBAL.json" E0_GLOBAL.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B_DRIVE/global_v3_strict/HZ_2019-01-04_R1B3J_ROOT_EVENTS_STRICT.jsonl.gz" schedule.jsonl.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          FITS=()
+          for n in 0 1 2 3 4 5 6 7 8; do J=$(printf '%02d' "$n"); rclone copyto "$R:$R1C_DRIVE/generative_k1/movement-$J/result.json" "fit-$J.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; FITS+=(--k1-fit "fit-$J.json"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1c2_transfer_posterior_chain_reweight_20260906.py" process-shard \
+            --edges edges.parquet --old-roots old_roots.json --e0-global E0_GLOBAL.json --schedule schedule.jsonl.gz \
+            "${FITS[@]}" --shard-index ${{ matrix.shard }} --out-edges "part-$I.parquet" --out-summary "part-$I.json"
+          python - <<'PY'
+          import json,glob
+          x=json.load(open(glob.glob('part-*.json')[0],encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1C2_CHAIN_GENEALOGY_REWEIGHT_SHARD'
+          assert x['r1b_timetable_modified'] is False
+          print(json.dumps({k:x[k] for k in ['shard_index','passenger_mass','transfer_sensitive_passenger_mass','posterior_total_variation_mass','posterior_total_variation_share_of_transfer_sensitive','top_descendant_changed_passenger_mass','top_route_changed_passenger_mass','unsupported_transfer_candidate_lineage_mass']},ensure_ascii=False,indent=2))
+          PY
+          rclone copyto "part-$I.parquet" "$R:$R1C_DRIVE/reweight_k1/partitions/part-$I.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "part-$I.json" "$R:$R1C_DRIVE/reweight_k1/summaries/part-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  merge:
+    needs: reweight-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install merge runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1c2_transfer_posterior_chain_reweight_20260906.py
+      - name: Merge and qualify the full-day R1C2 posterior refinement
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1c2-merge"; mkdir -p "$W"; cd "$W"; S=()
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone copyto "$R:$R1C_DRIVE/reweight_k1/summaries/part-$I.json" "part-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; S+=(--summary "part-$I.json"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1c2_transfer_posterior_chain_reweight_20260906.py" merge-global "${S[@]}" --out HZ_2019-01-04_R1C2_CHAIN_GENEALOGY_REFINEMENT.json
+          python - <<'PY'
+          import json
+          x=json.load(open('HZ_2019-01-04_R1C2_CHAIN_GENEALOGY_REFINEMENT.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1C2_FULL_DAY_CHAIN_GENEALOGY_REFINEMENT'
+          assert all(x['qualification_gates'].values())
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto HZ_2019-01-04_R1C2_CHAIN_GENEALOGY_REFINEMENT.json "$R:$R1C_DRIVE/reweight_k1/global/HZ_2019-01-04_R1C2_CHAIN_GENEALOGY_REFINEMENT.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           python -m pip install --disable-pip-version-check --quiet pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          python -m py_compile scripts/rail_hz_r1b2_event_service_posterior_merge_v2_20260905.py
+          python -m py_compile scripts/rail_hz_r1b2_event_service_posterior_merge_v2_20260905.py scripts/rail_hz_r1b2_merge_diagnostic_wrapper_20260905.py
       - name: Merge existing eight qualified event-evidence shards with corrected event semantics
         shell: bash
         run: |
@@ -49,10 +49,18 @@ jobs:
           test "$(find summaries -name 'r1b2-*.summary.json' | wc -l)" -eq 8
           E=(); for f in $(find event_aggregates -name 'r1b2-*.events.parquet' | sort); do E+=(--event-file "$f"); done
           S=(); for f in $(find summaries -name 'r1b2-*.summary.json' | sort); do S+=(--summary "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b2_event_service_posterior_merge_v2_20260905.py" \
+          set +e
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b2_merge_diagnostic_wrapper_20260905.py" \
             "${E[@]}" "${S[@]}" --roots roots.json --genealogy-global genealogy_global.json \
             --out-events HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SEED.parquet \
-            --out-summary HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SUMMARY.json
+            --out-summary HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SUMMARY.json \
+            --diagnostic HZ_2019-01-04_R1B2_MERGE_DIAGNOSTIC.json 2>&1 | tee merge.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          cat HZ_2019-01-04_R1B2_MERGE_DIAGNOSTIC.json
+          rclone copy HZ_2019-01-04_R1B2_MERGE_DIAGNOSTIC.json "$R:$R1B2_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
+          rclone copy merge.log "$R:$R1B2_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
+          if [[ "$RC" -ne 0 ]]; then exit "$RC"; fi
           python - <<'PY'
           import json
           x=json.load(open('HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SUMMARY.json',encoding='utf-8'))

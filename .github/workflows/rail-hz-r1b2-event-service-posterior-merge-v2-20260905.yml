@@ -1,0 +1,65 @@
+name: Rail HZ R1B2 Event Service Posterior Merge V2 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1b2-event-service-posterior-merge-v2-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  GENEALOGY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
+  R1B2_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b2_event_service_2019-01-04_20260905
+  TARGET_DATE: '2019-01-04'
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  merge-event-posterior-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b2_event_service_posterior_merge_v2_20260905.py
+      - name: Merge existing eight qualified event-evidence shards with corrected event semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1b2-merge-v2"; mkdir -p "$W"; cd "$W"
+          mkdir -p event_aggregates summaries
+          rclone copy "$R:$R1B2_DRIVE/event_aggregates" event_aggregates --config "$C" --retries 6 --low-level-retries 15
+          rclone copy "$R:$R1B2_DRIVE/summaries" summaries --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$R:$GENEALOGY_DRIVE/global/HZ_2019-01-04_R1B1_GENEALOGY_GLOBAL.json" genealogy_global.json --config "$C" --retries 6 --low-level-retries 15
+          test "$(find event_aggregates -name 'r1b2-*.events.parquet' | wc -l)" -eq 8
+          test "$(find summaries -name 'r1b2-*.summary.json' | wc -l)" -eq 8
+          E=(); for f in $(find event_aggregates -name 'r1b2-*.events.parquet' | sort); do E+=(--event-file "$f"); done
+          S=(); for f in $(find summaries -name 'r1b2-*.summary.json' | sort); do S+=(--summary "$f"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b2_event_service_posterior_merge_v2_20260905.py" \
+            "${E[@]}" "${S[@]}" --roots roots.json --genealogy-global genealogy_global.json \
+            --out-events HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SEED.parquet \
+            --out-summary HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SUMMARY.json
+          python - <<'PY'
+          import json
+          x=json.load(open('HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SUMMARY.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1B2_EVENT_LEVEL_SERVICE_POSTERIOR_SUBSTRATE'
+          assert all(x['qualification_gates'].values())
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copy HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SEED.parquet "$R:$R1B2_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
+          rclone copy HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SUMMARY.json "$R:$R1B2_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
+          shred -u "$C" 2>/dev/null || rm -f "$C"

@@ -36,6 +36,7 @@ jobs:
           set -euo pipefail
           python -m py_compile scripts/rail_hz_daily_service_field_init_20260905.py
           python -m py_compile scripts/rail_hz_service_root_completion_20260905.py
+          python -m py_compile scripts/rail_hz_expanded_route_support_20260905.py
           python -m pip install --disable-pip-version-check --quiet numpy openpyxl
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone
@@ -77,7 +78,7 @@ jobs:
           print('qualified city-day substrate confirmed')
           PY
 
-      - name: Build relative line-direction service priors
+      - name: Build relative line-direction service priors and line-aware route support
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
@@ -101,6 +102,10 @@ jobs:
           if missing_edges: raise SystemExit(f'missing directed relative priors: {len(missing_edges)}')
           print('relative priors qualified:', len(edges), 'directed edges')
           PY
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_expanded_route_support_20260905.py" \
+            --prior relative_service_prior.json \
+            --output expanded_route_support_k32.json \
+            --k 32
 
       - name: Initialize one full-day passenger-facing service field per date
         shell: bash
@@ -155,6 +160,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/hz_service"
           rclone copy relative_service_prior.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy expanded_route_support_k32.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copy HZ25_SERVICE_FIELD_INIT_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copy HZ25_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone copy days "$REMOTE_NAME:$OUT_DRIVE/days" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15

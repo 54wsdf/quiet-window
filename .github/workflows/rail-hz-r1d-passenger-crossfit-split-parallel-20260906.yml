@@ -1,0 +1,99 @@
+name: Rail HZ R1D Passenger Crossfit Split Parallel 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1d-passenger-crossfit-split-parallel-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  R1B1_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  R1D_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1d_crossfit_2019-01-04_20260906
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Prepare exact output directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          for d in train heldout summaries; do rclone mkdir "$R:$R1D_DRIVE/split/$d" --config "$C"; done
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  split:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1d_passenger_crossfit_split_20260906.py
+      - name: Split one exact genealogy partition by whole cohort
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/r1d-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$R1B1_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1d_passenger_crossfit_split_20260906.py" --edges edges.parquet --shard-index ${{ matrix.shard }} --folds 5 --heldout-fold 0 --train-out train.parquet --heldout-out heldout.parquet --summary-out summary.json
+          rclone copyto train.parquet "$R:$R1D_DRIVE/split/train/part-$I.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto heldout.parquet "$R:$R1D_DRIVE/split/heldout/part-$I.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto summary.json "$R:$R1D_DRIVE/split/summaries/part-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  qualify:
+    needs: split
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Qualify global split mass and balance
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1d-qual"; mkdir -p "$W"; cd "$W"
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone copyto "$R:$R1D_DRIVE/split/summaries/part-$I.json" "part-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          python - <<'PY'
+          import glob,json
+          xs=[json.load(open(p,encoding='utf-8')) for p in sorted(glob.glob('part-*.json'))]
+          assert len(xs)==8 and all(x['status']=='QUALIFIED_R1D_PASSENGER_CROSSFIT_SPLIT_SHARD' for x in xs)
+          out={'schema':'rail.hz-r1d-passenger-crossfit-split-global.v1','status':'QUALIFIED_R1D_PASSENGER_CROSSFIT_SPLIT','service_date':'2019-01-04','folds':5,'heldout_fold':0}
+          for side in ['train','heldout']:
+              out[side]={k:sum(float(x[side][k]) for x in xs) for k in ['cohort_count','edge_count','passenger_mass','resolved_mass','unresolved_mass']}
+          total=out['train']['passenger_mass']+out['heldout']['passenger_mass']
+          out['total_passenger_mass']=total
+          out['heldout_share']=out['heldout']['passenger_mass']/total
+          out['mass_conservation_abs_error']=abs(total-1206156.0)
+          out['scientific_semantics']={'whole_cohort_split':True,'split_before_parameter_refit':True,'heldout_forbidden_from_parameter_estimation':True,'candidate_inventory_frozen_so_validation_is_conditional_at_this_stage':True}
+          assert out['mass_conservation_abs_error']<=1e-6
+          assert 0.18<=out['heldout_share']<=0.22
+          open('HZ_2019-01-04_R1D_CROSSFIT_SPLIT.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2,sort_keys=True))
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto HZ_2019-01-04_R1D_CROSSFIT_SPLIT.json "$R:$R1D_DRIVE/split/HZ_2019-01-04_R1D_CROSSFIT_SPLIT.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

@@ -1,0 +1,198 @@
+name: Rail HZ 24 Full-Service-Day Service Init 2026-09-05
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rail-hz-24-full-service-day-service-init-20260905
+  cancel-in-progress: false
+
+jobs:
+  initialize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      AFC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      STATIC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/timetable_topology_aux
+      DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_service_init_20260905
+
+    steps:
+      - name: Checkout worker code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Validate worker and install runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/rail_hz_daily_service_field_init_20260905.py
+          python -m py_compile scripts/rail_hz_full_service_day_service_init_20260905.py
+          python -m py_compile scripts/rail_hz_service_root_completion_20260905.py
+          python -m py_compile scripts/rail_hz_expanded_route_support_20260905.py
+          python -m pip install --disable-pip-version-check --quiet numpy openpyxl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Restore protected storage configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/hz_service/passenger_summaries" "$RUNNER_TEMP/hz_service/days"
+
+      - name: Require qualified 24 complete full-service-day passenger domain
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_service"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/HZ24_FULL_SERVICE_DAY_PASSENGER_DOMAIN_SUMMARY_20260905.json" passenger_domain_summary.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy "$REMOTE_NAME:$DOMAIN_DRIVE/summaries" passenger_summaries --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          python - <<'PY'
+          import json
+          x=json.load(open('passenger_domain_summary.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_HZ24_COMPLETE_FULL_SERVICE_DAY_PASSENGER_DOMAIN', x['status']
+          assert x['complete_service_days']==24
+          assert x['boundary_hour']==4
+          assert x['total_cross_midnight_valid_journeys']>0
+          print('qualified HZ24 passenger domain confirmed')
+          PY
+
+      - name: Build relative service priors and full-network line-aware route support
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_service"
+          rclone copyto "$REMOTE_NAME:$STATIC_SOURCE_DRIVE/Train Timetable.xlsx" 'Train Timetable.xlsx' --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_daily_service_field_init_20260905.py" prior --timetable 'Train Timetable.xlsx' --output relative_service_prior.json
+          rm -f 'Train Timetable.xlsx'
+          python - <<'PY'
+          import json
+          x=json.load(open('relative_service_prior.json',encoding='utf-8'))
+          expected={'B_main:Down','B_main:Up','B_branch:Down','B_branch:Up','C_main:Down','C_main:Up','A_main:Down','A_main:Up'}
+          present={k for k,v in x['path_sequence_counts'].items() if v>0}
+          missing=sorted(expected-present)
+          if missing: raise SystemExit(f'missing full-route structural sequences: {missing}')
+          missing_edges=[e for e in x['edges'] if e['arrival_to_arrival_lag_sec_median'] is None]
+          if missing_edges: raise SystemExit(f'missing directed relative priors: {len(missing_edges)}')
+          print('relative priors qualified:', len(x['edges']))
+          PY
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_expanded_route_support_20260905.py" --prior relative_service_prior.json --output expanded_route_support_k32.json --k 32
+
+      - name: Accumulate all 25 calendar files into 24 complete service-day exit fields
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_service"
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_full_service_day_service_init_20260905.py" init-store --store exit_counts.dat --meta exit_store_meta.json
+          for d in $(seq -w 1 25); do
+            src="record_2019-01-$d.csv.gz"
+            echo "accumulating $src into 04:00 service-day field"
+            rclone copyto "$REMOTE_NAME:$AFC_SOURCE_DRIVE/$src" input.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            python "$GITHUB_WORKSPACE/scripts/rail_hz_full_service_day_service_init_20260905.py" accumulate --input input.csv.gz --source-file "$src" --store exit_counts.dat --meta exit_store_meta.json
+            rm -f input.csv.gz
+          done
+
+      - name: Finalize 24 service fields and uncertainty-bearing candidate service roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_service"
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_full_service_day_service_init_20260905.py" finalize \
+            --store exit_counts.dat \
+            --meta exit_store_meta.json \
+            --prior relative_service_prior.json \
+            --passenger-domain-dir passenger_summaries \
+            --out-dir days
+          rm -f exit_counts.dat
+          for d in $(seq -w 1 24); do
+            date="2019-01-$d"
+            python "$GITHUB_WORKSPACE/scripts/rail_hz_service_root_completion_20260905.py" day \
+              --day-npz "days/$date.service_init.npz" \
+              --day-json "days/$date.service_init.json" \
+              --prior relative_service_prior.json \
+              --output "days/record_$date.service_roots.json"
+          done
+          python - <<'PY'
+          import json, statistics
+          from pathlib import Path
+          paths=sorted(Path('days').glob('record_2019-01-*.service_roots.json'))
+          x=[json.loads(p.read_text(encoding='utf-8')) for p in paths]
+          expected=[f'2019-01-{d:02d}' for d in range(1,25)]
+          actual=[r['source_date'] for r in x]
+          gates={
+            'exactly_24_complete_service_days':len(x)==24 and actual==expected,
+            'all_day_root_gates_pass':all(r['status']=='QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION' for r in x),
+            'all_day_all_path_direction_roots':all(len(r['root_counts'])>=8 and all(v>0 for v in r['root_counts'].values()) for r in x),
+            'no_exact_train_identity_claim':all(not any(root['exact_train_identity_claimed'] for root in r['roots']) for r in x),
+          }
+          counts=[r['root_count_total'] for r in x]
+          result={
+            'schema':'rail.hz24-complete-service-day-service-root-summary.v1',
+            'status':'QUALIFIED_HZ24_CANDIDATE_SERVICE_ROOTS' if all(gates.values()) else 'HZ24_SERVICE_ROOT_GATE_FAILED',
+            'complete_service_days':24,
+            'integrity_gates':gates,
+            'total_candidate_roots':sum(counts),
+            'daily_candidate_roots_median':statistics.median(counts),
+            'daily_candidate_roots_min':min(counts),
+            'daily_candidate_roots_max':max(counts),
+            'scientific_boundary':'candidate service roots are uncertainty-bearing latent hypotheses; downstream R1B/R1D must test them',
+            'day_summaries':[{'date':r['source_date'],'root_count_total':r['root_count_total'],'root_counts':r['root_counts'],'anchor_counts':r['anchor_counts'],'matched_intermediate_event_assignments':r['matched_intermediate_event_assignments'],'structure_propagated_latent_event_assignments':r['structure_propagated_latent_event_assignments']} for r in x],
+          }
+          Path('HZ24_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'status':result['status'],'total_candidate_roots':result['total_candidate_roots'],'daily_candidate_roots_median':result['daily_candidate_roots_median'],'integrity_gates':gates},ensure_ascii=False,indent=2))
+          if not all(gates.values()): raise SystemExit(2)
+          PY
+
+      - name: Persist initialized full-service-day state products
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_service"
+          rclone copy passenger_domain_summary.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy exit_store_meta.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy relative_service_prior.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy expanded_route_support_k32.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy days/HZ24_SERVICE_FIELD_INIT_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ24_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy days "$REMOTE_NAME:$OUT_DRIVE/days" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 4
+          echo 'persisted service-init products:'
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --recursive --files-only | sort | tail -n 100
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

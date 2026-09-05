@@ -1,0 +1,63 @@
+name: MPPD R1C Distributed Parity Kernel Diagnostic V3 2026-09-05
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mppd-r1c-distributed-parity-kernel-diagnostic-v3-20260905.yml
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+  BASE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904
+  ROUTE_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r0_full_network_route_ensemble_g0h_gtxa
+  G1F_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/g1f_observed_event_preserving_recompletion
+  MONO_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_context_aware_service_offset_consistency
+  OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_distributed_parity_kernel_diagnostic_v3
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore exact parity substrate
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet networkx scipy numpy
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"; R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; echo "$C" > "$RUNNER_TEMP/cpath"; echo "$R" > "$RUNNER_TEMP/rname"
+          ROOT="$RUNNER_TEMP/parity_diag"; mkdir -p "$ROOT/e0/shard_00" "$ROOT/kernels" "$ROOT/out"
+          rclone copyto "$R:$SEOUL_ROOT/99_manifests/seoul_p1c_line_aware_crosswalk_20260903.json" "$ROOT/p1c.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASE_DRIVE/g0h_gtxa_corrected_cohort_rebuild/seoul_20260829_0700_1000_afc_time_cohorts_g0h.csv.gz" "$ROOT/cohorts.csv.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/r0_full_network_route_ensemble_candidates.jsonl.gz" "$ROOT/routes.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$G1F_DRIVE/seoul_20260829_0700_1000_service_state_initialization_v5_observed_event_preserving_recompletion.json" "$ROOT/service.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$MONO_DRIVE/r1b_first_bidirectional_joint_update_smoke_summary.json" "$ROOT/monolithic.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Rebuild exact sufficient statistics and quantify kernel parity
+        shell: bash
+        run: |
+          set -euo pipefail; ROOT="$RUNNER_TEMP/parity_diag"
+          python -m scripts.mppd_r1c_distributed_posterior_shard_v3_raw_movement_20260905 --phase E0 --shard-count 50 --shard-id 0 --p1c "$ROOT/p1c.json" --cohorts "$ROOT/cohorts.csv.gz" --routes "$ROOT/routes.jsonl.gz" --service-init "$ROOT/service.json" --topology-patch manifests/mppd_seoul_topology_patch_g0e_20260904.json --gtxa-overlay manifests/mppd_seoul_gtxa_crosswalk_overlay_g0h_20260904.json --beam 8 --max-skip 2 --out "$ROOT/e0/shard_00"
+          python -m scripts.mppd_r1c_distributed_kernel_aggregator_v2_raw_movement_20260905 --stats-root "$ROOT/e0" --out "$ROOT/kernels"
+          python - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'parity_diag'
+          mono=json.loads((root/'monolithic.json').read_text()); mk=mono['iteration']['M_kernel_update']['kernels_after']
+          dist=json.loads((root/'kernels/global_kernels.json').read_text())['kernels']
+          rows=[]
+          for movement in sorted(mk['transfer_by_movement']):
+              a=dist['transfer_by_movement'][movement]['components'][0]; b=mk['transfer_by_movement'][movement]['components'][0]
+              rows.append({'movement':movement,'median_abs':abs(float(a['median_sec'])-float(b['median_sec'])),'sigma_abs':abs(float(a['sigma'])-float(b['sigma'])),'dist_median':a['median_sec'],'mono_median':b['median_sec'],'dist_sigma':a['sigma'],'mono_sigma':b['sigma']})
+          rows.sort(key=lambda x:(x['median_abs'],x['sigma_abs']),reverse=True)
+          globals={}
+          for key in ('access','egress','transfer_global'):
+              a=dist[key]['components'][0]; b=mk[key]['components'][0]; globals[key]={'median_abs':abs(float(a['median_sec'])-float(b['median_sec'])),'sigma_abs':abs(float(a['sigma'])-float(b['sigma']))}
+          result={'schema':'mppd.r1c-distributed-parity-kernel-diagnostic.v3','date':'2026-09-05','movement_count':len(rows),'global_diffs':globals,'movement_max_median_abs':max(x['median_abs'] for x in rows),'movement_max_sigma_abs':max(x['sigma_abs'] for x in rows),'top_20_movement_diffs':rows[:20],'no_email_notification_logic':True}
+          (root/'out/kernel_parity_diagnostic.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)); print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+          C=$(cat "$RUNNER_TEMP/cpath"); R=$(cat "$RUNNER_TEMP/rname"); rclone copyto "$ROOT/out/kernel_parity_diagnostic.json" "$R:$OUT_DRIVE/kernel_parity_diagnostic.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

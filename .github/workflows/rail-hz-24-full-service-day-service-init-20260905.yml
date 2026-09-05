@@ -1,6 +1,10 @@
 name: Rail HZ 24 Full-Service-Day Service Init 2026-09-05
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-24-full-service-day-service-init-20260905.yml'
   workflow_dispatch:
 
 permissions:
@@ -20,6 +24,7 @@ jobs:
       STATIC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/timetable_topology_aux
       DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
       OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_service_init_20260905
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout worker code
@@ -149,11 +154,13 @@ jobs:
             'exactly_24_complete_service_days':len(x)==24 and actual==expected,
             'all_day_root_gates_pass':all(r['status']=='QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION' for r in x),
             'all_day_all_path_direction_roots':all(len(r['root_counts'])>=8 and all(v>0 for v in r['root_counts'].values()) for r in x),
+            'all_roots_monotone_service_time':all(r['integrity_gates'].get('all_roots_monotone_in_service_time',False) for r in x),
+            'negative_preboundary_times_not_wrapped':all(r['integrity_gates'].get('negative_preboundary_times_not_wrapped',False) for r in x),
             'no_exact_train_identity_claim':all(not any(root['exact_train_identity_claimed'] for root in r['roots']) for r in x),
           }
           counts=[r['root_count_total'] for r in x]
           result={
-            'schema':'rail.hz24-complete-service-day-service-root-summary.v1',
+            'schema':'rail.hz24-complete-service-day-service-root-summary.v2',
             'status':'QUALIFIED_HZ24_CANDIDATE_SERVICE_ROOTS' if all(gates.values()) else 'HZ24_SERVICE_ROOT_GATE_FAILED',
             'complete_service_days':24,
             'integrity_gates':gates,
@@ -161,11 +168,12 @@ jobs:
             'daily_candidate_roots_median':statistics.median(counts),
             'daily_candidate_roots_min':min(counts),
             'daily_candidate_roots_max':max(counts),
+            'total_roots_starting_before_service_day_boundary':sum(r.get('roots_starting_before_service_day_boundary',0) for r in x),
             'scientific_boundary':'candidate service roots are uncertainty-bearing latent hypotheses; downstream R1B/R1D must test them',
-            'day_summaries':[{'date':r['source_date'],'root_count_total':r['root_count_total'],'root_counts':r['root_counts'],'anchor_counts':r['anchor_counts'],'matched_intermediate_event_assignments':r['matched_intermediate_event_assignments'],'structure_propagated_latent_event_assignments':r['structure_propagated_latent_event_assignments']} for r in x],
+            'day_summaries':[{'date':r['source_date'],'root_count_total':r['root_count_total'],'root_counts':r['root_counts'],'anchor_counts':r['anchor_counts'],'roots_starting_before_service_day_boundary':r.get('roots_starting_before_service_day_boundary',0),'matched_intermediate_event_assignments':r['matched_intermediate_event_assignments'],'structure_propagated_latent_event_assignments':r['structure_propagated_latent_event_assignments']} for r in x],
           }
           Path('HZ24_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
-          print(json.dumps({'status':result['status'],'total_candidate_roots':result['total_candidate_roots'],'daily_candidate_roots_median':result['daily_candidate_roots_median'],'integrity_gates':gates},ensure_ascii=False,indent=2))
+          print(json.dumps({'status':result['status'],'total_candidate_roots':result['total_candidate_roots'],'daily_candidate_roots_median':result['daily_candidate_roots_median'],'total_roots_starting_before_service_day_boundary':result['total_roots_starting_before_service_day_boundary'],'integrity_gates':gates},ensure_ascii=False,indent=2))
           if not all(gates.values()): raise SystemExit(2)
           PY
 

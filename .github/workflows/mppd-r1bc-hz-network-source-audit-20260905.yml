@@ -1,0 +1,54 @@
+name: MPPD R1BC Hangzhou Network Source Audit 2026-09-05
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r1bc-hz-network-source-audit-20260905.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT: rail_transit/CN_HZ_Tianchi_2019
+    steps:
+      - name: Inspect network and OD source schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet pandas openpyxl
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          mkdir -p "$RUNNER_TEMP/hz"
+          for f in Metro_roadMap.csv Metro_od.csv Metro_roadMap_splitLineMode.csv Metro_roadMap_splitLineMode_time.csv; do
+            rclone copyto "$R:$ROOT/$f" "$RUNNER_TEMP/hz/$f" --config "$C" --retries 6 --low-level-retries 15
+          done
+          python - <<'PY'
+          import pandas as pd, os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'hz')
+          for f in ['Metro_roadMap.csv','Metro_od.csv','Metro_roadMap_splitLineMode.csv','Metro_roadMap_splitLineMode_time.csv']:
+              p=os.path.join(root,f)
+              print('\n===',f,'===')
+              for enc in ['utf-8-sig','gb18030']:
+                  try:
+                      d=pd.read_csv(p,encoding=enc)
+                      break
+                  except UnicodeDecodeError: pass
+              print('shape',d.shape)
+              print('columns',list(d.columns))
+              print(d.head(20).to_string(index=False))
+              for c in d.columns:
+                  if d[c].nunique(dropna=True)<=100:
+                      print('UNIQUE',c,d[c].nunique(dropna=True),d[c].dropna().astype(str).value_counts().head(30).to_dict())
+          PY
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        run: |
+          C="$RUNNER_TEMP/rclone.conf"; if [[ -f "$C" ]]; then shred -u "$C" 2>/dev/null || rm -f "$C"; fi

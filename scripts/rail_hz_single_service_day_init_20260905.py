@@ -136,8 +136,8 @@ def run(inputs: list[Path], target_date: str, prior_path: Path, passenger_summar
     station_event_counts, arrays = detect_events(counts)
     contexts, finite, total, fallback_contexts = propagation_contexts(counts, prior)
 
-    npz_path = out_prefix.with_suffix(".npz")
-    json_path = out_prefix.with_suffix(".json")
+    npz_path = Path(str(out_prefix) + ".npz")
+    json_path = Path(str(out_prefix) + ".json")
     np.savez_compressed(
         npz_path,
         bin_s=np.array([BIN_S], dtype=np.int32),

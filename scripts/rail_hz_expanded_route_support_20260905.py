@@ -6,7 +6,7 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 TRANSFER_RANKING_PENALTY_S = 300.0
 DEFAULT_K = 32
@@ -28,30 +28,32 @@ def build_graph(prior: dict[str, Any]) -> dict[tuple[int, str], list[tuple[tuple
     graph: dict[tuple[int, str], list[tuple[tuple[int, str], float, dict[str, Any]]]] = defaultdict(list)
     _by_line, by_station = line_membership(prior["line_paths"])
 
-    # Use the best available directed structural runtime for each station-line edge.
-    edge_best: dict[tuple[int, str, int, str], tuple[float, dict[str, Any]]] = {}
+    # A shared physical edge may belong to more than one service family. Keep every
+    # compatible family instead of selecting one path_id prematurely.
+    edge_options: dict[tuple[int, str, int, str], list[dict[str, Any]]] = defaultdict(list)
     for e in prior["edges"]:
         lag = e.get("arrival_to_arrival_lag_sec_median")
         if lag is None:
             continue
         line = str(e["afc_line"])
         u, v = int(e["from_station"]), int(e["to_station"])
-        key = (u, line, v, line)
-        meta = {
+        edge_options[(u, line, v, line)].append({
+            "path_id": str(e["path_id"]),
+            "direction": str(e["direction"]),
+            "structural_runtime_s": float(lag),
+        })
+
+    for (u, line_u, v, line_v), options in edge_options.items():
+        options = sorted(options, key=lambda x: (x["structural_runtime_s"], x["path_id"], x["direction"]))
+        ranking_cost = min(x["structural_runtime_s"] for x in options)
+        graph[(u, line_u)].append(((v, line_v), ranking_cost, {
             "kind": "RIDE",
-            "line": line,
-            "path_id": e["path_id"],
-            "direction": e["direction"],
+            "line": line_u,
             "from_station": u,
             "to_station": v,
-            "structural_runtime_s": float(lag),
-        }
-        old = edge_best.get(key)
-        if old is None or float(lag) < old[0]:
-            edge_best[key] = (float(lag), meta)
-
-    for (u, line_u, v, line_v), (cost, meta) in edge_best.items():
-        graph[(u, line_u)].append(((v, line_v), cost, meta))
+            "ranking_runtime_s": ranking_cost,
+            "service_options": options,
+        }))
 
     for station, lines in by_station.items():
         lines = sorted(lines)
@@ -68,25 +70,18 @@ def build_graph(prior: dict[str, Any]) -> dict[tuple[int, str], list[tuple[tuple
                     "scientific_semantics": "candidate-ranking penalty only; transfer-time likelihood is inferred later by Theta_K",
                 }))
 
-    # Deterministic order makes support generation replayable.
     for state in graph:
         graph[state].sort(key=lambda x: (x[1], x[0][0], x[0][1], x[2]["kind"]))
     return graph
 
 
-def shortest_path(
-    graph: dict[tuple[int, str], list[tuple[tuple[int, str], float, dict[str, Any]]]],
-    start: tuple[int, str],
-    goal: tuple[int, str],
-    banned_nodes: set[tuple[int, str]] | None = None,
-    banned_edges: set[tuple[tuple[int, str], tuple[int, str]]] | None = None,
-) -> tuple[float, list[tuple[int, str]], list[dict[str, Any]]] | None:
+def shortest_path(graph, start, goal, banned_nodes=None, banned_edges=None):
     banned_nodes = banned_nodes or set()
     banned_edges = banned_edges or set()
     if start in banned_nodes or goal in banned_nodes:
         return None
-    heap: list[tuple[float, tuple[tuple[int, str], ...], tuple[int, str], list[dict[str, Any]]]] = [(0.0, (start,), start, [])]
-    best: dict[tuple[int, str], float] = {start: 0.0}
+    heap = [(0.0, (start,), start, [])]
+    best = {start: 0.0}
     while heap:
         cost, path_tuple, u, edge_meta = heapq.heappop(heap)
         if cost > best.get(u, math.inf) + 1e-12:
@@ -103,9 +98,9 @@ def shortest_path(
     return None
 
 
-def path_cost(graph, states: list[tuple[int, str]]) -> tuple[float, list[dict[str, Any]]]:
+def path_cost(graph, states):
     total = 0.0
-    metas: list[dict[str, Any]] = []
+    metas = []
     for u, v in zip(states, states[1:]):
         opts = [(w, m) for vv, w, m in graph.get(u, []) if vv == v]
         if not opts:
@@ -116,21 +111,19 @@ def path_cost(graph, states: list[tuple[int, str]]) -> tuple[float, list[dict[st
     return total, metas
 
 
-def yen_k_shortest_simple_paths(graph, start, goal, k: int) -> list[tuple[float, list[tuple[int, str]], list[dict[str, Any]]]]:
+def yen_k_shortest_simple_paths(graph, start, goal, k):
     first = shortest_path(graph, start, goal)
     if first is None:
         return []
     accepted = [first]
-    candidates: list[tuple[float, tuple[tuple[int, str], ...], list[dict[str, Any]]]] = []
-    candidate_keys: set[tuple[tuple[int, str], ...]] = set()
-
+    candidates = []
+    candidate_keys = set()
     for _ in range(1, k):
-        prev_cost, prev_states, _prev_meta = accepted[-1]
-        del prev_cost
+        _prev_cost, prev_states, _prev_meta = accepted[-1]
         for i in range(len(prev_states) - 1):
             spur = prev_states[i]
             root = prev_states[: i + 1]
-            banned_edges: set[tuple[tuple[int, str], tuple[int, str]]] = set()
+            banned_edges = set()
             for _c, states, _m in accepted:
                 if len(states) > i and states[: i + 1] == root:
                     banned_edges.add((states[i], states[i + 1]))
@@ -154,14 +147,52 @@ def yen_k_shortest_simple_paths(graph, start, goal, k: int) -> list[tuple[float,
     return accepted
 
 
-def compress_candidate(cost: float, states: list[tuple[int, str]], edges: list[dict[str, Any]], rank: int) -> dict[str, Any]:
+def ride_legs(edges: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    legs = []
+    current = []
+    for e in edges + [{"kind": "END"}]:
+        if e["kind"] == "RIDE":
+            current.append(e)
+            continue
+        if current:
+            compatible = None
+            runtime_by_option: dict[tuple[str, str], float] = defaultdict(float)
+            for edge in current:
+                opts = {(x["path_id"], x["direction"]) for x in edge["service_options"]}
+                compatible = opts if compatible is None else compatible & opts
+            if not compatible:
+                return None
+            for option in compatible:
+                for edge in current:
+                    matches = [x for x in edge["service_options"] if (x["path_id"], x["direction"]) == option]
+                    if not matches:
+                        return None
+                    runtime_by_option[option] += min(float(x["structural_runtime_s"]) for x in matches)
+            legs.append({
+                "line": current[0]["line"],
+                "from_station": current[0]["from_station"],
+                "to_station": current[-1]["to_station"],
+                "edge_count": len(current),
+                "compatible_service_options": [
+                    {"path_id": p, "direction": d, "structural_runtime_s": runtime_by_option[(p, d)]}
+                    for p, d in sorted(compatible)
+                ],
+            })
+            current = []
+    return legs
+
+
+def compress_candidate(cost, states, edges, rank):
     transfers = [e for e in edges if e["kind"] == "TRANSFER"]
     rides = [e for e in edges if e["kind"] == "RIDE"]
-    line_sequence: list[str] = []
+    legs = ride_legs(edges)
+    if legs is None:
+        return None
+    line_sequence = []
     for _station, line in states:
         if not line_sequence or line_sequence[-1] != line:
             line_sequence.append(line)
-    physical_path: list[int] = []
+    physical_path = []
     for station, _line in states:
         if not physical_path or physical_path[-1] != station:
             physical_path.append(station)
@@ -174,7 +205,9 @@ def compress_candidate(cost: float, states: list[tuple[int, str]], edges: list[d
         "transfer_count": len(transfers),
         "transfer_movements": [f"{e['from_line']}:{e['station']}->{e['to_line']}:{e['station']}" for e in transfers],
         "ride_segments": rides,
+        "ride_legs": legs,
         "simple_state_path": len(states) == len(set(states)),
+        "service_family_not_prematurely_resolved": True,
     }
 
 
@@ -183,46 +216,58 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
     graph = build_graph(prior)
     by_line, by_station = line_membership(prior["line_paths"])
     states = sorted(graph)
-    support: dict[str, list[dict[str, Any]]] = {}
-    unreachable: list[str] = []
+    support = {}
+    unreachable = []
     candidate_count = 0
+    incoherent_filtered = 0
     max_transfer = 0
-    pairs_with_k = 0
-
-    # Generate only AFC-observable endpoint surfaces: line must actually serve the station.
+    pairs_reaching_k = 0
     endpoints = sorted((station, line) for station, lines in by_station.items() for line in lines)
     for start in endpoints:
         for goal in endpoints:
             if start == goal:
                 continue
             key = f"{start[1]}:{start[0]}->{goal[1]}:{goal[0]}"
-            paths = yen_k_shortest_simple_paths(graph, start, goal, k)
-            if not paths:
+            raw_paths = yen_k_shortest_simple_paths(graph, start, goal, k)
+            payload = []
+            for raw_rank, (c, s, e) in enumerate(raw_paths, start=1):
+                item = compress_candidate(c, s, e, raw_rank)
+                if item is None:
+                    incoherent_filtered += 1
+                    continue
+                item["rank"] = len(payload) + 1
+                payload.append(item)
+            if not payload:
                 unreachable.append(key)
                 continue
-            payload = [compress_candidate(c, s, e, i) for i, (c, s, e) in enumerate(paths, start=1)]
             support[key] = payload
             candidate_count += len(payload)
             max_transfer = max(max_transfer, max(p["transfer_count"] for p in payload))
-            pairs_with_k += int(len(payload) == k)
+            pairs_reaching_k += int(len(payload) == k)
 
     gates = {
         "all_endpoint_surfaces_reachable": len(unreachable) == 0,
         "no_transfer_count_filter": True,
         "line_aware_expanded_state_graph": True,
+        "shared_edges_retain_all_service_families": True,
+        "all_retained_ride_legs_have_coherent_service_options": all(
+            all(leg["compatible_service_options"] for cand in cands for leg in cand["ride_legs"])
+            for cands in support.values()
+        ),
         "absolute_auxiliary_timestamp_not_used": prior["absolute_timestamp_policy"] == "FORBIDDEN_AS_2019_REALIZED_TRUTH",
         "at_least_one_multitransfer_candidate_exists": max_transfer >= 2,
     }
     result = {
-        "schema": "rail.hz-expanded-route-support.v1",
+        "schema": "rail.hz-expanded-route-support.v2-service-family-aware",
         "dataset_id": "CN_HZ_Tianchi_2019",
         "status": "QUALIFIED_LINE_AWARE_ROUTE_SUPPORT" if all(gates.values()) else "ROUTE_SUPPORT_GATE_FAILED",
         "endpoint_surface_count": len(endpoints),
         "expanded_state_count": len(states),
         "route_pair_count": len(support),
         "candidate_count": candidate_count,
+        "incoherent_raw_paths_filtered": incoherent_filtered,
         "k_shortest_support_beam": k,
-        "pairs_reaching_k_beam": pairs_with_k,
+        "pairs_reaching_k_beam": pairs_reaching_k,
         "max_transfer_count_present": max_transfer,
         "unreachable_endpoint_pairs": unreachable,
         "integrity_gates": gates,
@@ -232,6 +277,7 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
             "routes_outside_k_are_not_claimed_empirically_zero": True,
             "non_simple_behavioral_support": "DEFERRED_TO_CONTROLLED_SIDECAR_BEFORE_BEHAVIORAL_INVARIANT_CLAIMS",
             "transfer_penalty_role": "RANKING_ONLY_NOT_THETA_K",
+            "shared_service_family_ambiguity": "RETAINED_UNTIL_PASSENGER_SERVICE_POSTERIOR_UPDATE",
         },
         "line_membership": {line: sorted(nodes) for line, nodes in sorted(by_line.items())},
         "route_support": support,
@@ -243,8 +289,9 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
         "expanded_state_count": len(states),
         "route_pair_count": len(support),
         "candidate_count": candidate_count,
+        "incoherent_raw_paths_filtered": incoherent_filtered,
         "max_transfer_count_present": max_transfer,
-        "pairs_reaching_k_beam": pairs_with_k,
+        "pairs_reaching_k_beam": pairs_reaching_k,
         "integrity_gates": gates,
     }, ensure_ascii=False, indent=2))
     if not all(gates.values()):
@@ -253,13 +300,13 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
 
 
 def main() -> None:
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--prior", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--k", type=int, default=DEFAULT_K)
-    args=p.parse_args()
-    build_support(args.prior,args.output,args.k)
+    a = p.parse_args()
+    build_support(a.prior, a.output, a.k)
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

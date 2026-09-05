@@ -1,0 +1,128 @@
+name: Rail HZ R1B3 Fixed Joint Solve V2 Reuse Factors 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1b3-fixed-joint-solve-v2-reuse-factors-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
+  SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
+  GENEALOGY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b3_fixed_joint_2019-01-04_20260905
+  TARGET_DATE: '2019-01-04'
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  solve-fixed-joint-timetable-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install solver runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b3_direct_realized_timetable_20260905.py scripts/rail_hz_r1b3_fixed_joint_realized_timetable_solver_20260905.py scripts/rail_hz_r1b3_fixed_joint_realized_timetable_solver_v2_dtypefix_20260905.py
+      - name: Solve one fixed full-day joint objective from original factors
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone mkdir "$R:$OUT_DRIVE/global_v2" --config "$C"
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone mkdir "$R:$OUT_DRIVE/reaudit_v2/shard-$I" --config "$C"; done
+          rclone mkdir "$R:$OUT_DRIVE/reaudit_v2/global" --config "$C"
+          W="$RUNNER_TEMP/joint-solve-v2"; mkdir -p "$W/factors"; cd "$W"
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/$TARGET_DATE.service_init.json" service_init.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$GENEALOGY_DRIVE/global/HZ_2019-01-04_R1B1_ROOT_LINEAGE_MASS.parquet" root_mass.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          A=();E=();T=()
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); mkdir -p "factors/$I"; for f in access.parquet egress.parquet transfer.parquet; do rclone copyto "$R:$OUT_DRIVE/factors/shard-$I/$f" "factors/$I/$f" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done; A+=(--access "factors/$I/access.parquet"); E+=(--egress "factors/$I/egress.parquet"); T+=(--transfer "factors/$I/transfer.parquet"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b3_fixed_joint_realized_timetable_solver_v2_dtypefix_20260905.py" \
+            --roots roots.json --service-init service_init.json --root-mass root_mass.parquet "${A[@]}" "${E[@]}" "${T[@]}" \
+            --out-physical-events HZ_2019-01-04_R1B3J_PHYSICAL_EVENTS.jsonl.gz \
+            --out-root-events HZ_2019-01-04_R1B3J_ROOT_EVENTS.jsonl.gz \
+            --out-summary HZ_2019-01-04_R1B3J_FIXED_JOINT_SUMMARY.json
+          python - <<'PY'
+          import json
+          x=json.load(open('HZ_2019-01-04_R1B3J_FIXED_JOINT_SUMMARY.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1B3_FIXED_JOINT_REALIZED_TIMETABLE_CANDIDATE'
+          assert all(x['qualification_gates'].values())
+          assert x['scientific_semantics']['r1b4_audit_summary_used_as_evidence'] is False
+          assert x['scientific_semantics']['scientific_self_iteration'] is False
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          for f in HZ_2019-01-04_R1B3J_PHYSICAL_EVENTS.jsonl.gz HZ_2019-01-04_R1B3J_ROOT_EVENTS.jsonl.gz HZ_2019-01-04_R1B3J_FIXED_JOINT_SUMMARY.json; do rclone copyto "$f" "$R:$OUT_DRIVE/global_v2/$f" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  reaudit-shard-v2:
+    needs: solve-fixed-joint-timetable-v2
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install audit runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py
+      - name: Read-only audit one genealogy partition
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/reaudit-v2-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$GENEALOGY_DRIVE/partitions/genealogy-$I.edges.parquet" genealogy.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/global_v2/HZ_2019-01-04_R1B3J_ROOT_EVENTS.jsonl.gz" root_events.jsonl.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py" audit-shard --genealogy genealogy.parquet --routes routes.json --r1b3-events root_events.jsonl.gz --shard-index ${{ matrix.shard }} --out-summary summary.json --out-examples conflicts.jsonl.gz
+          python - <<'PY'
+          import json
+          x=json.load(open('summary.json',encoding='utf-8')); assert x['status']=='COMPLETED_R1B4_AUDIT_SHARD'; assert all(x['qualification_gates'].values()); print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto summary.json "$R:$OUT_DRIVE/reaudit_v2/shard-$I/summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto conflicts.jsonl.gz "$R:$OUT_DRIVE/reaudit_v2/shard-$I/conflicts.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  merge-reaudit-v2:
+    needs: reaudit-shard-v2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Merge read-only re-audit
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/reaudit-v2-merge"; mkdir -p "$W"; cd "$W"; S=()
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone copyto "$R:$OUT_DRIVE/reaudit_v2/shard-$I/summary.json" "$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; S+=(--summary "$I.json"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b4_realized_timetable_genealogy_audit_20260905.py" merge "${S[@]}" --out-summary HZ_2019-01-04_R1B3J_REAUDIT_SUMMARY.json
+          cat HZ_2019-01-04_R1B3J_REAUDIT_SUMMARY.json
+          rclone copyto HZ_2019-01-04_R1B3J_REAUDIT_SUMMARY.json "$R:$OUT_DRIVE/reaudit_v2/global/HZ_2019-01-04_R1B3J_REAUDIT_SUMMARY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

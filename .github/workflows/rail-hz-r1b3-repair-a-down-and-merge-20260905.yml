@@ -1,0 +1,113 @@
+name: Rail HZ R1B3 Repair A-Down and Merge 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1b3-repair-a-down-and-merge-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
+  GENEALOGY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  R1B2_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b2_event_service_2019-01-04_20260905
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b3_realized_timetable_2019-01-04_20260905
+  TARGET_DATE: '2019-01-04'
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  repair-a-down:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow scipy
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b3_direct_realized_timetable_20260905.py scripts/rail_hz_r1b3_direct_realized_timetable_v2_constrained_20260905.py
+      - name: Solve A-main Down with hard physical forward-time domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1b3-06"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/$TARGET_DATE.service_init.json" service_init.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$GENEALOGY_DRIVE/global/HZ_2019-01-04_R1B1_ROOT_LINEAGE_MASS.parquet" root_mass.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$R1B2_DRIVE/global_v4/HZ_2019-01-04_R1B2_EVENT_SERVICE_POSTERIOR_SEED.jsonl.gz" event_support.jsonl.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b3_direct_realized_timetable_v2_constrained_20260905.py" solve-shard \
+            --roots roots.json --service-init service_init.json --root-mass root_mass.parquet --event-support event_support.jsonl.gz \
+            --path-id A_main --direction Down \
+            --out-events r1b3-06.events.jsonl.gz --out-roots r1b3-06.roots.jsonl.gz --out-summary r1b3-06.summary.json
+          python - <<'PY'
+          import json
+          x=json.load(open('r1b3-06.summary.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1B3_REALIZED_TIMETABLE_FACTOR_SHARD'
+          assert x['monotone_failure_count']==0
+          assert x.get('physical_monotonicity_constraint_active_root_count',0)>=1
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto r1b3-06.events.jsonl.gz "$R:$OUT_DRIVE/shard-06/events.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto r1b3-06.roots.jsonl.gz "$R:$OUT_DRIVE/shard-06/roots.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto r1b3-06.summary.json "$R:$OUT_DRIVE/shard-06/summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  merge-realized-timetable:
+    needs: repair-a-down
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/rail_hz_r1b3_direct_realized_timetable_20260905.py
+      - name: Merge all eight path-direction products
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1b3-merge"; mkdir -p "$W"; cd "$W"
+          E=(); RF=(); SM=()
+          for n in 0 1 2 3 4 5 6 7; do
+            I=$(printf '%02d' "$n")
+            mkdir -p "shard-$I"
+            rclone copyto "$R:$OUT_DRIVE/shard-$I/events.jsonl.gz" "shard-$I/events.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+            rclone copyto "$R:$OUT_DRIVE/shard-$I/roots.jsonl.gz" "shard-$I/roots.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+            rclone copyto "$R:$OUT_DRIVE/shard-$I/summary.json" "shard-$I/summary.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+            E+=(--event-file "shard-$I/events.jsonl.gz")
+            RF+=(--root-file "shard-$I/roots.jsonl.gz")
+            SM+=(--summary "shard-$I/summary.json")
+          done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b3_direct_realized_timetable_20260905.py" merge-global \
+            "${E[@]}" "${RF[@]}" "${SM[@]}" \
+            --out-physical-events HZ_2019-01-04_R1B3_REALIZED_PHYSICAL_SERVICE_EVENTS.jsonl.gz \
+            --out-root-hypotheses HZ_2019-01-04_R1B3_ROOT_PATH_HYPOTHESES.jsonl.gz \
+            --out-summary HZ_2019-01-04_R1B3_DIRECT_REALIZED_TIMETABLE_SUMMARY.json
+          python - <<'PY'
+          import json
+          x=json.load(open('HZ_2019-01-04_R1B3_DIRECT_REALIZED_TIMETABLE_SUMMARY.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1B3_DIRECT_REALIZED_TIMETABLE_POSTERIOR'
+          assert all(x['qualification_gates'].values())
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY
+          rclone copyto HZ_2019-01-04_R1B3_REALIZED_PHYSICAL_SERVICE_EVENTS.jsonl.gz "$R:$OUT_DRIVE/global/HZ_2019-01-04_R1B3_REALIZED_PHYSICAL_SERVICE_EVENTS.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto HZ_2019-01-04_R1B3_ROOT_PATH_HYPOTHESES.jsonl.gz "$R:$OUT_DRIVE/global/HZ_2019-01-04_R1B3_ROOT_PATH_HYPOTHESES.jsonl.gz" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto HZ_2019-01-04_R1B3_DIRECT_REALIZED_TIMETABLE_SUMMARY.json "$R:$OUT_DRIVE/global/HZ_2019-01-04_R1B3_DIRECT_REALIZED_TIMETABLE_SUMMARY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

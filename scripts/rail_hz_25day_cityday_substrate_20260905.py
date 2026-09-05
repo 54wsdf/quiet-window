@@ -101,6 +101,7 @@ def profile_day(input_path: Path, source_file: str, output_path: Path) -> dict[s
             else:
                 rec[0] += 1
 
+    unique_user_count = len(users)
     pair_sequence: Counter[str] = Counter()
     valid_count = 0
     valid_same_line = 0
@@ -171,7 +172,7 @@ def profile_day(input_path: Path, source_file: str, output_path: Path) -> dict[s
         "pay_type_counts": dict(pay_counts),
         "observed_station_count": len(station_counts),
         "observed_station_ids": sorted(station_counts),
-        "unique_user_count": sum(1 for _ in station_counts) * 0 + None,
+        "unique_user_count": unique_user_count,
         "exact_two_event_users": exact_two_users,
         "exact_two_event_status_sequence": dict(pair_sequence),
         "valid_full_journey": {

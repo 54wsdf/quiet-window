@@ -1,0 +1,76 @@
+name: Rail HZ R1C2 Transfer Key Diagnostic 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1c2-transfer-key-diagnostic-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  R1B1_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  R1C_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1c_transfer_2019-01-04_20260905
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Inspect exact R1C1 movement ids and genealogy transfer-chain encoding
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1c2-keydiag"; mkdir -p "$W"; cd "$W"
+          for n in 0 1 2 3 4 5 6 7 8; do I=$(printf '%02d' "$n"); rclone copyto "$R:$R1C_DRIVE/generative_k1/movement-$I/result.json" "fit-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone copyto "$R:$R1B1_DRIVE/partitions/genealogy-$I.edges.parquet" "g-$I.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          python - <<'PY'
+          import glob,json
+          from collections import defaultdict
+          import pyarrow.parquet as pq
+
+          fits=[]
+          for p in sorted(glob.glob('fit-*.json')):
+              x=json.load(open(p,encoding='utf-8'))
+              fits.append((p,x.get('movement'),x.get('movement_level_fit',{}).get('parameters',{})))
+          print('=== R1C1 EXACT MOVEMENT IDS ===')
+          for p,m,pars in fits:
+              print(json.dumps({'file':p,'movement':m,'parameters':pars},ensure_ascii=False,sort_keys=True))
+
+          mass=defaultdict(float); edges=defaultdict(int); tc_mass=defaultdict(float); examples={}
+          total_transfer_mass=0.0
+          for p in sorted(glob.glob('g-*.parquet')):
+              pf=pq.ParquetFile(p)
+              cols=['transfer_chain','root_chain','transfer_count','lineage_mass','cohort_id']
+              for b in pf.iter_batches(batch_size=100000,columns=cols):
+                  for r in b.to_pylist():
+                      if int(r['transfer_count'])<=0: continue
+                      lm=float(r['lineage_mass']); total_transfer_mass+=lm
+                      key=str(r['transfer_chain'])
+                      mass[key]+=lm; edges[key]+=1; tc_mass[int(r['transfer_count'])]+=lm
+                      if key not in examples:
+                          examples[key]={'transfer_chain':key,'root_chain':str(r['root_chain']),'transfer_count':int(r['transfer_count']),'cohort_id':str(r['cohort_id']),'lineage_mass':lm}
+          print('=== TRANSFER MASS BY TRANSFER_COUNT ===')
+          for k in sorted(tc_mass): print(json.dumps({'transfer_count':k,'lineage_mass':tc_mass[k]},sort_keys=True))
+          print('=== TOP RAW TRANSFER CHAINS ===')
+          for k,v in sorted(mass.items(),key=lambda kv:(-kv[1],kv[0]))[:100]:
+              z={'raw_transfer_chain':k,'lineage_mass':v,'edge_count':edges[k],'example':examples[k]}
+              print(json.dumps(z,ensure_ascii=False,sort_keys=True))
+          print('=== UNIQUE RAW TRANSFER CHAIN COUNT ===')
+          print(json.dumps({'unique_raw_transfer_chains':len(mass),'total_transfer_lineage_mass':total_transfer_mass},sort_keys=True))
+          PY
+          shred -u "$C" 2>/dev/null || rm -f "$C"

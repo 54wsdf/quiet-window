@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/rail-hz-single-full-service-day-qualification-20260905.yml'
+      - 'scripts/rail_hz_single_service_day_init_20260905.py'
+      - 'scripts/rail_hz_relative_service_prior_v2_20260905.py'
+      - 'scripts/rail_hz_service_root_completion_20260905.py'
   workflow_dispatch:
 
 permissions:

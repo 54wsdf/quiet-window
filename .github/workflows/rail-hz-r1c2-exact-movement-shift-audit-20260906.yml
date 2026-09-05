@@ -1,0 +1,72 @@
+name: Rail HZ R1C2 Exact Movement Shift Audit 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1c2-exact-movement-shift-audit-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  R1C_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1c_transfer_2019-01-04_20260905
+  PYTHONPATH: ${{ github.workspace }}/scripts:${{ github.workspace }}
+
+jobs:
+  audit-shard:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Audit one R1C2 V2 partition with exact movement parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/r1c2audit-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$R1C_DRIVE/reweight_k1_v2/partitions/part-$I.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1c2_exact_movement_shift_audit_20260906.py" shard --edges edges.parquet --shard-index ${{ matrix.shard }} --out summary.json
+          rclone copyto summary.json "$R:$R1C_DRIVE/reweight_k1_v2/exact_movement_audit/part-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  merge:
+    needs: audit-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Merge exact movement audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/r1c2audit-merge"; mkdir -p "$W"; cd "$W"; A=()
+          for n in 0 1 2 3 4 5 6 7; do I=$(printf '%02d' "$n"); rclone copyto "$R:$R1C_DRIVE/reweight_k1_v2/exact_movement_audit/part-$I.json" "part-$I.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; A+=(--input "part-$I.json"); done
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1c2_exact_movement_shift_audit_20260906.py" merge "${A[@]}" --out HZ_2019-01-04_R1C2_EXACT_MOVEMENT_SHIFT_AUDIT.json
+          rclone copyto HZ_2019-01-04_R1C2_EXACT_MOVEMENT_SHIFT_AUDIT.json "$R:$R1C_DRIVE/reweight_k1_v2/global/HZ_2019-01-04_R1C2_EXACT_MOVEMENT_SHIFT_AUDIT.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"

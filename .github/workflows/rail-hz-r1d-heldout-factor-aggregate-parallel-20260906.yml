@@ -1,0 +1,55 @@
+name: Rail HZ R1D Heldout Factor Aggregate Parallel 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-r1d-heldout-factor-aggregate-parallel-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
+  R1D_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1d_crossfit_2019-01-04_20260906
+  PYTHONPATH: ${{ github.workspace }}/scripts:${{ github.workspace }}
+
+jobs:
+  aggregate:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Aggregate heldout-only scoring factors
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/r1d-heldout-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$R1D_DRIVE/split/heldout/part-$I.parquet" heldout.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1d_heldout_fixed_factor_aggregate_20260906.py" --genealogy heldout.parquet --routes routes.json --shard-index ${{ matrix.shard }} --out-access access.parquet --out-egress egress.parquet --out-transfer transfer.parquet --out-summary summary.json
+          python - <<'PY'
+          import json
+          x=json.load(open('summary.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1D_HELDOUT_FIXED_FACTOR_AGGREGATE_SHARD'
+          assert x['mapping_failure_mass']==0
+          assert x['scientific_semantics']['parameter_estimation_forbidden'] is True
+          PY
+          for f in access.parquet egress.parquet transfer.parquet summary.json; do rclone copyto "$f" "$R:$R1D_DRIVE/heldout_factors/shard-$I/$f" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          shred -u "$C" 2>/dev/null || rm -f "$C"

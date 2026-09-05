@@ -1,0 +1,29 @@
+{
+  "schema": "rail.hz-r1b2-event-shard-qualification-manifest.v1",
+  "service_date": "2019-01-04",
+  "source_run_id": 33958132102,
+  "status": "QUALIFIED_EIGHT_R1B2_EVENT_EVIDENCE_SHARDS",
+  "shards": [
+    {"shard_index":0,"resolved_lineage_mass":117082.99999997982,"unresolved_mass":38549.0,"mapped_chain_mass":117082.99999997982,"station_only_mass":0.0,"first_boarding_mass":117082.99999997982,"final_alighting_mass":117082.99999997982,"transfer_episode_mass":41981.03917665682,"event_keys_with_support":40153,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":1,"resolved_lineage_mass":118628.999999988,"unresolved_mass":31441.0,"mapped_chain_mass":118628.999999988,"station_only_mass":0.0,"first_boarding_mass":118628.999999988,"final_alighting_mass":118628.999999988,"transfer_episode_mass":36333.22344914838,"event_keys_with_support":34998,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":2,"resolved_lineage_mass":120726.99999999942,"unresolved_mass":29334.0,"mapped_chain_mass":120726.99999999942,"station_only_mass":0.0,"first_boarding_mass":120726.99999999942,"final_alighting_mass":120726.99999999942,"transfer_episode_mass":41996.884512308454,"event_keys_with_support":33497,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":3,"resolved_lineage_mass":118255.99999999936,"unresolved_mass":31813.0,"mapped_chain_mass":118255.99999999936,"station_only_mass":0.0,"first_boarding_mass":118255.99999999936,"final_alighting_mass":118255.99999999936,"transfer_episode_mass":44824.835466606215,"event_keys_with_support":32892,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":4,"resolved_lineage_mass":120695.99999998538,"unresolved_mass":29393.0,"mapped_chain_mass":120695.99999998538,"station_only_mass":0.0,"first_boarding_mass":120695.99999998538,"final_alighting_mass":120695.99999998538,"transfer_episode_mass":40567.38383209232,"event_keys_with_support":33025,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":5,"resolved_lineage_mass":116113.99999999515,"unresolved_mass":33982.0,"mapped_chain_mass":116113.99999999515,"station_only_mass":0.0,"first_boarding_mass":116113.99999999515,"final_alighting_mass":116113.99999999515,"transfer_episode_mass":39526.494976555,"event_keys_with_support":35342,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":6,"resolved_lineage_mass":109566.9999999879,"unresolved_mass":40511.0,"mapped_chain_mass":109566.9999999879,"station_only_mass":0.0,"first_boarding_mass":109566.9999999879,"final_alighting_mass":109566.9999999879,"transfer_episode_mass":37403.097291465514,"event_keys_with_support":34395,"mapping_failure_mass":0.0,"mapping_failure_count":0},
+    {"shard_index":7,"resolved_lineage_mass":111391.99999997886,"unresolved_mass":38669.0,"mapped_chain_mass":111391.99999997886,"station_only_mass":0.0,"first_boarding_mass":111391.99999997886,"final_alighting_mass":111391.99999997886,"transfer_episode_mass":37298.04824883992,"event_keys_with_support":35399,"mapping_failure_mass":0.0,"mapping_failure_count":0}
+  ],
+  "global_checks": {
+    "shard_count": 8,
+    "resolved_lineage_mass": 932463.9999999139,
+    "unresolved_mass": 273692.0,
+    "mapped_chain_mass": 932463.9999999139,
+    "station_only_mass": 0.0,
+    "first_boarding_mass": 932463.9999999139,
+    "final_alighting_mass": 932463.9999999139,
+    "transfer_episode_mass": 319931.0069536726,
+    "mapping_failure_mass": 0.0,
+    "all_shards_scientifically_qualified": true
+  },
+  "semantic_boundary": "This manifest freezes actual outputs from the eight successful R1B2 shard jobs. It replaces ambiguous concurrent Drive summary-folder discovery; it does not replace or alter any scientific computation."
+}

@@ -30,24 +30,41 @@ def _finalize_leg(current: list[dict[str, Any]], compatible: set[tuple[str, str]
     }
 
 
-def ride_legs_and_movements(edges: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-    """Build service-coherent ride legs.
+def _explicit_transfer_meta(edge: dict[str, Any]) -> dict[str, Any]:
+    movement = f"{edge['from_line']}:{edge['station']}->{edge['to_line']}:{edge['station']}"
+    return {
+        "kind": "CROSS_LINE_TRANSFER",
+        "station": int(edge["station"]),
+        "from_line": str(edge["from_line"]),
+        "to_line": str(edge["to_line"]),
+        "movement": movement,
+    }
 
-    A continuous AFC line is not necessarily one through-train service family. In
-    Hangzhou Line B, travelling between the two branches requires changing service
-    family at station 20 (客运中心). The v2 builder rejected those OD pairs because it
-    intersected service-family support across the whole same-line path.
 
-    Here, whenever the compatible service-family intersection would become empty,
-    the current leg is closed and a SAME_LINE_SERVICE_CHANGE movement is inserted at
-    the physical junction. This is not a topology shortcut: it explicitly requires a
-    new boarding chain and therefore enters the transfer/connection timing likelihood.
+def ride_legs_and_movements(
+    edges: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build service-coherent ride legs and distinguish endpoint surface switches.
+
+    Two structural cases must not be conflated:
+
+    1. Branch-to-branch travel on AFC Line B can require a real new boarding/service
+       family at station 20 even though the AFC line label does not change. This is an
+       in-journey SAME_LINE_SERVICE_CHANGE and must enter the connection-time likelihood.
+
+    2. At a physical interchange used as the trip origin or destination, the AFC line
+       surface label can differ from the first/last ridden service line without implying
+       an additional train boarding after arrival or before first boarding. A graph
+       TRANSFER before the first ride or after the final ride is therefore retained as
+       an ENDPOINT_SURFACE_SWITCH, not fabricated into an in-journey transfer.
     """
     legs: list[dict[str, Any]] = []
     movements: list[str] = []
     movement_meta: list[dict[str, Any]] = []
+    endpoint_surface_transitions: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
     compatible: set[tuple[str, str]] | None = None
+    pending_transfers: list[dict[str, Any]] = []
 
     def flush() -> None:
         nonlocal current, compatible
@@ -58,29 +75,42 @@ def ride_legs_and_movements(edges: list[dict[str, Any]]) -> tuple[list[dict[str,
             current = []
             compatible = None
 
+    def consume_pending_before_new_ride() -> None:
+        nonlocal pending_transfers
+        if not pending_transfers:
+            return
+        if legs:
+            # These transfers lie between two actual ride legs.
+            for meta in pending_transfers:
+                movements.append(str(meta["movement"]))
+                movement_meta.append(meta)
+        else:
+            # No prior ride leg: this is an origin station-surface transition.
+            for meta in pending_transfers:
+                endpoint_surface_transitions.append({
+                    **meta,
+                    "kind": "ENTRY_ENDPOINT_SURFACE_SWITCH",
+                    "scientific_semantics": "endpoint line-surface alignment inside the physical interchange; not an extra train boarding",
+                })
+        pending_transfers = []
+
     for edge in edges:
         if edge["kind"] == "TRANSFER":
             flush()
-            movement = f"{edge['from_line']}:{edge['station']}->{edge['to_line']}:{edge['station']}"
-            movements.append(movement)
-            movement_meta.append({
-                "kind": "CROSS_LINE_TRANSFER",
-                "station": int(edge["station"]),
-                "from_line": str(edge["from_line"]),
-                "to_line": str(edge["to_line"]),
-                "movement": movement,
-            })
+            pending_transfers.append(_explicit_transfer_meta(edge))
             continue
 
         if edge["kind"] != "RIDE":
             raise RuntimeError(f"unexpected edge kind: {edge['kind']}")
 
-        options = {(str(x["path_id"]), str(x["direction"])) for x in edge["service_options"]}
         if not current:
+            consume_pending_before_new_ride()
+            options = {(str(x["path_id"]), str(x["direction"])) for x in edge["service_options"]}
             current = [edge]
             compatible = set(options)
             continue
 
+        options = {(str(x["path_id"]), str(x["direction"])) for x in edge["service_options"]}
         assert compatible is not None
         narrowed = compatible & options
         if narrowed:
@@ -111,20 +141,28 @@ def ride_legs_and_movements(edges: list[dict[str, Any]]) -> tuple[list[dict[str,
 
     flush()
 
-    # For ordinary ride chains every inter-leg boundary must have one movement. Paths
-    # with no ride leg (same-station line-surface changes) remain a separate boundary
-    # case handled by the downstream station-only logic and are not fabricated here.
+    # Transfers left after the last ride only align the final physical interchange
+    # station with the AFC endpoint surface. They are not a post-arrival train transfer.
+    if pending_transfers:
+        for meta in pending_transfers:
+            endpoint_surface_transitions.append({
+                **meta,
+                "kind": "EXIT_ENDPOINT_SURFACE_SWITCH" if legs else "STATION_ONLY_ENDPOINT_SURFACE_SWITCH",
+                "scientific_semantics": "endpoint line-surface alignment inside the physical interchange; not an extra train boarding",
+            })
+
+    # For any route with actual riding, one movement must connect each adjacent pair
+    # of ride legs. Endpoint surface switches are deliberately excluded from this count.
     if legs and len(movements) != len(legs) - 1:
         raise RuntimeError(f"movement/leg alignment failed: {len(movements)} movements for {len(legs)} legs")
-    return legs, movements, movement_meta
+    return legs, movements, movement_meta, endpoint_surface_transitions
 
 
 def compress_candidate(cost: float, states: list[tuple[int, str]], edges: list[dict[str, Any]], rank: int) -> dict[str, Any] | None:
     try:
-        legs, movements, movement_meta = ride_legs_and_movements(edges)
+        legs, movements, movement_meta, endpoint_surface_transitions = ride_legs_and_movements(edges)
     except RuntimeError:
         return None
-    explicit_transfers = [e for e in edges if e["kind"] == "TRANSFER"]
     rides = [e for e in edges if e["kind"] == "RIDE"]
     line_sequence: list[str] = []
     for _station, line in states:
@@ -135,17 +173,20 @@ def compress_candidate(cost: float, states: list[tuple[int, str]], edges: list[d
         if not physical_path or physical_path[-1] != station:
             physical_path.append(station)
     same_line_changes = sum(m["kind"] == "SAME_LINE_SERVICE_CHANGE" for m in movement_meta)
+    cross_line_interleg = sum(m["kind"] == "CROSS_LINE_TRANSFER" for m in movement_meta)
     return {
         "rank": rank,
         "base_ranking_cost_s": float(cost),
         "state_path": [{"station": s, "line": l} for s, l in states],
         "physical_station_path": physical_path,
         "line_sequence": line_sequence,
-        "transfer_count": len(explicit_transfers),
+        "transfer_count": int(cross_line_interleg),
         "same_line_service_change_count": int(same_line_changes),
         "inter_leg_movement_count": len(movements),
+        "endpoint_surface_transition_count": len(endpoint_surface_transitions),
         "transfer_movements": movements,
         "inter_leg_movement_meta": movement_meta,
+        "endpoint_surface_transitions": endpoint_surface_transitions,
         "ride_segments": rides,
         "ride_legs": legs,
         "simple_state_path": len(states) == len(set(states)),
@@ -166,6 +207,7 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
     max_same_line_changes = 0
     pairs_reaching_k = 0
     pairs_using_same_line_change = 0
+    pairs_using_endpoint_surface_switch = 0
     endpoints = sorted((station, line) for station, lines in by_station.items() for line in lines)
 
     for start in endpoints:
@@ -190,6 +232,7 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
             max_transfer = max(max_transfer, max(p["transfer_count"] for p in payload))
             max_same_line_changes = max(max_same_line_changes, max(p["same_line_service_change_count"] for p in payload))
             pairs_using_same_line_change += int(any(p["same_line_service_change_count"] > 0 for p in payload))
+            pairs_using_endpoint_surface_switch += int(any(p["endpoint_surface_transition_count"] > 0 for p in payload))
             pairs_reaching_k += int(len(payload) == k)
 
     gates = {
@@ -205,12 +248,16 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
             (not cand["ride_legs"]) or len(cand["transfer_movements"]) == len(cand["ride_legs"]) - 1
             for cands in support.values() for cand in cands
         ),
+        "endpoint_surface_switches_not_counted_as_train_transfers": all(
+            all(m["kind"] in {"ENTRY_ENDPOINT_SURFACE_SWITCH", "EXIT_ENDPOINT_SURFACE_SWITCH", "STATION_ONLY_ENDPOINT_SURFACE_SWITCH"} for m in cand["endpoint_surface_transitions"])
+            for cands in support.values() for cand in cands
+        ),
         "absolute_auxiliary_timestamp_not_used": prior["absolute_timestamp_policy"] == "FORBIDDEN_AS_2019_REALIZED_TRUTH",
         "at_least_one_multitransfer_candidate_exists": max_transfer >= 2,
         "same_line_branch_service_change_is_representable": max_same_line_changes >= 1,
     }
     result = {
-        "schema": "rail.hz-expanded-route-support.v3-branch-service-change-aware",
+        "schema": "rail.hz-expanded-route-support.v3.1-branch-and-endpoint-surface-aware",
         "dataset_id": "CN_HZ_Tianchi_2019",
         "status": "QUALIFIED_LINE_AWARE_ROUTE_SUPPORT" if all(gates.values()) else "ROUTE_SUPPORT_GATE_FAILED",
         "endpoint_surface_count": len(endpoints),
@@ -223,6 +270,7 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
         "max_transfer_count_present": max_transfer,
         "max_same_line_service_change_count_present": max_same_line_changes,
         "pairs_with_same_line_service_change_support": pairs_using_same_line_change,
+        "pairs_with_endpoint_surface_switch_support": pairs_using_endpoint_surface_switch,
         "unreachable_endpoint_pairs": unreachable,
         "integrity_gates": gates,
         "scientific_boundary": {
@@ -233,6 +281,7 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
             "transfer_penalty_role": "RANKING_ONLY_NOT_THETA_K",
             "shared_service_family_ambiguity": "RETAINED_UNTIL_PASSENGER_SERVICE_POSTERIOR_UPDATE",
             "same_line_branch_change": "REQUIRES_NEW_BOARDING_CHAIN_AT_PHYSICAL_JUNCTION; NOT TREATED_AS_THROUGH_SERVICE",
+            "interchange_endpoint_surface": "AFC endpoint line-surface alignment is retained separately from in-journey train transfers; it will be absorbed by endpoint access/egress semantics rather than fabricated as an extra boarding",
         },
         "line_membership": {line: sorted(nodes) for line, nodes in sorted(by_line.items())},
         "route_support": support,
@@ -247,6 +296,7 @@ def build_support(prior_path: Path, output: Path, k: int) -> dict[str, Any]:
         "max_transfer_count_present": max_transfer,
         "max_same_line_service_change_count_present": max_same_line_changes,
         "pairs_with_same_line_service_change_support": pairs_using_same_line_change,
+        "pairs_with_endpoint_surface_switch_support": pairs_using_endpoint_surface_switch,
         "unreachable_endpoint_pair_count": len(unreachable),
         "unreachable_endpoint_pairs": unreachable[:100],
         "integrity_gates": gates,

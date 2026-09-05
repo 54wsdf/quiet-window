@@ -1,0 +1,193 @@
+name: Rail HZ Single Full-Service-Day Qualification 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-single-full-service-day-qualification-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rail-hz-single-full-service-day-qualification-20260905
+  cancel-in-progress: false
+
+jobs:
+  qualify-one-day:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      AFC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      STATIC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/timetable_topology_aux
+      DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
+      TARGET_DATE: '2019-01-04'
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout worker code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Validate worker and install runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/rail_hz_relative_service_prior_v2_20260905.py
+          python -m py_compile scripts/rail_hz_single_service_day_init_20260905.py
+          python -m py_compile scripts/rail_hz_service_root_completion_20260905.py
+          python -m pip install --disable-pip-version-check --quiet numpy openpyxl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Restore protected storage configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/hz_one"
+
+      - name: Require qualified passenger domain for target day
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_one"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/summaries/$TARGET_DATE.service_day_summary.json" passenger_summary.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          python - <<'PY'
+          import json, os
+          x=json.load(open('passenger_summary.json',encoding='utf-8'))
+          assert x.get('service_date')==os.environ['TARGET_DATE'] or x.get('source_date')==os.environ['TARGET_DATE'], x
+          assert x.get('raw_afc_events_in_service_day',0)>0
+          assert x.get('all_consecutive_valid_1_to_0_journeys',0)>0
+          print('target passenger domain qualified:', os.environ['TARGET_DATE'], x.get('raw_afc_events_in_service_day'), x.get('all_consecutive_valid_1_to_0_journeys'))
+          PY
+
+      - name: Build uncertainty-aware relative service prior
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_one"
+          rclone copyto "$REMOTE_NAME:$STATIC_SOURCE_DRIVE/Train Timetable.xlsx" 'Train Timetable.xlsx' --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_relative_service_prior_v2_20260905.py" --timetable 'Train Timetable.xlsx' --output relative_service_prior_v2.json
+          rm -f 'Train Timetable.xlsx'
+          python - <<'PY'
+          import json
+          x=json.load(open('relative_service_prior_v2.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_UNCERTAINTY_AWARE_RELATIVE_SERVICE_PRIOR'
+          assert x['integrity_gates']['all_directed_physical_edges_have_finite_prior']
+          print('prior classes:', json.dumps(x['prior_source_class_counts'], ensure_ascii=False))
+          PY
+
+      - name: Build one complete 04:00-to-04:00 service field
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_one"
+          rclone copyto "$REMOTE_NAME:$AFC_SOURCE_DRIVE/record_2019-01-04.csv.gz" record_2019-01-04.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$AFC_SOURCE_DRIVE/record_2019-01-05.csv.gz" record_2019-01-05.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_single_service_day_init_20260905.py" \
+            --input record_2019-01-04.csv.gz \
+            --input record_2019-01-05.csv.gz \
+            --target-date "$TARGET_DATE" \
+            --prior relative_service_prior_v2.json \
+            --passenger-summary passenger_summary.json \
+            --out-prefix "$TARGET_DATE.service_init"
+          rm -f record_2019-01-04.csv.gz record_2019-01-05.csv.gz
+
+      - name: Complete uncertainty-bearing service roots for target day
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_one"
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_service_root_completion_20260905.py" day \
+            --day-npz "$TARGET_DATE.service_init.npz" \
+            --day-json "$TARGET_DATE.service_init.json" \
+            --prior relative_service_prior_v2.json \
+            --output "record_$TARGET_DATE.service_roots.json"
+          python - <<'PY'
+          import json, os
+          d=os.environ['TARGET_DATE']
+          init=json.load(open(f'{d}.service_init.json',encoding='utf-8'))
+          roots=json.load(open(f'record_{d}.service_roots.json',encoding='utf-8'))
+          gates={
+            'service_init_qualified': init['status']=='QUALIFIED_SINGLE_FULL_SERVICE_DAY_SERVICE_INIT',
+            'service_roots_qualified': roots['status']=='QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION',
+            'all_path_directions_have_roots': roots['integrity_gates']['all_path_directions_have_roots'],
+            'no_exact_train_identity_claim': roots['integrity_gates']['no_exact_train_identity_claim'],
+            'full_day_anchor_domain_retained': roots['integrity_gates']['full_day_anchor_domain_retained'],
+          }
+          result={
+            'schema':'rail.hz-single-full-service-day-qualification.v1',
+            'date':d,
+            'status':'QUALIFIED_SINGLE_FULL_SERVICE_DAY_PRE_R1B' if all(gates.values()) else 'SINGLE_DAY_PRE_R1B_GATE_FAILED',
+            'integrity_gates':gates,
+            'service_init':{
+              'event_count':init['event_field']['event_count'],
+              'stations_with_events':init['event_field']['stations_with_events'],
+              'afc_supported_lag_context_share':init['propagation_field']['afc_supported_share'],
+              'fallback_prior_contexts':init['propagation_field']['fallback_prior_contexts'],
+              'passenger_domain':init['passenger_domain'],
+            },
+            'service_roots':{
+              'root_count_total':roots['root_count_total'],
+              'root_counts':roots['root_counts'],
+              'anchor_counts':roots['anchor_counts'],
+              'matched_intermediate_event_assignments':roots['matched_intermediate_event_assignments'],
+              'structure_propagated_latent_event_assignments':roots['structure_propagated_latent_event_assignments'],
+            },
+            'next_stage':'SINGLE_DAY_R1B_FULL_SERVICE_DAY',
+            'scientific_boundary':'This run qualifies one complete city-day engineering substrate only; it does not replace the V7 multi-day scientific target.'
+          }
+          open('HZ_SINGLE_FULL_SERVICE_DAY_2019-01-04_QUALIFICATION_20260905.json','w',encoding='utf-8').write(json.dumps(result,ensure_ascii=False,indent=2))
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          if not all(gates.values()): raise SystemExit(2)
+          PY
+
+      - name: Persist single-day qualification products
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/hz_one"
+          rclone copy passenger_summary.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy relative_service_prior_v2.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy "$TARGET_DATE.service_init.json" "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy "$TARGET_DATE.service_init.npz" "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy "record_$TARGET_DATE.service_roots.json" "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ_SINGLE_FULL_SERVICE_DAY_2019-01-04_QUALIFICATION_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

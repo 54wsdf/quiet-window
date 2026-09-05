@@ -1,0 +1,167 @@
+name: Rail HZ 24-Day Formal R1B Full-Service-Day 2026-09-05
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rail-hz-24-r1b-full-service-day-20260905
+  cancel-in-progress: false
+
+jobs:
+  r1b:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+      SERVICE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_service_init_20260905
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1b_full_service_day_20260905
+
+    steps:
+      - name: Checkout worker code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Validate formal R1B worker and install runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/rail_hz_r1b_full_service_day_joint_update_20260905.py
+          python -m pip install --disable-pip-version-check --quiet numpy pandas pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Restore protected storage configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1b/out" "$RUNNER_TEMP/r1b/tmp"
+
+      - name: Require qualified full-service-day passenger and service substrates
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1b"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/HZ24_FULL_SERVICE_DAY_PASSENGER_DOMAIN_SUMMARY_20260905.json" passenger_summary.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$SERVICE_DRIVE/HZ24_SERVICE_FIELD_INIT_SUMMARY_20260905.json" service_summary.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$SERVICE_DRIVE/HZ24_SERVICE_ROOT_COMPLETION_SUMMARY_20260905.json" root_summary.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto "$REMOTE_NAME:$SERVICE_DRIVE/expanded_route_support_k32.json" routes.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          python - <<'PY'
+          import json
+          p=json.load(open('passenger_summary.json',encoding='utf-8'))
+          s=json.load(open('service_summary.json',encoding='utf-8'))
+          r=json.load(open('root_summary.json',encoding='utf-8'))
+          q=json.load(open('routes.json',encoding='utf-8'))
+          assert p['status']=='QUALIFIED_HZ24_COMPLETE_FULL_SERVICE_DAY_PASSENGER_DOMAIN'
+          assert s['status']=='QUALIFIED_HZ24_COMPLETE_SERVICE_DAY_SERVICE_INIT'
+          assert r['status']=='QUALIFIED_HZ24_CANDIDATE_SERVICE_ROOTS'
+          assert q['status']=='QUALIFIED_LINE_AWARE_ROUTE_SUPPORT'
+          assert q['scientific_boundary']['transfer_count_cap'] is None
+          print('formal R1B prerequisites qualified')
+          PY
+
+      - name: Run six complete service days on this shard
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1b"
+          start=$((10#$SHARD * 6 + 1))
+          end=$((start + 5))
+          for n in $(seq "$start" "$end"); do
+            d=$(printf '%02d' "$n")
+            date="2019-01-$d"
+            echo "formal full-service-day R1B: $date"
+            rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/cohorts/$date.journey_cohorts.parquet" cohorts.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            rclone copyto "$REMOTE_NAME:$SERVICE_DRIVE/days/record_$date.service_roots.json" roots.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b_full_service_day_joint_update_20260905.py" day \
+              --cohorts cohorts.parquet \
+              --routes routes.json \
+              --roots roots.json \
+              --output "out/$date.r1b.json" \
+              --temp-dir tmp \
+              --beam 16
+            rclone copyto "out/$date.r1b.json" "$REMOTE_NAME:$OUT_DRIVE/days/$date.r1b.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            rm -f cohorts.parquet roots.json "out/$date.r1b.json"
+            rm -rf tmp/*
+          done
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi
+
+  aggregate:
+    needs: r1b
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1b_full_service_day_20260905
+    steps:
+      - name: Checkout worker code
+        uses: actions/checkout@v5
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Restore protected storage configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1b_merge/days"
+      - name: Aggregate 24 formal R1B days
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1b_merge"
+          rclone copy "$REMOTE_NAME:$OUT_DRIVE/days" days --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 4
+          test "$(find days -maxdepth 1 -name '2019-01-*.r1b.json' | wc -l)" -eq 24
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b_full_service_day_joint_update_20260905.py" aggregate --input-dir days --output HZ24_R1B_FULL_SERVICE_DAY_MULTIDAY_SUMMARY_20260905.json
+          rclone copy HZ24_R1B_FULL_SERVICE_DAY_MULTIDAY_SUMMARY_20260905.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

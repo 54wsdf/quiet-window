@@ -1,0 +1,91 @@
+name: Rail HZ Single-Day Parallel Prep Qualification V3 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rail-hz-single-day-parallel-prep-qualification-v3-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-prep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and install runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pandas pyarrow
+          python -m py_compile scripts/rail_hz_r1b_distributed_exact_20260905.py scripts/rail_hz_r1c_full_service_day_input_contract_20260905.py scripts/rail_hz_single_day_r1b_science_report_20260905.py
+      - name: Test lossless split and merge algebra
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/prep/parts" && cd "$RUNNER_TEMP/prep"
+          python - <<'PY'
+          import pyarrow as pa, pyarrow.parquet as pq
+          n=103
+          t=pa.table({'origin_line':['B']*n,'origin_station':[0]*n,'destination_line':['B']*n,'destination_station':[1]*n,'entry_sec':list(range(n)),'exit_sec':[x+300 for x in range(n)],'passenger_mass':[(x%4)+1 for x in range(n)]})
+          pq.write_table(t,'cohorts.parquet',compression='zstd')
+          PY
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b_distributed_exact_20260905.py" split --source cohorts.parquet --out-dir parts --shards 4 --manifest split.json
+          test "$(find parts -maxdepth 1 -name 'part-*.parquet' | wc -l)" -eq 4
+          python - <<'PY'
+          import json
+          x=json.load(open('split.json'))
+          assert x['row_conservation_pass'] and x['split_rows']==103
+          assert sum(p['rows'] for p in x['parts'])==103
+          assert abs(sum(p['passenger_mass'] for p in x['parts'])-x['split_passenger_mass'])<1e-9
+          print('lossless split manifest PASS')
+          PY
+          cat > a.json <<'EOF'
+          {"metrics":{"cohort_count":2,"finite_cohort_count":1,"passenger_mass":4,"finite_posterior_mass":3,"no_route_support_mass":0,"time_or_service_incompatible_mass":1,"station_only_supported_mass":0,"weighted_mean_route_entropy":0.2,"weighted_mean_top_route_probability":0.8,"weighted_mean_min_local_beam_retained_fraction":0.99},"factor_stats":{"access":{"w":3,"sum_log":15,"sum_log2":76},"transfer":{"w":2,"sum_log":10,"sum_log2":51},"egress":{"w":3,"sum_log":14,"sum_log2":67}}}
+          EOF
+          cat > b.json <<'EOF'
+          {"metrics":{"cohort_count":3,"finite_cohort_count":2,"passenger_mass":6,"finite_posterior_mass":5,"no_route_support_mass":1,"time_or_service_incompatible_mass":0,"station_only_supported_mass":0,"weighted_mean_route_entropy":0.4,"weighted_mean_top_route_probability":0.7,"weighted_mean_min_local_beam_retained_fraction":0.97},"factor_stats":{"access":{"w":5,"sum_log":26,"sum_log2":137},"transfer":{"w":4,"sum_log":20,"sum_log2":102},"egress":{"w":5,"sum_log":24,"sum_log2":119}}}
+          EOF
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b_distributed_exact_20260905.py" merge-e0 --input a.json --input b.json --output e0.json
+          python - <<'PY'
+          import json
+          import scripts.rail_hz_r1b_distributed_exact_20260905 as d
+          x=json.load(open('e0.json'))
+          assert x['mass_conservation_pass'] and x['metrics']['passenger_mass']==10 and x['factor_stats']['access']['w']==8
+          items=[{'metrics':{'cohort_count':2,'passenger_mass':4,'finite_posterior_mass':3,'no_route_support_mass':0,'time_or_service_incompatible_mass':1,'became_finite_mass':0,'lost_finite_mass':0,'finite_both_mass':3,'top_route_changed_mass':1,'top_boarding_chain_changed_mass':2,'weighted_mean_route_entropy':.2,'weighted_mean_route_entropy_change_among_finite_both':.01,'weighted_mean_top_route_probability':.8,'weighted_mean_top_route_probability_change_among_finite_both':-.01}},{'metrics':{'cohort_count':3,'passenger_mass':6,'finite_posterior_mass':5,'no_route_support_mass':1,'time_or_service_incompatible_mass':0,'became_finite_mass':1,'lost_finite_mass':0,'finite_both_mass':4,'top_route_changed_mass':2,'top_boarding_chain_changed_mass':1,'weighted_mean_route_entropy':.4,'weighted_mean_route_entropy_change_among_finite_both':.02,'weighted_mean_top_route_probability':.7,'weighted_mean_top_route_probability_change_among_finite_both':-.02}}]
+          y=d._merge_e1_metrics(items)
+          assert y['mass_conservation_pass'] and y['top_route_changed_mass']==3 and y['top_boarding_chain_changed_mass']==3
+          print('E0 sufficient-statistic merge PASS; E1 metric merge PASS')
+          PY
+      - name: Test R1C launch gate and science reporter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/prep"
+          cat > r1b.json <<'EOF'
+          {"service_date":"2019-01-04","status":"COMPLETED_FORMAL_R1B_FULL_SERVICE_DAY_UPDATE","scope":{"time":"FULL_SERVICE_DAY_0400_TO_NEXT_0400","network":"FULL_NETWORK","passenger_subsample":false,"transfer_count_cap":null,"boarding_skip_count_cap":null},"mass_conservation":{"E0_pass":true,"E1_pass":true,"passenger_mass":10},"E0":{"finite_posterior_mass":8,"finite_posterior_share":0.8,"no_route_support_mass":1,"time_or_service_incompatible_mass":1,"weighted_mean_route_entropy":0.3},"E1":{"finite_posterior_mass":9,"finite_posterior_share":0.9,"no_route_support_mass":1,"time_or_service_incompatible_mass":0,"became_finite_mass":1,"lost_finite_mass":0,"finite_both_mass":8,"top_route_changed_mass":2,"top_route_changed_share_among_finite_both":0.25,"top_boarding_chain_changed_mass":3,"top_boarding_chain_changed_share_among_finite_both":0.375,"weighted_mean_route_entropy":0.25,"weighted_mean_route_entropy_change_among_finite_both":-0.05},"service_timing_update":{"root_count":10,"roots_shifted_nonzero":4,"root_shifted_share":0.4,"usage_weighted_mean_abs_shift_sec":21,"offset_histogram":{"0":6,"30":4}},"kernels_before":{"access":{"median_sec":180,"sigma":0.9,"evidence_class":"BROAD"},"transfer":{"median_sec":180,"sigma":0.85,"evidence_class":"BROAD"},"egress":{"median_sec":120,"sigma":0.8,"evidence_class":"BROAD"}},"kernels_after":{"access":{"median_sec":170,"sigma":0.8,"evidence_class":"UPDATED"},"transfer":{"median_sec":190,"sigma":0.82,"evidence_class":"UPDATED"},"egress":{"median_sec":110,"sigma":0.75,"evidence_class":"UPDATED"}},"bidirectional_evidence":{"passenger_posterior_updates_temporal_kernels":true,"passenger_posterior_updates_service_timing":true,"updated_state_redistributes_route_posterior":true,"updated_state_redistributes_boarding_posterior":true}}
+          EOF
+          echo '{"date":"2019-01-04","status":"QUALIFIED_SINGLE_FULL_SERVICE_DAY_R1B","hard_integrity_gates":{"a":true},"scientific_bidirectional_gates":{"passenger_updates_temporal_kernels":true,"passenger_updates_service_timing":true,"route_or_boarding_redistribution":true}}' > qualification.json
+          echo '{"status":"QUALIFIED_LINE_AWARE_ROUTE_SUPPORT"}' > routes.json
+          echo '{"source_date":"2019-01-04","status":"QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION"}' > roots.json
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1c_full_service_day_input_contract_20260905.py" --r1b r1b.json --qualification qualification.json --cohorts cohorts.parquet --routes routes.json --roots roots.json --output r1c.json
+          python "$GITHUB_WORKSPACE/scripts/rail_hz_single_day_r1b_science_report_20260905.py" --r1b r1b.json --qualification qualification.json --output report.json
+          python - <<'PY'
+          import json
+          c=json.load(open('r1c.json')); r=json.load(open('report.json'))
+          assert c['status']=='QUALIFIED_FOR_SINGLE_DAY_FULL_SERVICE_DAY_R1C'
+          assert abs(r['posterior_coverage']['finite_share_change']-0.1)<1e-12
+          assert r['service_world_update']['roots_shifted_nonzero']==4
+          print('R1C input contract PASS; R1B science reporter PASS')
+          PY
+      - name: Qualification marker
+        run: |
+          echo QUALIFIED_SINGLE_DAY_PARALLEL_PREP_INFRASTRUCTURE
+          echo No-formal-R1C-or-other-service-day-executed

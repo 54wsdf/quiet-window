@@ -1,0 +1,49 @@
+name: MPPD R1BC Full-Day Multi-Day Substrate Discovery 2026-09-05
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r1bc-full-day-multiday-substrate-discovery-20260905.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1bc-full-day-multiday-substrate-discovery-20260905
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SEOUL_ROOT: ResearchData/rail_transit/metro_transfer_afc_ats_bridge/20260903/seoul
+      CLOSURE_ROOT: ResearchData/rail_transit/mppd_core_closure_20260904
+      HZ_ROOT: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      SH_ROOT: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+    steps:
+      - name: Discover complete-day and multi-day substrates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo '=== HANGZHOU RAW AFC DAYS ==='
+          rclone lsf "$R:$HZ_ROOT" --config "$C" --files-only | sort | grep -E 'record_[0-9]{4}-[0-9]{2}-[0-9]{2}\.csv\.gz$' || true
+          echo '=== SHANGHAI STRICT JOURNEY DAYS ==='
+          rclone lsf "$R:$SH_ROOT" --config "$C" --files-only | sort | grep -E 'SPTCC-[0-9]{8}\.strict_metro_journeys\.parquet$' || true
+          echo '=== SEOUL PASSENGER/SERVICE TREE ==='
+          rclone lsf "$R:$SEOUL_ROOT" --config "$C" --recursive --files-only | sort | head -n 500
+          echo '=== EXISTING CITY-DAY / SERVICE / COHORT PRODUCTS ==='
+          rclone lsf "$R:$CLOSURE_ROOT" --config "$C" --recursive --files-only | sort | grep -Ei '(cohort|service_state|service_field|route_ensemble|city_day|posterior|g1f)' | head -n 1000 || true
+          echo '=== DISCOVERY PASS ==='
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        run: |
+          C="$RUNNER_TEMP/rclone.conf"; if [[ -f "$C" ]]; then shred -u "$C" 2>/dev/null || rm -f "$C"; fi

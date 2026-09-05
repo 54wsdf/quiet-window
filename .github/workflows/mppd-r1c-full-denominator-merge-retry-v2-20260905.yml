@@ -1,0 +1,58 @@
+name: MPPD R1C Full Denominator Merge Retry V2 2026-09-05
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mppd-r1c-full-denominator-merge-retry-v2-20260905.yml
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OUT_DRIVE: ResearchData/rail_transit/mppd_core_closure_20260904/r1c_full_denominator_distributed_v2_raw_movement
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Merge exact full denominator result from completed E0/E1 shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || exit 3
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          ROOT="$RUNNER_TEMP/r1c_merge"; mkdir -p "$ROOT/e0" "$ROOT/e1" "$ROOT/out"
+          # Copy whole shard trees. The previous include/exclude combination was order-ambiguous in rclone and caused a false E0/E1 folder mismatch.
+          rclone copy "$R:$OUT_DRIVE/e0" "$ROOT/e0" --config "$C" --retries 6 --low-level-retries 15 --transfers 8
+          rclone copy "$R:$OUT_DRIVE/e1" "$ROOT/e1" --config "$C" --retries 6 --low-level-retries 15 --transfers 8
+          rclone copyto "$R:$OUT_DRIVE/global/global_kernels.json" "$ROOT/kernels.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/global/global_offsets.json" "$ROOT/offsets.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python -m scripts.mppd_r1c_distributed_final_merger_20260905 --e0-root "$ROOT/e0" --e1-root "$ROOT/e1" --kernels "$ROOT/kernels.json" --offsets "$ROOT/offsets.json" --out "$ROOT/out"
+          python - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_merge'/'out'/'r1c_full_denominator_distributed_joint_posterior_result.json'
+          x=json.loads(p.read_text())
+          assert x['scope']['cohort_count']==562071 and x['scope']['passenger_mass']==632143
+          assert x['qualification']['denominator_conservation']=='PASS'
+          assert x['qualification']['cohort_partition_conservation']=='PASS'
+          assert x['qualification']['failure_mass_conservation_E0'] is True
+          assert x['qualification']['failure_mass_conservation_E1'] is True
+          print(json.dumps({'scope':x['scope'],'E0':x['E0'],'E1':x['E1'],'redistribution':x['posterior_redistribution'],'kernel_counts':x['kernel_counts'],'service_timing':x['service_timing'],'qualification':x['qualification']},ensure_ascii=False,indent=2))
+          PY
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'r1c_merge'/'out'
+          result=json.loads((root/'r1c_full_denominator_distributed_joint_posterior_result.json').read_text())
+          manifest={'schema':'mppd.r1c-full-denominator-distributed-v2-raw-movement-merge-retry-execution-manifest.v1','date':'2026-09-05','status':'R1C_FULL_DENOMINATOR_DISTRIBUTED_V2_RAW_MOVEMENT_MERGE_COMPLETED','execution_sha':os.environ.get('GITHUB_SHA'),'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),'result':{'E0_finite':result['E0']['finite_posterior_mass'],'E1_finite':result['E1']['finite_posterior_mass'],'E1_failure_mass':result['E1']['failure_mass'],'redistribution':result['posterior_redistribution'],'kernel_counts':result['kernel_counts'],'service_timing':result['service_timing'],'qualification':result['qualification']},'output_files':{},'no_email_notification_logic':True}
+          for p in root.iterdir():
+              if p.is_file() and p.name!='execution_manifest.json': manifest['output_files'][p.name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (root/'execution_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+          for f in "$ROOT/out"/*; do rclone copyto "$f" "$R:$OUT_DRIVE/final/$(basename "$f")" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+          shred -u "$C" 2>/dev/null || rm -f "$C"

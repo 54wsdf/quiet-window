@@ -1,0 +1,57 @@
+name: MPPD R1BC Hangzhou Network Source Audit V2 2026-09-05
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mppd-r1bc-hz-network-source-audit-v2-20260905.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT: rail_transit/CN_HZ_Tianchi_2019/timetable_topology_aux
+    steps:
+      - name: Inspect actual network, route and timetable schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          python -m pip install --disable-pip-version-check --quiet pandas openpyxl
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          mkdir -p "$RUNNER_TEMP/hz"
+          for f in 'Metro_roadMap.csv' 'L1_Route Reselection.csv' 'L2_Route Reselection.csv' 'L3_Route Reselection.csv' 'Train Timetable.xlsx'; do
+            rclone copyto "$R:$ROOT/$f" "$RUNNER_TEMP/hz/$f" --config "$C" --retries 6 --low-level-retries 15
+          done
+          python - <<'PY'
+          import pandas as pd, os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'hz')
+          for f in ['Metro_roadMap.csv','L1_Route Reselection.csv','L2_Route Reselection.csv','L3_Route Reselection.csv']:
+              p=os.path.join(root,f)
+              print('\n===',f,'===')
+              d=None
+              for enc in ['utf-8-sig','gb18030','utf-8']:
+                  try: d=pd.read_csv(p,encoding=enc); break
+                  except UnicodeDecodeError: pass
+              print('shape',d.shape); print('columns',list(d.columns)); print(d.head(40).to_string(index=False))
+              for c in d.columns:
+                  n=d[c].nunique(dropna=True)
+                  if n<=120: print('UNIQUE',c,n,d[c].dropna().astype(str).value_counts().head(50).to_dict())
+          x=os.path.join(root,'Train Timetable.xlsx')
+          xl=pd.ExcelFile(x)
+          print('\n=== TIMETABLE SHEETS ==='); print(xl.sheet_names)
+          for s in xl.sheet_names:
+              d=pd.read_excel(x,sheet_name=s)
+              print('\n--- SHEET',s,'shape',d.shape,'---'); print('columns',list(d.columns)); print(d.head(30).to_string(index=False))
+          PY
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        run: |
+          C="$RUNNER_TEMP/rclone.conf"; if [[ -f "$C" ]]; then shred -u "$C" 2>/dev/null || rm -f "$C"; fi

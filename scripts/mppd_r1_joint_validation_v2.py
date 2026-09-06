@@ -89,6 +89,7 @@ def validate(state: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any]
         bad("service_world", "no inferred services")
         services = []
     service_ids: set[str] = set()
+    service_by_id: dict[str, dict[str, Any]] = {}
     service_event_count = 0
     fine_event_count = 0
     for tr in services:
@@ -101,6 +102,8 @@ def validate(state: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any]
         elif sid in service_ids:
             bad("service_id", f"duplicate {sid}")
         service_ids.add(sid)
+        if sid:
+            service_by_id[sid] = tr
         key = (str(tr.get("path_id")), str(tr.get("line_id")), str(tr.get("direction_id")))
         events = sorted(tr.get("events", []), key=lambda e: int(e.get("sequence_index", -1)))
         service_event_count += len(events)
@@ -137,12 +140,86 @@ def validate(state: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any]
                     if float(b["arrival_time_s"]) <= float(a["departure_time_s"]):
                         bad("service_running_time", f"{sid}: non-positive running time")
 
+    # Service-circulation inference is optional during coarse rebuilding, but once
+    # present it is audited fail-closed. It represents a revenue-service successor
+    # chain only, never a physical rolling-stock identity.
+    circulation_rows = state.get("service_circulations", [])
+    if circulation_rows is None:
+        circulation_rows = []
+    if not isinstance(circulation_rows, list):
+        bad("service_circulation", "service_circulations must be a list")
+        circulation_rows = []
+    circulation_ids: set[str] = set()
+    circulation_owner: dict[str, str] = {}
+    circulation_service_count = 0
+    singleton_circulation_count = 0
+    circulation_link_count = 0
+    for row in circulation_rows:
+        if not isinstance(row, dict):
+            bad("service_circulation", "non-dict circulation")
+            continue
+        cid = str(row.get("circulation_id", ""))
+        if not cid:
+            bad("service_circulation", "empty circulation_id")
+        elif cid in circulation_ids:
+            bad("service_circulation", f"duplicate circulation_id {cid}")
+        circulation_ids.add(cid)
+        if row.get("physical_vehicle_identity_claimed") is not False:
+            bad("circulation_physical_identity", f"{cid}: physical vehicle identity claimed")
+        if "vehicle_id" in row and row.get("vehicle_id") is not None:
+            bad("circulation_physical_identity", f"{cid}: vehicle_id is not admissible in R1 service chain")
+        chain_type = row.get("chain_type")
+        if chain_type not in {"TURNBACK", "THROUGH_RUNNING", "MIXED"}:
+            bad("service_circulation", f"{cid}: invalid chain_type {chain_type}")
+        tids = row.get("ordered_trajectory_ids", [])
+        if not isinstance(tids, list) or not tids:
+            bad("service_circulation", f"{cid}: ordered_trajectory_ids missing")
+            continue
+        tids = [str(x) for x in tids]
+        circulation_service_count += len(tids)
+        singleton_circulation_count += int(len(tids) == 1)
+        circulation_link_count += max(0, len(tids) - 1)
+        if len(tids) != len(set(tids)):
+            bad("service_circulation", f"{cid}: duplicate trajectory inside circulation")
+        for tid in tids:
+            if tid not in service_by_id:
+                bad("service_circulation", f"{cid}: missing trajectory {tid}")
+                continue
+            previous_owner = circulation_owner.get(tid)
+            if previous_owner is not None and previous_owner != cid:
+                bad("service_circulation", f"{tid}: appears in both {previous_owner} and {cid}")
+            else:
+                circulation_owner[tid] = cid
+        for left_id, right_id in zip(tids, tids[1:]):
+            left = service_by_id.get(left_id)
+            right = service_by_id.get(right_id)
+            if left is None or right is None:
+                continue
+            left_events = sorted(left.get("events", []), key=lambda e: int(e.get("sequence_index", -1)))
+            right_events = sorted(right.get("events", []), key=lambda e: int(e.get("sequence_index", -1)))
+            if not left_events or not right_events:
+                continue
+            if str(left_events[-1].get("station_id")) != str(right_events[0].get("station_id")):
+                bad("service_circulation", f"{cid}: successor station mismatch {left_id}->{right_id}")
+            if chain_type == "TURNBACK" and str(left.get("direction_id")) == str(right.get("direction_id")):
+                bad("service_circulation", f"{cid}: turnback keeps direction {left_id}->{right_id}")
+            if state.get("stage") == FINE_STAGE:
+                left_time = left_events[-1].get("arrival_time_s")
+                right_time = right_events[0].get("departure_time_s")
+            else:
+                left_time = left_events[-1].get("anchor_time_s")
+                right_time = right_events[0].get("anchor_time_s")
+            if finite(left_time) and finite(right_time) and float(right_time) <= float(left_time):
+                bad("service_circulation", f"{cid}: non-positive successor time {left_id}->{right_id}")
+
     # Service count is an inferred property of the state, not an authority target.
     metadata = state.get("metadata", {})
     if metadata.get("service_count_is_fixed") is True:
         bad("count_free_semantics", "state metadata fixes service count")
     if "expected_service_count" in metadata:
         bad("count_free_semantics", "state metadata contains expected_service_count")
+    if metadata.get("physical_vehicle_identity_claimed") is True:
+        bad("circulation_physical_identity", "state metadata claims physical vehicle identity")
 
     station_rows = {str(x.get("station_id")): x for x in state.get("station_movements", []) if isinstance(x, dict)}
     for s in stations - set(station_rows):
@@ -233,6 +310,7 @@ def validate(state: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any]
         "count_free": {
             "service_count_is_authority_input": False,
             "inferred_service_count": len(services),
+            "physical_vehicle_identity_is_claimed": False,
         },
         "coverage": {
             "authority_station_count": len(stations),
@@ -242,6 +320,10 @@ def validate(state: dict[str, Any], authority: dict[str, Any]) -> dict[str, Any]
             "transfer_path_count": transfer_path_count,
             "service_event_count": service_event_count,
             "fine_arrival_departure_event_count": fine_event_count,
+            "service_circulation_count": len(circulation_rows),
+            "service_circulation_membership_count": circulation_service_count,
+            "service_circulation_link_count": circulation_link_count,
+            "singleton_service_circulation_count": singleton_circulation_count,
             "passenger_resolved_share": resolved_share,
         },
         "violation_counts": dict(sorted(violations.items())),

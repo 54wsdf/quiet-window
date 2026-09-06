@@ -1,0 +1,184 @@
+name: MPPD R1 Hangzhou Count-Free Passenger Feedback 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-count-free-passenger-feedback-20260906.yml'
+      - 'scripts/mppd_r1_hz_count_free_passenger_coverage.py'
+      - 'tests/test_mppd_r1_hz_count_free_passenger_coverage.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-count-free-passenger-feedback-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_service_init_20260905
+  SERVICE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
+  TARGET_DATE: '2019-01-04'
+  SHARD_COUNT: '8'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and verify physical-chain semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow pytest
+          python -m py_compile scripts/mppd_r1_hz_count_free_passenger_coverage.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_count_free_passenger_coverage.py
+
+  passenger-shard:
+    needs: unit-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE config' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/cfpass"
+      - name: Fetch passenger, route and count-free service worlds
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cfpass"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$SERVICE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          q=json.load(open('routes.json',encoding='utf-8'))
+          s=json.load(open('services.json',encoding='utf-8'))
+          assert q['status']=='QUALIFIED_LINE_AWARE_ROUTE_SUPPORT'
+          assert s['semantics']['train_count_is_input'] is False
+          assert s['semantics']['planned_timetable_used'] is False
+          assert s['semantics']['legacy_candidate_roots_used_as_input'] is False
+          print('count-free service trajectories:',s['inferred_service_trajectory_count'])
+          PY
+      - name: Regenerate complete passenger chains against free service field
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cfpass"
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services services.json \
+            --shard-index "$SHARD" \
+            --shard-count "$SHARD_COUNT" \
+            --output "shard_$SHARD.json"
+      - name: Persist shard feedback
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cfpass"
+          rclone copyto "shard_$SHARD.json" "$REMOTE_NAME:$OUT_DRIVE/shards/shard_$SHARD.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  merge:
+    needs: passenger-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install merge runtime and Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/cfpass_merge/shards"
+      - name: Fetch and merge all passenger-feedback shards
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cfpass_merge"
+          rclone copy "$REMOTE_NAME:$OUT_DRIVE/shards" shards --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 8
+          test "$(find shards -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 8
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge \
+            --input-dir shards \
+            --output HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json
+          rclone copy HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload merged scientific probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-count-free-passenger-feedback
+          path: ${{ runner.temp }}/cfpass_merge/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

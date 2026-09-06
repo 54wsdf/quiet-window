@@ -1,0 +1,113 @@
+name: MPPD R1 Hangzhou Count-Free Joint Movement Fit 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-count-free-movement-fit-20260906.yml'
+      - 'scripts/mppd_r1_hz_count_free_movement_fit.py'
+      - 'tests/test_mppd_r1_hz_count_free_movement_fit.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-count-free-movement-fit-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  CLOCK_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_clock_calibration_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_joint_movement_fit_2019-01-04_20260906
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  movement-fit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test physical movement semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow pytest
+          python -m py_compile scripts/mppd_r1_hz_count_free_movement_fit.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_count_free_movement_fit.py
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]]' '/^\[[^]]+\]/{print $2; exit}' "$C" 2>/dev/null || true)"
+          if [[ -z "$R" ]]; then R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; fi
+          test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/movement"
+      - name: Fetch calibrated service world and full-day passenger domain
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/movement"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$CLOCK_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_CLOCK_CALIBRATED.json" services.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          s=json.load(open('services.json',encoding='utf-8'))
+          assert s['inferred_service_trajectory_count']==1841
+          assert s['absolute_clock_calibration']['common_shift_s']==60.0
+          assert s['semantics']['planned_timetable_used'] is False
+          PY
+      - name: Fit access egress and multi-path transfer distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/movement"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_movement_fit.py" \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services services.json \
+            --iterations 3 \
+            --output HZ_2019-01-04_R1_COUNT_FREE_JOINT_MOVEMENT_FIT.json
+      - name: Persist movement fit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/movement"
+          rclone copyto HZ_2019-01-04_R1_COUNT_FREE_JOINT_MOVEMENT_FIT.json "$REMOTE_NAME:$OUT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_JOINT_MOVEMENT_FIT.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload scientific artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-count-free-joint-movement-fit
+          path: ${{ runner.temp }}/movement/HZ_2019-01-04_R1_COUNT_FREE_JOINT_MOVEMENT_FIT.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

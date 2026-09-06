@@ -1,0 +1,206 @@
+name: MPPD R1 Hangzhou Progressive 5s Birth Frontier 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-progressive-5s-birth-frontier-20260906.yml'
+      - 'scripts/mppd_r1_hz_progressive_birth_refinement.py'
+      - 'tests/test_mppd_r1_hz_progressive_birth_refinement.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-progressive-5s-birth-frontier-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  PARENT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  FINE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/multires_service_count_v2
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/progressive_5s_birth_frontier
+  TARGET_DATE: '2019-01-04'
+  BASELINE_RESOLVED_MASS: '598628.0'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test progressive birth contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile scripts/mppd_r1_hz_progressive_birth_refinement.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_progressive_birth_refinement.py
+
+  frontier-point:
+    needs: unit-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        novelty: [30, 45, 60]
+        evidence: ['0.80', '0.90', '1.00', '1.10']
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/birth"
+      - name: Restore Drive config and fetch parent fine service and passenger inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/birth"
+          rclone copyto "$R:$PARENT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" parent.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$FINE_DRIVE/R1_SERVICE_LEVEL_5S.json" fine5.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Build one progressive five-second residual-birth world
+        shell: bash
+        env:
+          NOVELTY: ${{ matrix.novelty }}
+          EVIDENCE: ${{ matrix.evidence }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/birth"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_progressive_birth_refinement.py" \
+            --parent-services parent.json --fine-services fine5.json \
+            --novelty-radius-s "$NOVELTY" --minimum-evidence-score "$EVIDENCE" \
+            --minimum-support-stations 6 \
+            --output augmented.json --summary birth_summary.json
+      - name: Recompute complete full-day passenger closure
+        shell: bash
+        env:
+          NOVELTY: ${{ matrix.novelty }}
+          EVIDENCE: ${{ matrix.evidence }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/birth"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+            --cohorts cohorts.parquet --routes routes.json --services augmented.json \
+            --shard-index 0 --shard-count 1 --output coverage.json
+          python - <<'PY'
+          import json, os
+          b=json.load(open('birth_summary.json',encoding='utf-8'))
+          c=json.load(open('coverage.json',encoding='utf-8'))
+          baseline=float(os.environ['BASELINE_RESOLVED_MASS'])
+          births=int(b['birth_count'])
+          gain=float(c['resolved_mass'])-baseline
+          out={
+              'schema':'mppd.r1-hz-progressive-5s-birth-frontier-point.v1',
+              'novelty_radius_s':float(os.environ['NOVELTY']),
+              'minimum_evidence_score':float(os.environ['EVIDENCE']),
+              'parent_service_count':int(b['parent_service_count']),
+              'birth_count':births,
+              'augmented_service_count':int(b['augmented_service_count']),
+              'births_by_line_direction':b['births_by_line_direction'],
+              'resolved_mass':float(c['resolved_mass']),
+              'resolved_share':float(c['resolved_share']),
+              'resolved_mass_gain_vs_1841_parent':gain,
+              'gain_per_birth':gain/births if births else None,
+              'failure_mass':c['failure_mass'],
+              'scientific_boundary':'Coarse 1841 AFC service world is retained; only distinct high-resolution residual service births are added. This point does not yet authorize parent death or split replacement.'
+          }
+          open('point.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload point artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: progressive-birth-n${{ matrix.novelty }}-e${{ matrix.evidence }}
+          path: ${{ runner.temp }}/birth/point.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  summarize:
+    needs: frontier-point
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download all progressive-birth frontier points
+        uses: actions/download-artifact@v5
+        with:
+          pattern: progressive-birth-*
+          path: ${{ runner.temp }}/points
+      - name: Summarize structural and passenger frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob,json,pathlib
+          rows=[]
+          for p in glob.glob(str(pathlib.Path('${{ runner.temp }}')/'points'/'**'/'point.json'),recursive=True):
+              rows.append(json.load(open(p,encoding='utf-8')))
+          rows.sort(key=lambda x:(x['novelty_radius_s'],x['minimum_evidence_score']))
+          for r in rows:
+              r['pareto_nondominated']=not any(
+                  q['birth_count']<=r['birth_count'] and q['resolved_mass_gain_vs_1841_parent']>=r['resolved_mass_gain_vs_1841_parent'] and
+                  (q['birth_count']<r['birth_count'] or q['resolved_mass_gain_vs_1841_parent']>r['resolved_mass_gain_vs_1841_parent'])
+                  for q in rows
+              )
+          positive=[r for r in rows if r['resolved_mass_gain_vs_1841_parent']>0]
+          out={
+              'schema':'mppd.r1-hz-progressive-5s-birth-frontier.v1',
+              'status':'PROGRESSIVE_5S_BIRTH_FRONTIER_COMPLETED_NO_FINAL_POINT_SELECTED',
+              'baseline_service_count':1841,
+              'baseline_resolved_mass':598628.0,
+              'points':rows,
+              'best_closure_point':max(rows,key=lambda x:x['resolved_mass']) if rows else None,
+              'best_positive_gain_per_birth_point':max(positive,key=lambda x:x['gain_per_birth']) if positive else None,
+              'scientific_boundary':'The frontier tests whether five-second residual AFC structure supports additional services while preserving the coarse service world. A final service count still requires structural lineage and joint movement/posterior re-estimation.'
+          }
+          path=pathlib.Path('${{ runner.temp }}')/'R1_PROGRESSIVE_5S_BIRTH_FRONTIER.json'
+          path.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist frontier to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone copyto '${{ runner.temp }}/R1_PROGRESSIVE_5S_BIRTH_FRONTIER.json' "$R:$OUT_DRIVE/R1_PROGRESSIVE_5S_BIRTH_FRONTIER.json" --config "$C" --retries 6 --low-level-retries 15
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+      - name: Upload frontier artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-progressive-5s-birth-frontier
+          path: ${{ runner.temp }}/R1_PROGRESSIVE_5S_BIRTH_FRONTIER.json
+          if-no-files-found: error
+          retention-days: 30

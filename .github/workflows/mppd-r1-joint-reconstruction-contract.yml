@@ -9,6 +9,8 @@ on:
       - 'scripts/mppd_r1_hz_joint_service_projection.py'
       - 'scripts/mppd_r1_hz_event_level_joint.py'
       - 'scripts/mppd_r1_hz_clean_joint.py'
+      - 'scripts/mppd_r1_hz_clean_projected.py'
+      - 'scripts/mppd_r1_hz_projected_event_merge.py'
       - 'tests/test_mppd_r1_joint_reconstruction_validate.py'
       - '.github/workflows/mppd-r1-joint-reconstruction-contract.yml'
   workflow_dispatch:
@@ -34,6 +36,8 @@ jobs:
           python -m py_compile scripts/mppd_r1_hz_joint_service_projection.py
           python -m py_compile scripts/mppd_r1_hz_event_level_joint.py
           python -m py_compile scripts/mppd_r1_hz_clean_joint.py
+          python -m py_compile scripts/mppd_r1_hz_clean_projected.py
+          python -m py_compile scripts/mppd_r1_hz_projected_event_merge.py
       - name: Run deterministic validator self-test
         run: python scripts/mppd_r1_joint_reconstruction_validate.py self-test
       - name: Run scientific gate tests

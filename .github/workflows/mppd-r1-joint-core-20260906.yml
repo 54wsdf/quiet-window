@@ -9,9 +9,11 @@ on:
       - 'scripts/mppd_r1_joint_solver.py'
       - 'scripts/mppd_r1_bootstrap_count_free.py'
       - 'scripts/mppd_r1_joint_validation_v2.py'
+      - 'scripts/mppd_r1_hz_network_authority.py'
       - 'tests/test_mppd_r1_joint_model.py'
       - 'tests/test_mppd_r1_joint_solver.py'
       - 'tests/test_mppd_r1_joint_validation_v2.py'
+      - 'tests/test_mppd_r1_hz_network_authority.py'
   workflow_dispatch:
 
 permissions:
@@ -20,6 +22,7 @@ permissions:
 env:
   GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
   COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
   OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/bootstrap
 
 jobs:
@@ -40,11 +43,13 @@ jobs:
             scripts/mppd_r1_joint_model.py \
             scripts/mppd_r1_joint_solver.py \
             scripts/mppd_r1_bootstrap_count_free.py \
-            scripts/mppd_r1_joint_validation_v2.py
+            scripts/mppd_r1_joint_validation_v2.py \
+            scripts/mppd_r1_hz_network_authority.py
           PYTHONPATH="$PWD" pytest -q \
             tests/test_mppd_r1_joint_model.py \
             tests/test_mppd_r1_joint_solver.py \
-            tests/test_mppd_r1_joint_validation_v2.py
+            tests/test_mppd_r1_joint_validation_v2.py \
+            tests/test_mppd_r1_hz_network_authority.py
 
   hangzhou-count-free-warm-start:
     needs: unit-contract
@@ -73,7 +78,7 @@ jobs:
           echo "config_file=$C" >> "$GITHUB_OUTPUT"
           echo "remote_name=$R" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/r1joint"
-      - name: Fetch current AFC-only count-free service warm start
+      - name: Fetch count-free service warm start and line-aware route topology
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
@@ -85,6 +90,28 @@ jobs:
             "$REMOTE_NAME:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" \
             count_free.json \
             --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto \
+            "$REMOTE_NAME:$ROUTE_DRIVE/expanded_route_support_k32.json" \
+            routes.json \
+            --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Build network-only authority with no service-count leakage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1joint"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_network_authority.py" \
+            --route-support routes.json \
+            --output R1_HZ_NETWORK_AUTHORITY.json
+          python - <<'PY'
+          import json
+          a=json.load(open('R1_HZ_NETWORK_AUTHORITY.json',encoding='utf-8'))
+          assert a['schema']=='mppd.r1-network-authority.v2'
+          assert len(a['station_ids'])==81
+          assert len(a['line_paths'])==8
+          assert 'service_event_keys' not in a
+          assert 'expected_service_count' not in a
+          assert a['semantics']['service_count_must_be_inferred'] is True
+          PY
       - name: Materialize new joint-state warm start without fixing service count
         shell: bash
         run: |
@@ -107,7 +134,26 @@ jobs:
           assert x['semantics']['fine_resolution_s']==1.0
           assert x['semantics']['single_event_update_trust_region_s']==5.0
           PY
-      - name: Persist bootstrap authority artifacts
+      - name: Audit warm start against network-only authority without claiming final qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1joint"
+          PYTHONPATH="$GITHUB_WORKSPACE" python - <<'PY'
+          import json
+          from scripts.mppd_r1_joint_validation_v2 import validate
+          s=json.load(open('R1_JOINT_WARM_START.json',encoding='utf-8'))
+          a=json.load(open('R1_HZ_NETWORK_AUTHORITY.json',encoding='utf-8'))
+          r=validate(s,a)
+          assert r['count_free']['service_count_is_authority_input'] is False
+          assert r['count_free']['inferred_service_count']==len(s['services'])
+          assert 'authority_service_leakage' not in r['violation_counts']
+          assert r['status']=='R1_JOINT_RECONSTRUCTION_V2_NOT_QUALIFIED'
+          assert r['violation_counts'].get('final_resolution',0)==1
+          open('R1_JOINT_WARM_START_VALIDATION.json','w',encoding='utf-8').write(json.dumps(r,ensure_ascii=False,indent=2))
+          print(json.dumps(r,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist bootstrap and authority artifacts
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
@@ -115,8 +161,9 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/r1joint"
-          rclone copyto R1_JOINT_WARM_START.json "$REMOTE_NAME:$OUT_DRIVE/R1_JOINT_WARM_START.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
-          rclone copyto R1_JOINT_WARM_START_SUMMARY.json "$REMOTE_NAME:$OUT_DRIVE/R1_JOINT_WARM_START_SUMMARY.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          for f in R1_JOINT_WARM_START.json R1_JOINT_WARM_START_SUMMARY.json R1_HZ_NETWORK_AUTHORITY.json R1_JOINT_WARM_START_VALIDATION.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
       - name: Upload joint warm-start artifact
         uses: actions/upload-artifact@v4
         with:
@@ -124,6 +171,8 @@ jobs:
           path: |
             ${{ runner.temp }}/r1joint/R1_JOINT_WARM_START.json
             ${{ runner.temp }}/r1joint/R1_JOINT_WARM_START_SUMMARY.json
+            ${{ runner.temp }}/r1joint/R1_HZ_NETWORK_AUTHORITY.json
+            ${{ runner.temp }}/r1joint/R1_JOINT_WARM_START_VALIDATION.json
           if-no-files-found: error
           retention-days: 30
       - name: Clean protected configuration

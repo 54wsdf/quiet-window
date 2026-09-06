@@ -1,4 +1,4 @@
-name: MPPD R1 HZ Full-Day Joint Inversion 2026-09-06
+name: MPPD R1 HZ Event-Level Full-Day Joint Inversion 2026-09-06
 
 on:
   push:
@@ -15,46 +15,13 @@ env:
   SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
   SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
   PROPOSAL_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
-  JOINT_OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_full_day_v2_2019-01-04_20260906
+  START_STATS_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_full_day_v2_2019-01-04_20260906/pass0
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_event_level_full_day_2019-01-04_20260906
   TARGET_DATE: '2019-01-04'
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  joint-pass0:
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0,1,2,3,4,5,6,7]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install runtime
-        run: |
-          python -m pip install --disable-pip-version-check --quiet pyarrow
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          python -m py_compile scripts/mppd_r1_hz_joint_full_day.py scripts/mppd_r1_hz_joint_service_projection.py
-      - name: Joint pass 0 with latent service-time projection
-        shell: bash
-        run: |
-          set -euo pipefail
-          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/joint0-$I"; mkdir -p "$W"; cd "$W"
-          rclone copyto "$R:$PROPOSAL_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_service_projection.py" shard \
-            --edges edges.parquet --roots roots.json --routes routes.json \
-            --out-stats "joint0-$I.stats.json" --shard-index ${{ matrix.shard }}
-          rclone copyto "joint0-$I.stats.json" "$R:$JOINT_OUT_DRIVE/pass0/joint0-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          shred -u "$C" 2>/dev/null || rm -f "$C"
-
-  joint-merge0:
-    needs: joint-pass0
+  event-merge0:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -64,27 +31,28 @@ jobs:
           python-version: '3.12'
       - name: Install runtime
         run: |
-          python -m pip install --disable-pip-version-check --quiet pyarrow
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Joint M-step and shared service-time update
+          python -m py_compile scripts/mppd_r1_hz_event_level_joint.py
+      - name: Recover first shared event-level service timetable
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          W="$RUNNER_TEMP/jointm0"; mkdir -p "$W/stats"; cd "$W"
-          rclone copy "$R:$JOINT_OUT_DRIVE/pass0" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          W="$RUNNER_TEMP/event-merge0"; mkdir -p "$W/stats"; cd "$W"
+          rclone copy "$R:$START_STATS_DRIVE" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           test "$(find stats -name 'joint0-*.stats.json' | wc -l)" -eq 8
           A=(); for f in $(find stats -name 'joint0-*.stats.json' | sort); do A+=(--stats "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" merge "${A[@]}" \
-            --roots roots.json --out-params params0.json --out-summary merge0.json --update-offsets
-          rclone copyto params0.json "$R:$JOINT_OUT_DRIVE/params/params0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto merge0.json "$R:$JOINT_OUT_DRIVE/params/merge0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" merge "${A[@]}" \
+            --roots roots.json --out-params event_params0.json --out-summary event_merge0.json --update-events
+          rclone copyto event_params0.json "$R:$OUT_DRIVE/params/event_params0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto event_merge0.json "$R:$OUT_DRIVE/params/event_merge0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"
 
-  joint-pass1:
-    needs: joint-merge0
+  event-pass1:
+    needs: event-merge0
     strategy:
       fail-fast: false
       matrix:
@@ -98,28 +66,27 @@ jobs:
           python-version: '3.12'
       - name: Install runtime
         run: |
-          python -m pip install --disable-pip-version-check --quiet pyarrow
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Final passenger inference against one shared recovered service state
+      - name: Infer passengers against shared event-level timetable pass 1
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/joint1-$I"; mkdir -p "$W"; cd "$W"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/event-pass1-$I"; mkdir -p "$W"; cd "$W"
           rclone copyto "$R:$PROPOSAL_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$JOINT_OUT_DRIVE/params/params0.json" params0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_service_projection.py" shard \
-            --edges edges.parquet --roots roots.json --routes routes.json --params params0.json \
-            --out-stats "joint1-$I.stats.json" --chains-out "joint1-$I.chains.parquet" --shard-index ${{ matrix.shard }}
-          rclone copyto "joint1-$I.stats.json" "$R:$JOINT_OUT_DRIVE/pass1/joint1-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "joint1-$I.chains.parquet" "$R:$JOINT_OUT_DRIVE/chains/joint1-$I.chains.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/params/event_params0.json" params.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" shard \
+            --edges edges.parquet --roots roots.json --routes routes.json --params params.json \
+            --out-stats "event1-$I.stats.json" --shard-index ${{ matrix.shard }}
+          rclone copyto "event1-$I.stats.json" "$R:$OUT_DRIVE/pass1/event1-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"
 
-  joint-final:
-    needs: joint-pass1
+  event-merge1:
+    needs: event-pass1
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -129,39 +96,107 @@ jobs:
           python-version: '3.12'
       - name: Install runtime
         run: |
-          python -m pip install --disable-pip-version-check --quiet pyarrow
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Finalize full-day joint result
+      - name: Refine event-level timetable and movement distributions
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          W="$RUNNER_TEMP/joint-final"; mkdir -p "$W/stats"; cd "$W"
-          rclone copy "$R:$JOINT_OUT_DRIVE/pass1" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$JOINT_OUT_DRIVE/params/params0.json" params0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          W="$RUNNER_TEMP/event-merge1"; mkdir -p "$W/stats"; cd "$W"
+          rclone copy "$R:$OUT_DRIVE/pass1" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/params/event_params0.json" old.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          test "$(find stats -name 'joint1-*.stats.json' | wc -l)" -eq 8
-          A=(); for f in $(find stats -name 'joint1-*.stats.json' | sort); do A+=(--stats "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" merge "${A[@]}" \
-            --old-params params0.json --roots roots.json --out-params params1.json --out-summary merge1.json
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" finalize \
-            --params params1.json --roots roots.json --merge-summary merge1.json --out HZ_2019-01-04_R1_JOINT_FULL_DAY.json
+          test "$(find stats -name 'event1-*.stats.json' | wc -l)" -eq 8
+          A=(); for f in $(find stats -name 'event1-*.stats.json' | sort); do A+=(--stats "$f"); done
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" merge "${A[@]}" \
+            --old-params old.json --roots roots.json --out-params event_params1.json --out-summary event_merge1.json --update-events
+          rclone copyto event_params1.json "$R:$OUT_DRIVE/params/event_params1.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto event_merge1.json "$R:$OUT_DRIVE/params/event_merge1.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  event-pass2:
+    needs: event-merge1
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Final passenger inference against shared event-level timetable
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/event-pass2-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$PROPOSAL_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/params/event_params1.json" params.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" shard \
+            --edges edges.parquet --roots roots.json --routes routes.json --params params.json \
+            --out-stats "event2-$I.stats.json" --chains-out "event2-$I.chains.parquet" --shard-index ${{ matrix.shard }}
+          rclone copyto "event2-$I.stats.json" "$R:$OUT_DRIVE/pass2/event2-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "event2-$I.chains.parquet" "$R:$OUT_DRIVE/chains/event2-$I.chains.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+
+  event-final:
+    needs: event-pass2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime
+        run: |
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Freeze event timetable and produce final full-day result
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/event-final"; mkdir -p "$W/stats"; cd "$W"
+          rclone copy "$R:$OUT_DRIVE/pass2" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OUT_DRIVE/params/event_params1.json" old.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          test "$(find stats -name 'event2-*.stats.json' | wc -l)" -eq 8
+          A=(); for f in $(find stats -name 'event2-*.stats.json' | sort); do A+=(--stats "$f"); done
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" merge "${A[@]}" \
+            --old-params old.json --roots roots.json --out-params event_params_final.json --out-summary event_merge_final.json
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" finalize \
+            --params event_params_final.json --roots roots.json --merge-summary event_merge_final.json \
+            --out HZ_2019-01-04_R1_EVENT_LEVEL_JOINT_FULL_DAY.json
           python - <<'PY'
           import json
-          x=json.load(open('HZ_2019-01-04_R1_JOINT_FULL_DAY.json',encoding='utf-8'))
-          c=x['coverage']; d=x['diagnostics']
+          x=json.load(open('HZ_2019-01-04_R1_EVENT_LEVEL_JOINT_FULL_DAY.json',encoding='utf-8'))
+          c=x['coverage']; j=x['joint_parameters']; d=x['diagnostics']
           assert c['service_root_count']==1673, c
           assert c['service_event_count']==43584, c
           assert c['station_count']==81, c
-          assert c['transfer_movement_count']>0 and c['transfer_path_count']==2*c['transfer_movement_count'], c
-          assert c['resolved_passenger_mass']>0 and c['resolved_share']>0
+          assert c['transfer_movement_count']==9 and c['transfer_path_count']==18, c
           assert d['max_abs_map_chain_time_closure_error_s'] <= 1e-6, d
-          assert all(z['access_interval_s'][0] >= 5 and z['egress_interval_s'][0] >= 5 for z in x['station_movement_intervals'])
-          assert all(p['transfer_interval_s'][0] >= 5 for z in x['transfer_path_intervals'] for p in z['paths'])
-          print(json.dumps({'status':x['status'],'coverage':c,'joint_parameters':x['joint_parameters'],'diagnostics':d},ensure_ascii=False,indent=2))
+          assert j['service_event_offsets_nonzero']>0, j
+          assert j['service_event_offset_bound_hits']==0, j
+          assert all(z['access_interval_s'][0]>=5 and z['egress_interval_s'][0]>=5 for z in x['station_movement_intervals'])
+          assert all(p['transfer_interval_s'][0]>=5 for z in x['transfer_path_intervals'] for p in z['paths'])
+          print(json.dumps({'status':x['status'],'coverage':c,'joint_parameters':j,'diagnostics':d},ensure_ascii=False,indent=2))
           PY
-          rclone copyto params1.json "$R:$JOINT_OUT_DRIVE/final/params1.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto merge1.json "$R:$JOINT_OUT_DRIVE/final/merge1.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto HZ_2019-01-04_R1_JOINT_FULL_DAY.json "$R:$JOINT_OUT_DRIVE/final/HZ_2019-01-04_R1_JOINT_FULL_DAY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto event_params_final.json "$R:$OUT_DRIVE/final/event_params_final.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto event_merge_final.json "$R:$OUT_DRIVE/final/event_merge_final.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto HZ_2019-01-04_R1_EVENT_LEVEL_JOINT_FULL_DAY.json "$R:$OUT_DRIVE/final/HZ_2019-01-04_R1_EVENT_LEVEL_JOINT_FULL_DAY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"

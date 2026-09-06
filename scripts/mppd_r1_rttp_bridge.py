@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 RTTP_PROVIDER_REPOSITORY = "54wsdf/rail-transit-timetable-platform"
 RTTP_PROVIDER_BRANCH = "development/rttp-conditional-research-continuation-20260901"
-RTTP_PROVIDER_SHA = "72f4a5900bd341bbc4d29c4c6f51604e58c70b00"
+RTTP_PROVIDER_SHA = "d812bb9a55a6c8763effb05e07b3a77309f0da5b"
 RTTP_PROVIDER_CONTRACT = "rttp.mppd-r1-provider.v0.2"
 RTTP_PROVIDER_MODULE = "rttp.integrations.mppd_r1"
 

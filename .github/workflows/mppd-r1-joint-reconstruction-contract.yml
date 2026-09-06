@@ -1,0 +1,48 @@
+name: MPPD R1 Joint Reconstruction Contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/mppd_r1_joint_reconstruction_validate.py'
+      - 'tests/test_mppd_r1_joint_reconstruction_validate.py'
+      - '.github/workflows/mppd-r1-joint-reconstruction-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scientific-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile validator
+        run: python -m py_compile scripts/mppd_r1_joint_reconstruction_validate.py
+      - name: Run deterministic validator self-test
+        run: python scripts/mppd_r1_joint_reconstruction_validate.py self-test
+      - name: Run scientific gate tests
+        run: python tests/test_mppd_r1_joint_reconstruction_validate.py
+      - name: Exercise canonical CLI on a valid joint world
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util, json
+          from pathlib import Path
+          p=Path('scripts/mppd_r1_joint_reconstruction_validate.py')
+          spec=importlib.util.spec_from_file_location('r1v',p)
+          m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          Path('/tmp/r1_joint_fixture.json').write_text(json.dumps(m.fixture()),encoding='utf-8')
+          PY
+          python scripts/mppd_r1_joint_reconstruction_validate.py validate --input /tmp/r1_joint_fixture.json --out /tmp/r1_joint_report.json
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/r1_joint_report.json',encoding='utf-8'))
+          assert x['status']=='QUALIFIED_R1_JOINT_RECONSTRUCTION'
+          assert all(x['qualification_gates'].values())
+          print(json.dumps(x,ensure_ascii=False,indent=2))
+          PY

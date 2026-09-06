@@ -1,0 +1,197 @@
+name: MPPD R1 Hangzhou Count-Free Service Clock Calibration 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-count-free-clock-calibration-20260906.yml'
+      - 'scripts/mppd_r1_hz_count_free_clock_calibration.py'
+      - 'tests/test_mppd_r1_hz_count_free_clock_calibration.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-count-free-clock-calibration-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  SERVICE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_clock_calibration_2019-01-04_20260906
+  TARGET_DATE: '2019-01-04'
+  SHARD_COUNT: '8'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test clock calibration semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow pytest
+          python -m py_compile scripts/mppd_r1_hz_count_free_clock_calibration.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_count_free_clock_calibration.py
+
+  clock-shard:
+    needs: unit-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/clock"
+      - name: Fetch full-day passenger, route and count-free service inputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clock"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$SERVICE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Score common AFC-ridge-to-service clock shifts
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clock"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_clock_calibration.py" shard \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services services.json \
+            --shard-index "$SHARD" \
+            --shard-count "$SHARD_COUNT" \
+            --shift-start-s 0 \
+            --shift-stop-s 240 \
+            --shift-step-s 15 \
+            --output "shard_$SHARD.json"
+      - name: Upload calibration shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: count-free-clock-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/clock/shard_${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  merge-and-apply:
+    needs: clock-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/clock_merge/shards"
+      - name: Download all shift-score shards
+        uses: actions/download-artifact@v5
+        with:
+          pattern: count-free-clock-shard-*
+          path: ${{ runner.temp }}/clock_merge/shards
+          merge-multiple: true
+      - name: Merge full-day clock grid
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clock_merge"
+          test "$(find shards -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 8
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_clock_calibration.py" merge \
+            --input-dir shards \
+            --output HZ_2019-01-04_R1_COUNT_FREE_CLOCK_CALIBRATION.json
+      - name: Restore Drive configuration and fetch original count-free services
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/clock_merge"
+          rclone copyto "$R:$SERVICE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Materialize clock-calibrated service field
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clock_merge"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_clock_calibration.py" apply \
+            --services services.json \
+            --calibration HZ_2019-01-04_R1_COUNT_FREE_CLOCK_CALIBRATION.json \
+            --output HZ_2019-01-04_R1_COUNT_FREE_SERVICE_CLOCK_CALIBRATED.json
+      - name: Persist calibration and adjusted services
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clock_merge"
+          rclone copyto HZ_2019-01-04_R1_COUNT_FREE_CLOCK_CALIBRATION.json "$REMOTE_NAME:$OUT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_CLOCK_CALIBRATION.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto HZ_2019-01-04_R1_COUNT_FREE_SERVICE_CLOCK_CALIBRATED.json "$REMOTE_NAME:$OUT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_CLOCK_CALIBRATED.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload calibration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-count-free-clock-calibration
+          path: |
+            ${{ runner.temp }}/clock_merge/HZ_2019-01-04_R1_COUNT_FREE_CLOCK_CALIBRATION.json
+            ${{ runner.temp }}/clock_merge/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_CLOCK_CALIBRATED.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

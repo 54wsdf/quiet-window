@@ -118,6 +118,59 @@ class ServiceTrajectoryState:
         return errors
 
 
+CirculationChainType = Literal["TURNBACK", "THROUGH_RUNNING", "MIXED"]
+CirculationStartBoundary = Literal["UNRESOLVED", "DEPOT_EXIT", "NETWORK_BOUNDARY"]
+CirculationEndBoundary = Literal["UNRESOLVED", "DEPOT_ENTRY", "NETWORK_BOUNDARY"]
+
+
+@dataclass
+class ServiceCirculationState:
+    """Inferred passenger-service successor chain, not a physical trainset identity.
+
+    The chain says which inferred revenue-service trajectories are hypothesized to
+    continue one another.  `physical_vehicle_identity_claimed` must remain false;
+    mapping a chain to a real rolling-stock vehicle requires separate circulation,
+    depot and rolling-stock evidence.
+    """
+
+    circulation_id: str
+    ordered_trajectory_ids: list[str]
+    chain_type: CirculationChainType = "TURNBACK"
+    start_boundary: CirculationStartBoundary = "UNRESOLVED"
+    end_boundary: CirculationEndBoundary = "UNRESOLVED"
+    linkage_method: str = "INFERRED_SERVICE_SUCCESSOR_CHAIN"
+    confidence: float | None = None
+    evidence_score: float = 0.0
+    physical_vehicle_identity_claimed: bool = False
+
+    def validate_basic(self) -> list[str]:
+        errors: list[str] = []
+        if not self.circulation_id:
+            errors.append("empty circulation_id")
+        if not self.ordered_trajectory_ids:
+            errors.append(f"{self.circulation_id}: circulation contains no service trajectories")
+        if len(self.ordered_trajectory_ids) != len(set(self.ordered_trajectory_ids)):
+            errors.append(f"{self.circulation_id}: duplicate trajectory in one circulation")
+        if self.chain_type not in {"TURNBACK", "THROUGH_RUNNING", "MIXED"}:
+            errors.append(f"{self.circulation_id}: unknown chain_type {self.chain_type}")
+        if self.start_boundary not in {"UNRESOLVED", "DEPOT_EXIT", "NETWORK_BOUNDARY"}:
+            errors.append(f"{self.circulation_id}: invalid start boundary {self.start_boundary}")
+        if self.end_boundary not in {"UNRESOLVED", "DEPOT_ENTRY", "NETWORK_BOUNDARY"}:
+            errors.append(f"{self.circulation_id}: invalid end boundary {self.end_boundary}")
+        if not self.linkage_method:
+            errors.append(f"{self.circulation_id}: linkage_method is empty")
+        if self.confidence is not None:
+            if not finite(self.confidence) or not 0.0 <= float(self.confidence) <= 1.0:
+                errors.append(f"{self.circulation_id}: confidence must be in [0, 1]")
+        if not finite(self.evidence_score):
+            errors.append(f"{self.circulation_id}: evidence_score is not finite")
+        if self.physical_vehicle_identity_claimed:
+            errors.append(
+                f"{self.circulation_id}: R1 service circulation may not claim physical vehicle identity"
+            )
+        return errors
+
+
 @dataclass
 class StationMovementState:
     station_id: str
@@ -212,6 +265,7 @@ class JointState:
     iteration: int
     config: R1Config
     services: list[ServiceTrajectoryState]
+    service_circulations: list[ServiceCirculationState] = field(default_factory=list)
     station_movements: list[StationMovementState] = field(default_factory=list)
     transfer_movements: list[TransferMovementState] = field(default_factory=list)
     passenger_summary: PassengerPosteriorSummary | None = None
@@ -221,6 +275,58 @@ class JointState:
     @property
     def inferred_service_count(self) -> int:
         return len(self.services)
+
+    def _circulation_validation_errors(self) -> list[str]:
+        errors: list[str] = []
+        by_id = {service.trajectory_id: service for service in self.services}
+        circulation_ids = [row.circulation_id for row in self.service_circulations]
+        if len(circulation_ids) != len(set(circulation_ids)):
+            errors.append("duplicate circulation_id")
+
+        owner: dict[str, str] = {}
+        for row in self.service_circulations:
+            errors.extend(row.validate_basic())
+            services_in_chain: list[ServiceTrajectoryState] = []
+            for trajectory_id in row.ordered_trajectory_ids:
+                service = by_id.get(trajectory_id)
+                if service is None:
+                    errors.append(
+                        f"{row.circulation_id}: references missing trajectory {trajectory_id}"
+                    )
+                    continue
+                if trajectory_id in owner:
+                    errors.append(
+                        f"trajectory {trajectory_id} appears in both {owner[trajectory_id]} and {row.circulation_id}"
+                    )
+                else:
+                    owner[trajectory_id] = row.circulation_id
+                services_in_chain.append(service)
+
+            for left, right in zip(services_in_chain, services_in_chain[1:]):
+                left_events = sorted(left.events, key=lambda e: e.sequence_index)
+                right_events = sorted(right.events, key=lambda e: e.sequence_index)
+                if not left_events or not right_events:
+                    continue
+                if left_events[-1].station_id != right_events[0].station_id:
+                    errors.append(
+                        f"{row.circulation_id}: successor station mismatch {left.trajectory_id}->{right.trajectory_id}"
+                    )
+                if row.chain_type == "TURNBACK" and left.direction_id == right.direction_id:
+                    errors.append(
+                        f"{row.circulation_id}: turnback successor keeps direction {left.direction_id}"
+                    )
+                if self.stage == FINE_STAGE:
+                    left_terminal = left_events[-1].arrival_time_s
+                    right_origin = right_events[0].departure_time_s
+                else:
+                    left_terminal = left_events[-1].anchor_time_s
+                    right_origin = right_events[0].anchor_time_s
+                if finite(left_terminal) and finite(right_origin):
+                    if float(right_origin) <= float(left_terminal):
+                        errors.append(
+                            f"{row.circulation_id}: non-positive successor/turnback time {left.trajectory_id}->{right.trajectory_id}"
+                        )
+        return errors
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -237,6 +343,7 @@ class JointState:
         if len(ids) != len(set(ids)):
             errors.append("duplicate trajectory_id")
         errors.extend(x for s in self.services for x in s.validate(self.stage))
+        errors.extend(self._circulation_validation_errors())
         errors.extend(x for s in self.station_movements for x in s.validate(self.config))
         errors.extend(x for m in self.transfer_movements for x in m.validate(self.config))
         if self.passenger_summary is not None:
@@ -298,6 +405,7 @@ def bootstrap_from_count_free_discovery(doc: dict[str, Any]) -> JointState:
         iteration=0,
         config=R1Config(),
         services=services,
+        service_circulations=[],
         metadata={
             "warm_start_only": True,
             "service_count_is_free_after_bootstrap": True,
@@ -306,6 +414,8 @@ def bootstrap_from_count_free_discovery(doc: dict[str, Any]) -> JointState:
             "legacy_baseline": doc.get("legacy_baseline"),
             "planned_timetable_used": False,
             "legacy_candidate_roots_used_as_input": False,
+            "service_circulation_status": "UNINFERRED",
+            "physical_vehicle_identity_claimed": False,
         },
     )
     errors = state.validate()

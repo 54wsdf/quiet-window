@@ -1,0 +1,304 @@
+name: MPPD R1 Hangzhou Birth Bootstrap Stability 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-birth-bootstrap-stability-20260906.yml'
+      - 'scripts/mppd_r1_hz_count_free_service_v2.py'
+      - 'scripts/mppd_r1_hz_resampled_birth_discovery.py'
+      - 'scripts/mppd_r1_hz_birth_bootstrap_stability.py'
+      - 'scripts/mppd_r1_hz_b_family_evidence_audit.py'
+      - 'tests/test_mppd_r1_hz_multires_service_count_v2.py'
+      - 'tests/test_mppd_r1_hz_birth_bootstrap_stability.py'
+      - 'tests/test_mppd_r1_hz_b_family_evidence_audit.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-birth-bootstrap-stability-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  AFC_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/birth_bootstrap_stability
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test evidence stability primitives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pytest
+          python -m py_compile \
+            scripts/mppd_r1_hz_count_free_service_v2.py \
+            scripts/mppd_r1_hz_resampled_birth_discovery.py \
+            scripts/mppd_r1_hz_birth_bootstrap_stability.py \
+            scripts/mppd_r1_hz_b_family_evidence_audit.py
+          PYTHONPATH="$PWD" pytest -q \
+            tests/test_mppd_r1_hz_multires_service_count_v2.py \
+            tests/test_mppd_r1_hz_birth_bootstrap_stability.py \
+            tests/test_mppd_r1_hz_b_family_evidence_audit.py
+
+  full-data:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/full"
+      - name: Fetch raw AFC
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/full"
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-04.csv.gz" afc_04.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-05.csv.gz" afc_05.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Re-estimate full-data coarse and five-second worlds with evidence IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/full"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_resampled_birth_discovery.py" \
+            --input afc_04.csv.gz --input afc_05.csv.gz \
+            --service-date "$TARGET_DATE" --iterations 3 \
+            --output full.json --coarse-output coarse.json --fine-output fine5.json
+          python - <<'PY'
+          import json
+          x=json.load(open('full.json',encoding='utf-8'))
+          assert x['coarse_service_count']==1841, x['coarse_service_count']
+          assert all(t.get('support_event_ids') for t in x['coarse_support_trajectories']), 'coarse support evidence missing'
+          print(json.dumps({'coarse_N':x['coarse_service_count'],'fine_N':x['fine_five_second_service_count'],'birth_counts':{k:v['birth_count'] for k,v in x['frontier'].items()}},ensure_ascii=False,indent=2))
+          PY
+      - name: Audit B main-branch shared-trunk evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/full"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_b_family_evidence_audit.py" \
+            --parent-services coarse.json --fine-services fine5.json --output b_family.json
+      - name: Upload full-data evidence world
+        uses: actions/upload-artifact@v4
+        with:
+          name: r1-full-evidence-world
+          path: |
+            ${{ runner.temp }}/full/full.json
+            ${{ runner.temp }}/full/coarse.json
+            ${{ runner.temp }}/full/fine5.json
+            ${{ runner.temp }}/full/b_family.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  bootstrap:
+    needs: unit-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1101, 1102, 1103, 1104, 1105, 1106]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/rep"
+      - name: Fetch raw AFC
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/rep"
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-04.csv.gz" afc_04.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-05.csv.gz" afc_05.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Re-estimate service support under Poisson bootstrap
+        shell: bash
+        env:
+          BOOTSTRAP_SEED: ${{ matrix.seed }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/rep"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_resampled_birth_discovery.py" \
+            --input afc_04.csv.gz --input afc_05.csv.gz \
+            --service-date "$TARGET_DATE" --bootstrap-seed "$BOOTSTRAP_SEED" --iterations 3 \
+            --output "rep_${BOOTSTRAP_SEED}.json"
+      - name: Upload bootstrap structural replicate
+        uses: actions/upload-artifact@v4
+        with:
+          name: r1-bootstrap-${{ matrix.seed }}
+          path: ${{ runner.temp }}/rep/rep_${{ matrix.seed }}.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  summarize:
+    needs: [full-data, bootstrap]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: r1-full-evidence-world
+          path: ${{ runner.temp }}/full
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: r1-bootstrap-*
+          path: ${{ runner.temp }}/reps
+      - name: Match full-data births across bootstrap service worlds
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t REPS < <(find "$RUNNER_TEMP/reps" -name 'rep_*.json' -type f | sort)
+          test "${#REPS[@]}" -eq 6
+          ARGS=()
+          for p in "${REPS[@]}"; do ARGS+=(--replicate "$p"); done
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_birth_bootstrap_stability.py" \
+            --full "$RUNNER_TEMP/full/full.json" "${ARGS[@]}" \
+            --output "$RUNNER_TEMP/stability.json"
+      - name: Intersect bootstrap stability with B shared-trunk family gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, pathlib
+          root=pathlib.Path('${{ runner.temp }}')
+          s=json.load(open(root/'stability.json',encoding='utf-8'))
+          b=json.load(open(root/'full'/'b_family.json',encoding='utf-8'))
+          points={}
+          for label, sp in s['frontier'].items():
+              bp=b['frontier'][label]
+              rejected={x['trajectory_id'] for x in bp['b_birth_audit'] if x['classification']!='SURVIVES_B_SHARED_TRUNK_EVIDENCE_GATE'}
+              stable=[x for x in sp['candidates'] if x['stable_two_thirds'] and x['trajectory_id'] not in rejected]
+              strong=[x for x in sp['candidates'] if x['strong_stable_five_sixths'] and x['trajectory_id'] not in rejected]
+              points[label]={
+                  'novelty_radius_s':sp['novelty_radius_s'],
+                  'minimum_evidence_score':sp['minimum_evidence_score'],
+                  'full_data_birth_count':sp['full_data_birth_count'],
+                  'bootstrap_stable_birth_count_before_B_gate':sp['stable_birth_count_two_thirds'],
+                  'bootstrap_strong_stable_birth_count_before_B_gate':sp['strong_stable_birth_count_five_sixths'],
+                  'B_family_rejected_birth_count':len(rejected),
+                  'stable_birth_count_after_B_gate':len(stable),
+                  'strong_stable_birth_count_after_B_gate':len(strong),
+                  'stable_service_count_after_B_gate':s['full_data_coarse_service_count']+len(stable),
+                  'strong_stable_service_count_after_B_gate':s['full_data_coarse_service_count']+len(strong),
+                  'stable_births_by_line_direction':{
+                      k:sum(f"{x['afc_line']}:{x['direction']}"==k for x in stable)
+                      for k in sorted({f"{x['afc_line']}:{x['direction']}" for x in stable})
+                  },
+                  'bootstrap_augmented_count_range':{
+                      'min':sp['bootstrap_augmented_count_min'],
+                      'median':sp['bootstrap_augmented_count_median'],
+                      'max':sp['bootstrap_augmented_count_max'],
+                  },
+                  'stable_births':[{
+                      'trajectory_id':x['trajectory_id'],
+                      'afc_line':x['afc_line'],
+                      'direction':x['direction'],
+                      'path_id':x['path_id'],
+                      'path_ambiguous':x['path_ambiguous'],
+                      'anchor_time_s':x['anchor_time_s'],
+                      'evidence_score':x['evidence_score'],
+                      'recovered_replicate_count':x['recovered_replicate_count'],
+                      'recovered_fraction':x['recovered_fraction'],
+                      'recovery_source_counts':x['recovery_source_counts'],
+                  } for x in stable],
+              }
+          counts=sorted({x['stable_service_count_after_B_gate'] for x in points.values()})
+          strong_counts=sorted({x['strong_stable_service_count_after_B_gate'] for x in points.values()})
+          out={
+              'schema':'mppd.r1-hz-structural-service-count-qualification.v1',
+              'status':'STRUCTURAL_SERVICE_COUNT_STABILITY_COMPLETED_DEATH_SPLIT_REPLACEMENT_OPEN',
+              'full_data_coarse_service_count':s['full_data_coarse_service_count'],
+              'full_data_five_second_independent_count':s['full_data_fine_five_second_service_count'],
+              'bootstrap_replicate_count':s['bootstrap_replicate_count'],
+              'bootstrap_coarse_service_count':s['bootstrap_coarse_service_count'],
+              'frontier':points,
+              'stable_service_count_frontier_after_B_gate':counts,
+              'strong_stable_service_count_frontier_after_B_gate':strong_counts,
+              'scientific_boundary':'These counts survive AFC Poisson-bootstrap recovery and B main/branch shared-trunk duplicate filtering. Final N is not selected until parent death and split-replacement alternatives are tested with passenger/movement posterior scoring.',
+              'semantics':{
+                  'planned_timetable_used':False,
+                  'service_count_reestimated_in_every_bootstrap':True,
+                  'recovery_as_coarse_or_residual_service_both_count_as_stable':True,
+                  'B_shared_trunk_pulse_duplicates_removed_before_counting_stable_births':True,
+                  'five_second_grid_is_not_minimum_headway':True,
+              }
+          }
+          path=root/'R1_STRUCTURAL_SERVICE_COUNT_QUALIFICATION.json'
+          path.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist structural qualification to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone copyto "$RUNNER_TEMP/stability.json" "$R:$OUT_DRIVE/R1_BIRTH_BOOTSTRAP_STABILITY.json" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$RUNNER_TEMP/full/b_family.json" "$R:$OUT_DRIVE/R1_B_FAMILY_EVIDENCE_AUDIT.json" --config "$C" --retries 6 --low-level-retries 15
+          rclone copyto "$RUNNER_TEMP/R1_STRUCTURAL_SERVICE_COUNT_QUALIFICATION.json" "$R:$OUT_DRIVE/R1_STRUCTURAL_SERVICE_COUNT_QUALIFICATION.json" --config "$C" --retries 6 --low-level-retries 15
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-structural-service-count-qualification
+          path: |
+            ${{ runner.temp }}/stability.json
+            ${{ runner.temp }}/full/b_family.json
+            ${{ runner.temp }}/R1_STRUCTURAL_SERVICE_COUNT_QUALIFICATION.json
+          if-no-files-found: error
+          retention-days: 30

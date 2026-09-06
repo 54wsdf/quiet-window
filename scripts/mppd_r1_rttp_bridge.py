@@ -266,6 +266,7 @@ def joint_state_to_provider_payload(
         if isinstance(raw_events, (str, bytes)) or not isinstance(raw_events, Sequence):
             raise ValueError(f"R1 service {trajectory_id} events must be a sequence")
         events: list[dict[str, Any]] = []
+        previous_departure_s: int | None = None
         for expected_sequence, raw_event in enumerate(raw_events):
             event = _mapping(raw_event, name="R1 event")
             sequence_index = int(event.get("sequence_index", -1))
@@ -287,6 +288,11 @@ def joint_state_to_provider_payload(
                 raise ValueError(
                     f"R1 service {trajectory_id} departure precedes arrival"
                 )
+            if previous_departure_s is not None and arrival_s <= previous_departure_s:
+                raise ValueError(
+                    f"R1 service {trajectory_id} has non-positive interstation running time"
+                )
+            previous_departure_s = departure_s
             events.append(
                 {
                     "station_id": str(event.get("station_id", "")),
@@ -352,10 +358,12 @@ def normalize_r1_operations_for_rttp(
                 raise ValueError(
                     f"R1 {op_type} requires explicit lowered_operations before RTTP handoff"
                 )
-            normalized.extend(
-                normalize_r1_operations_for_rttp(
-                    [item for item in lowered if isinstance(item, Mapping)]
+            if any(not isinstance(item, Mapping) for item in lowered):
+                raise ValueError(
+                    f"R1 {op_type} lowered_operations must contain only mappings"
                 )
+            normalized.extend(
+                normalize_r1_operations_for_rttp(list(lowered))
             )
             continue
         if op_type not in (

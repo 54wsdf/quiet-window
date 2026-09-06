@@ -3,9 +3,15 @@
   "provider": {
     "repository": "54wsdf/rail-transit-timetable-platform",
     "branch_at_pin": "development/rttp-conditional-research-continuation-20260901",
-    "commit_sha": "72f4a5900bd341bbc4d29c4c6f51604e58c70b00",
+    "commit_sha": "d812bb9a55a6c8763effb05e07b3a77309f0da5b",
     "module": "rttp.integrations.mppd_r1",
-    "contract_version": "rttp.mppd-r1-provider.v0.2"
+    "contract_version": "rttp.mppd-r1-provider.v0.2",
+    "qualified_source_features": [
+      "count_free_network_substrate",
+      "fine_arrival_departure_materialization",
+      "service_circulation_without_physical_vehicle_identity",
+      "circulation_trip_bounds_use_first_departure_and_last_arrival"
+    ]
   },
   "authority_boundary": {
     "count_free_network_input": "NETWORK_AND_TRANSFER_PHYSICAL_DOMAIN_ONLY",

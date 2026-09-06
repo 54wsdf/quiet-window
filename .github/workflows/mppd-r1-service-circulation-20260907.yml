@@ -8,10 +8,12 @@ on:
       - 'scripts/mppd_r1_joint_model.py'
       - 'scripts/mppd_r1_joint_solver.py'
       - 'scripts/mppd_r1_service_circulation.py'
+      - 'scripts/mppd_r1_joint_validation_v2.py'
       - 'scripts/mppd_r1_hz_network_authority.py'
       - 'tests/test_mppd_r1_joint_model.py'
       - 'tests/test_mppd_r1_joint_solver.py'
       - 'tests/test_mppd_r1_service_circulation.py'
+      - 'tests/test_mppd_r1_joint_validation_circulation.py'
   workflow_dispatch:
 
 permissions:
@@ -35,11 +37,13 @@ jobs:
             scripts/mppd_r1_joint_model.py \
             scripts/mppd_r1_joint_solver.py \
             scripts/mppd_r1_service_circulation.py \
+            scripts/mppd_r1_joint_validation_v2.py \
             scripts/mppd_r1_hz_network_authority.py
           PYTHONPATH="$PWD" python -m pytest -q \
             tests/test_mppd_r1_joint_model.py \
             tests/test_mppd_r1_joint_solver.py \
-            tests/test_mppd_r1_service_circulation.py
+            tests/test_mppd_r1_service_circulation.py \
+            tests/test_mppd_r1_joint_validation_circulation.py
 
       - name: Derive only geometric terminal reversals from Hangzhou network authority
         shell: bash

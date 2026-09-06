@@ -94,7 +94,7 @@ def load_exit_counts_poisson_bootstrap(
     }
 
 
-def compact_birth(row: dict[str, Any]) -> dict[str, Any]:
+def compact_trajectory(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "trajectory_id": str(row.get("trajectory_id")),
         "afc_line": str(row.get("afc_line")),
@@ -152,7 +152,7 @@ def discover_from_counts(
             "birth_count": len(births),
             "births_by_line_direction": dict(Counter(f"{x['afc_line']}:{x['direction']}" for x in births)),
             "excluded_counts": excluded,
-            "births": [compact_birth(x) for x in births],
+            "births": [compact_trajectory(x) for x in births],
         }
     return coarse, fine, frontier
 
@@ -187,6 +187,7 @@ def main() -> None:
         "source_profile": source_profile,
         "coarse_service_count": int(coarse["inferred_service_trajectory_count"]),
         "fine_five_second_service_count": int(fine["inferred_service_trajectory_count"]),
+        "coarse_support_trajectories": [compact_trajectory(x) for x in coarse.get("trajectories", [])],
         "frontier": frontier,
         "semantics": {
             "planned_timetable_used": False,
@@ -195,6 +196,7 @@ def main() -> None:
             "poisson_bootstrap_preserves_expected_afc_intensity": a.bootstrap_seed is not None,
             "five_second_grid_is_observation_and_structure_resolution_not_minimum_headway": True,
             "support_event_ids_are_preserved_for_cross_resample_evidence_matching": True,
+            "full_data_birth_can_be_recovered_as_coarse_service_in_a_resample": True,
         },
     }
     a.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

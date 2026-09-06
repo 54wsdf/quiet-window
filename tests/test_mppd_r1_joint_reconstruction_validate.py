@@ -9,12 +9,12 @@ assert spec and spec.loader
 spec.loader.exec_module(r1v)
 
 def assert_bad(doc, code):
-    report = r1v.validate(doc)
+    report = r1v.validate(doc, r1v.authority_fixture())
     assert report["status"] == "R1_JOINT_RECONSTRUCTION_NOT_QUALIFIED", report
     assert report["violation_counts"].get(code, 0) > 0, report
 
 def test_valid_joint_world():
-    report = r1v.validate(r1v.fixture())
+    report = r1v.validate(r1v.fixture(), r1v.authority_fixture())
     assert report["status"] == "QUALIFIED_R1_JOINT_RECONSTRUCTION", report
     assert all(report["qualification_gates"].values())
 
@@ -42,6 +42,13 @@ def test_rejects_transfer_outside_selected_path_interval():
     doc = r1v.fixture()
     doc["passenger_chains"][0]["transfers"][0]["transfer_time_s"] = 25.0
     assert_bad(doc, "transfer_membership")
+
+def test_rejects_self_declared_incomplete_authority():
+    authority = r1v.authority_fixture()
+    authority["schema"] = "wrong"
+    report = r1v.validate(r1v.fixture(), authority)
+    assert report["status"] == "R1_JOINT_RECONSTRUCTION_NOT_QUALIFIED", report
+    assert report["violation_counts"].get("authority", 0) > 0, report
 
 if __name__ == "__main__":
     tests=[v for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -6,6 +6,7 @@ from typing import Any
 
 SCHEMA="mppd.r1-joint-reconstruction.v1"
 REPORT_SCHEMA="mppd.r1-joint-reconstruction-validation.v1"
+AUTHORITY_SCHEMA="mppd.r1-reconstruction-authority.v1"
 MIN_MOVE_S=5.0
 MIN_PATHS=2
 TOL=1e-6
@@ -17,7 +18,7 @@ def interval(x):
 def ekey(service,station): return str(service),str(station)
 def mkey(station,fl,fd,tl,td): return tuple(map(str,(station,fl,fd,tl,td)))
 
-def validate(doc:dict[str,Any], tol=TOL):
+def validate(doc:dict[str,Any], authority:dict[str,Any], tol=TOL):
     vc=defaultdict(int); ex=defaultdict(list)
     def bad(code,msg):
         vc[code]+=1
@@ -36,7 +37,10 @@ def validate(doc:dict[str,Any], tol=TOL):
     min_move=max(MIN_MOVE_S,float(con.get("minimum_physical_move_s",MIN_MOVE_S)))
     min_paths=max(MIN_PATHS,int(con.get("minimum_transfer_paths_per_movement",MIN_PATHS)))
 
-    inv=doc.get("inventory",{})
+    if not isinstance(authority,dict) or authority.get("schema")!=AUTHORITY_SCHEMA:
+        bad("authority",f"external authority schema must be {AUTHORITY_SCHEMA}")
+        authority={}
+    inv=authority
     stations={str(x) for x in inv.get("station_ids",[])}
     events={ekey(x["service_id"],x["station_id"]) for x in inv.get("service_event_keys",[])
             if isinstance(x,dict) and {"service_id","station_id"}<=x.keys()}
@@ -47,7 +51,7 @@ def validate(doc:dict[str,Any], tol=TOL):
     if not events: bad("inventory","complete service_event_keys required")
     if not moves: bad("inventory","complete transfer_movements required")
 
-    # Realized timetable: every declared train/station event must be reconstructed.
+    # realized timetable
     ei={}; smeta={}; seqs=defaultdict(list)
     for i,r in enumerate(doc.get("realized_service_timetable",[])):
         req={"service_id","station_id","line_id","direction_id","arrival_time_s","departure_time_s"}
@@ -60,7 +64,8 @@ def validate(doc:dict[str,Any], tol=TOL):
         if float(r["departure_time_s"])+tol<float(r["arrival_time_s"]):
             bad("service_time",f"{key} dep<arr")
         ei[key]=r; seqs[str(r["service_id"])].append(r)
-        meta=(str(r["line_id"]),str(r["direction_id"])); sid=str(r["service_id"])
+        meta=(str(r["line_id"]),str(r["direction_id"]))
+        sid=str(r["service_id"])
         if sid in smeta and smeta[sid]!=meta: bad("service_metadata",f"{sid} line/direction changed")
         smeta[sid]=meta
     for x in sorted(events-set(ei)): bad("service_coverage",f"missing {x}")
@@ -72,7 +77,7 @@ def validate(doc:dict[str,Any], tol=TOL):
                 if float(b["arrival_time_s"])+tol<float(a["arrival_time_s"]): bad("service_monotonicity",sid)
                 if float(b["departure_time_s"])+tol<float(a["departure_time_s"]): bad("service_monotonicity",sid)
 
-    # Every station must have its own access and egress interval.
+    # all stations access/egress intervals
     si={}
     for i,r in enumerate(doc.get("station_movement_intervals",[])):
         if not isinstance(r,dict) or "station_id" not in r: bad("station_interval",f"row {i}"); continue
@@ -88,7 +93,7 @@ def validate(doc:dict[str,Any], tol=TOL):
     for s in sorted(stations-set(si)): bad("station_coverage",f"missing {s}")
     for s in sorted(set(si)-stations): bad("station_coverage",f"undeclared {s}")
 
-    # Every transfer movement must expose multiple internal paths, each with its own interval.
+    # every transfer movement has multiple internal paths
     ti={}
     for i,r in enumerate(doc.get("transfer_path_intervals",[])):
         req={"station_id","from_line_id","from_direction_id","to_line_id","to_direction_id"}
@@ -111,7 +116,7 @@ def validate(doc:dict[str,Any], tol=TOL):
     for k in sorted(moves-set(ti)): bad("transfer_coverage",f"missing {k}")
     for k in sorted(set(ti)-moves): bad("transfer_coverage",f"undeclared {k}")
 
-    # Passenger chains must jointly reconcile timetable, station intervals and transfer paths.
+    # passenger chains bind all latent objects
     n=0; mass=0.0; maxerr=0.0; minwait=math.inf
     for i,p in enumerate(doc.get("passenger_chains",[])):
         if not isinstance(p,dict): bad("passenger_chain",f"row {i}"); continue
@@ -158,7 +163,8 @@ def validate(doc:dict[str,Any], tol=TOL):
                 bad("transfer_assignment",f"{pid}:{j}"); continue
             kt=float(tr["transfer_time_s"]); path=str(tr["path_id"])
             if kt<min_move-tol: bad("physical_lower_bound",f"{pid}:transfer{j}={kt}")
-            mk=mkey(prev[2],prev[3],prev[4],nxt[3],nxt[4]); paths=ti.get(mk)
+            mk=mkey(prev[2],prev[3],prev[4],nxt[3],nxt[4])
+            paths=ti.get(mk)
             if paths is None: bad("transfer_reference",f"{pid}:{mk}")
             elif path not in paths: bad("transfer_reference",f"{pid}:{mk}/{path}")
             else:
@@ -176,7 +182,7 @@ def validate(doc:dict[str,Any], tol=TOL):
     if n==0: bad("passenger_coverage","no passenger chains")
 
     gates={
-      "joint_semantics":vc["schema"]==vc["semantics"]==0,
+      "joint_semantics":vc["schema"]==vc["semantics"]==vc["authority"]==0,
       "complete_realized_service_timetable":sum(vc[x] for x in ("inventory","service_event","service_duplicate","service_time","service_coverage","service_monotonicity"))==0,
       "complete_station_access_egress_intervals":sum(vc[x] for x in ("station_interval","station_duplicate","station_coverage"))==0,
       "complete_multi_path_transfer_intervals":sum(vc[x] for x in ("transfer_interval","transfer_duplicate","transfer_path","transfer_path_duplicate","transfer_path_multiplicity","transfer_coverage"))==0,
@@ -190,6 +196,7 @@ def validate(doc:dict[str,Any], tol=TOL):
     return {
       "schema":REPORT_SCHEMA,
       "status":"QUALIFIED_R1_JOINT_RECONSTRUCTION" if passed else "R1_JOINT_RECONSTRUCTION_NOT_QUALIFIED",
+      "authority":{"schema":authority.get("schema") if isinstance(authority,dict) else None},
       "constraints":{"minimum_physical_move_s":min_move,"minimum_transfer_paths_per_movement":min_paths,"time_tolerance_s":tol},
       "coverage":{"expected_station_count":len(stations),"reconstructed_station_count":len(si),
                   "expected_service_event_count":len(events),"reconstructed_service_event_count":len(ei),
@@ -203,17 +210,22 @@ def validate(doc:dict[str,Any], tol=TOL):
       "violation_examples":dict(sorted(ex.items()))
     }
 
+def authority_fixture():
+    return {
+      "schema":AUTHORITY_SCHEMA,
+      "station_ids":["O","X","D"],
+      "service_event_keys":[{"service_id":"S1","station_id":"O"},{"service_id":"S1","station_id":"X"},
+                            {"service_id":"S2","station_id":"X"},{"service_id":"S2","station_id":"D"}],
+      "transfer_movements":[{"station_id":"X","from_line_id":"L1","from_direction_id":"UP",
+                             "to_line_id":"L2","to_direction_id":"DOWN"}]
+    }
+
 def fixture():
     return {
       "schema":SCHEMA,
       "semantics":{"jointly_estimated":True,"actual_timetable_is_latent":True,
                    "planned_timetable_is_soft_prior":True,"r1_split_into_bcd":False},
       "constraints":{"minimum_physical_move_s":5.0,"minimum_transfer_paths_per_movement":2},
-      "inventory":{"station_ids":["O","X","D"],
-        "service_event_keys":[{"service_id":"S1","station_id":"O"},{"service_id":"S1","station_id":"X"},
-                              {"service_id":"S2","station_id":"X"},{"service_id":"S2","station_id":"D"}],
-        "transfer_movements":[{"station_id":"X","from_line_id":"L1","from_direction_id":"UP",
-                               "to_line_id":"L2","to_direction_id":"DOWN"}]},
       "realized_service_timetable":[
         {"service_id":"S1","station_id":"O","line_id":"L1","direction_id":"UP","sequence_index":0,"arrival_time_s":90,"departure_time_s":100},
         {"service_id":"S1","station_id":"X","line_id":"L1","direction_id":"UP","sequence_index":1,"arrival_time_s":200,"departure_time_s":210},
@@ -236,15 +248,15 @@ def fixture():
 def main():
     ap=argparse.ArgumentParser()
     sp=ap.add_subparsers(dest="cmd",required=True)
-    v=sp.add_parser("validate"); v.add_argument("--input",type=Path,required=True); v.add_argument("--out",type=Path)
+    v=sp.add_parser("validate"); v.add_argument("--input",type=Path,required=True); v.add_argument("--authority",type=Path,required=True); v.add_argument("--out",type=Path)
     sp.add_parser("self-test")
     a=ap.parse_args()
     if a.cmd=="self-test":
-        r=validate(fixture()); assert r["status"]=="QUALIFIED_R1_JOINT_RECONSTRUCTION",r
+        r=validate(fixture(),authority_fixture()); assert r["status"]=="QUALIFIED_R1_JOINT_RECONSTRUCTION",r
         x=fixture(); x["transfer_path_intervals"][0]["paths"][0]["transfer_interval_s"][0]=1
-        r=validate(x); assert r["status"]!="QUALIFIED_R1_JOINT_RECONSTRUCTION",r
+        r=validate(x,authority_fixture()); assert r["status"]!="QUALIFIED_R1_JOINT_RECONSTRUCTION",r
         print("R1 joint reconstruction validator self-test PASS"); return 0
-    doc=json.loads(a.input.read_text(encoding="utf-8")); r=validate(doc)
+    doc=json.loads(a.input.read_text(encoding="utf-8")); authority=json.loads(a.authority.read_text(encoding="utf-8")); r=validate(doc,authority)
     text=json.dumps(r,ensure_ascii=False,indent=2,sort_keys=True)
     if a.out: a.out.write_text(text+"\n",encoding="utf-8")
     print(text); return 0 if r["status"]=="QUALIFIED_R1_JOINT_RECONSTRUCTION" else 2

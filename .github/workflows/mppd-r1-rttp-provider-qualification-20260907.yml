@@ -20,7 +20,7 @@ permissions:
 
 env:
   RTTP_REPOSITORY: 54wsdf/rail-transit-timetable-platform
-  RTTP_PROVIDER_SHA: 72f4a5900bd341bbc4d29c4c6f51604e58c70b00
+  RTTP_PROVIDER_SHA: d812bb9a55a6c8763effb05e07b3a77309f0da5b
   RTTP_PROVIDER_CONTRACT: rttp.mppd-r1-provider.v0.2
 
 jobs:
@@ -47,9 +47,10 @@ jobs:
           code = provider_lock()
           disk = json.loads(Path('contracts/MPPD_R1_RTTP_PROVIDER_LOCK.json').read_text(encoding='utf-8'))['provider']
           assert code['repository'] == disk['repository'] == '54wsdf/rail-transit-timetable-platform'
-          assert code['commit_sha'] == disk['commit_sha'] == '72f4a5900bd341bbc4d29c4c6f51604e58c70b00'
+          assert code['commit_sha'] == disk['commit_sha'] == 'd812bb9a55a6c8763effb05e07b3a77309f0da5b'
           assert code['provider_contract'] == disk['contract_version'] == 'rttp.mppd-r1-provider.v0.2'
           assert len(code['commit_sha']) == 40
+          assert 'circulation_trip_bounds_use_first_departure_and_last_arrival' in disk['qualified_source_features']
           PY
 
       - name: Compile and test the fail-closed bridge

@@ -1,4 +1,4 @@
-name: Rail HZ R1B1 Full-Day Genealogy Parallel 2026-09-05
+name: MPPD R1 HZ Full-Day Joint Inversion 2026-09-06
 
 on:
   push:
@@ -14,67 +14,19 @@ env:
   GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
   SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
   SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
-  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
-  JOINT_OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_full_day_2019-01-04_20260906
+  PROPOSAL_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b1_genealogy_2019-01-04_20260905
+  JOINT_OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_full_day_v2_2019-01-04_20260906
   TARGET_DATE: '2019-01-04'
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  genealogy:
+  joint-pass0:
     strategy:
       fail-fast: false
       matrix:
         shard: [0,1,2,3,4,5,6,7]
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install and validate runtime
-        run: |
-          set -euo pipefail
-          python -m pip install --disable-pip-version-check --quiet numpy pandas pyarrow
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          python -m py_compile scripts/rail_hz_r1b1_full_day_genealogy_20260905.py scripts/rail_hz_r1b_full_service_day_joint_update_20260905.py
-      - name: Reconstruct one exact genealogy partition from frozen E0 posterior
-        shell: bash
-        run: |
-          set -euo pipefail
-          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          I=$(printf '%02d' ${{ matrix.shard }})
-          W="$RUNNER_TEMP/genealogy-$I"; mkdir -p "$W"; cd "$W"
-          rclone copyto "$R:$SOURCE_DRIVE/shards/part-$I.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15
-          rclone copyto "$R:$SOURCE_DRIVE/global/E0_GLOBAL.json" E0_GLOBAL.json --config "$C" --retries 6 --low-level-retries 15
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15
-          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b1_full_day_genealogy_20260905.py" extract-shard \
-            --cohorts cohorts.parquet --routes routes.json --roots roots.json --e0-global E0_GLOBAL.json \
-            --edges "genealogy-$I.edges.parquet" --descendants "genealogy-$I.descendants.parquet" \
-            --root-mass "genealogy-$I.roots.parquet" --transfers "genealogy-$I.transfers.parquet" \
-            --summary "genealogy-$I.summary.json" --beam 16 --shard-index ${{ matrix.shard }}
-          python - <<'PY'
-          import json, glob
-          p=glob.glob('genealogy-*.summary.json')[0]
-          x=json.load(open(p,encoding='utf-8'))
-          assert x['status']=='QUALIFIED_R1B1_GENEALOGY_SHARD'
-          assert x['genealogy_mass_conservation_pass']
-          assert x['posterior_probability_normalization_pass']
-          print(json.dumps({k:x[k] for k in ['shard_index','passenger_mass','resolved_genealogy_mass','unresolved_genealogy_mass','posterior_lineage_edge_count','unique_descendant_state_count','weighted_mean_lineage_entropy_nats','weighted_mean_top_descendant_probability']},ensure_ascii=False,indent=2))
-          PY
-          rclone copy "genealogy-$I.edges.parquet" "$R:$OUT_DRIVE/partitions" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copy "genealogy-$I.summary.json" "$R:$OUT_DRIVE/summaries" --config "$C" --retries 6 --low-level-retries 15
-          rclone copy "genealogy-$I.descendants.parquet" "$R:$OUT_DRIVE/aggregates/descendants" --config "$C" --retries 6 --low-level-retries 15
-          rclone copy "genealogy-$I.roots.parquet" "$R:$OUT_DRIVE/aggregates/roots" --config "$C" --retries 6 --low-level-retries 15
-          rclone copy "genealogy-$I.transfers.parquet" "$R:$OUT_DRIVE/aggregates/transfers" --config "$C" --retries 6 --low-level-retries 15
-          shred -u "$C" 2>/dev/null || rm -f "$C"
-
-  merge-genealogy:
-    needs: genealogy
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -82,75 +34,23 @@ jobs:
           python-version: '3.12'
       - name: Install runtime
         run: |
-          set -euo pipefail
-          python -m pip install --disable-pip-version-check --quiet numpy pandas pyarrow
+          python -m pip install --disable-pip-version-check --quiet pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          python -m py_compile scripts/rail_hz_r1b1_full_day_genealogy_20260905.py
-      - name: Merge and qualify the full service day genealogy
+          python -m py_compile scripts/mppd_r1_hz_joint_full_day.py scripts/mppd_r1_hz_joint_service_projection.py
+      - name: Joint pass 0 with latent service-time projection
         shell: bash
         run: |
           set -euo pipefail
-          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          W="$RUNNER_TEMP/genealogy-merge"; mkdir -p "$W"; cd "$W"
-          mkdir -p summaries aggregates/descendants aggregates/roots aggregates/transfers
-          rclone copy "$R:$OUT_DRIVE/summaries" summaries --config "$C" --retries 6 --low-level-retries 15
-          rclone copy "$R:$OUT_DRIVE/aggregates/descendants" aggregates/descendants --config "$C" --retries 6 --low-level-retries 15
-          rclone copy "$R:$OUT_DRIVE/aggregates/roots" aggregates/roots --config "$C" --retries 6 --low-level-retries 15
-          rclone copy "$R:$OUT_DRIVE/aggregates/transfers" aggregates/transfers --config "$C" --retries 6 --low-level-retries 15
-          rclone copyto "$R:$SOURCE_DRIVE/global/E0_GLOBAL.json" E0_GLOBAL.json --config "$C" --retries 6 --low-level-retries 15
-          test "$(find summaries -name 'genealogy-*.summary.json' | wc -l)" -eq 8
-          S=(); for f in $(find summaries -name 'genealogy-*.summary.json' | sort); do S+=(--summary "$f"); done
-          D=(); for f in $(find aggregates/descendants -name 'genealogy-*.descendants.parquet' | sort); do D+=(--descendants "$f"); done
-          RM=(); for f in $(find aggregates/roots -name 'genealogy-*.roots.parquet' | sort); do RM+=(--root-mass "$f"); done
-          T=(); for f in $(find aggregates/transfers -name 'genealogy-*.transfers.parquet' | sort); do T+=(--transfers "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/rail_hz_r1b1_full_day_genealogy_20260905.py" merge-global \
-            "${S[@]}" "${D[@]}" "${RM[@]}" "${T[@]}" --e0-global E0_GLOBAL.json \
-            --out-summary HZ_2019-01-04_R1B1_GENEALOGY_GLOBAL.json \
-            --out-descendants HZ_2019-01-04_R1B1_DESCENDANT_STATES.parquet \
-            --out-roots HZ_2019-01-04_R1B1_ROOT_LINEAGE_MASS.parquet \
-            --out-transfers HZ_2019-01-04_R1B1_TRANSFER_LINEAGE_MASS.parquet
-          python - <<'PY'
-          import json
-          x=json.load(open('HZ_2019-01-04_R1B1_GENEALOGY_GLOBAL.json',encoding='utf-8'))
-          assert x['status']=='QUALIFIED_R1B1_FIRST_CLASS_FULL_DAY_GENEALOGY_SUBSTRATE'
-          assert all(x['qualification_gates'].values())
-          print(json.dumps(x,ensure_ascii=False,indent=2))
-          PY
-          rclone copy HZ_2019-01-04_R1B1_GENEALOGY_GLOBAL.json "$R:$OUT_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
-          rclone copy HZ_2019-01-04_R1B1_DESCENDANT_STATES.parquet "$R:$OUT_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
-          rclone copy HZ_2019-01-04_R1B1_ROOT_LINEAGE_MASS.parquet "$R:$OUT_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
-          rclone copy HZ_2019-01-04_R1B1_TRANSFER_LINEAGE_MASS.parquet "$R:$OUT_DRIVE/global" --config "$C" --retries 6 --low-level-retries 15
-          shred -u "$C" 2>/dev/null || rm -f "$C"
-
-  joint-pass0:
-    needs: genealogy
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0,1,2,3,4,5,6,7]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - run: python -m pip install --disable-pip-version-check --quiet pyarrow
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Unified joint E-step pass 0
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m py_compile scripts/mppd_r1_hz_joint_full_day.py
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
           I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/joint0-$I"; mkdir -p "$W"; cd "$W"
-          rclone copyto "$R:$OUT_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --transfers 1
-          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --transfers 1
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" shard --edges edges.parquet --roots roots.json --routes routes.json --out-stats "joint0-$I.stats.json" --shard-index ${{ matrix.shard }}
-          rclone copyto "joint0-$I.stats.json" "$R:$JOINT_OUT_DRIVE/pass0/joint0-$I.stats.json" --config "$C" --transfers 1
+          rclone copyto "$R:$PROPOSAL_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_service_projection.py" shard \
+            --edges edges.parquet --roots roots.json --routes routes.json \
+            --out-stats "joint0-$I.stats.json" --shard-index ${{ matrix.shard }}
+          rclone copyto "joint0-$I.stats.json" "$R:$JOINT_OUT_DRIVE/pass0/joint0-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"
 
   joint-merge0:
@@ -162,19 +62,25 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Joint M-step and service-time update
+      - name: Install runtime
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Joint M-step and shared service-time update
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; W="$RUNNER_TEMP/jointm0"; mkdir -p "$W/stats"; cd "$W"
-          rclone copy "$R:$JOINT_OUT_DRIVE/pass0" stats --config "$C" --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --transfers 1
-          A=(); for f in stats/joint0-*.stats.json; do A+=(--stats "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" merge "${A[@]}" --roots roots.json --out-params params0.json --out-summary merge0.json --update-offsets
-          rclone copyto params0.json "$R:$JOINT_OUT_DRIVE/params/params0.json" --config "$C" --transfers 1
-          rclone copyto merge0.json "$R:$JOINT_OUT_DRIVE/params/merge0.json" --config "$C" --transfers 1
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/jointm0"; mkdir -p "$W/stats"; cd "$W"
+          rclone copy "$R:$JOINT_OUT_DRIVE/pass0" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          test "$(find stats -name 'joint0-*.stats.json' | wc -l)" -eq 8
+          A=(); for f in $(find stats -name 'joint0-*.stats.json' | sort); do A+=(--stats "$f"); done
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" merge "${A[@]}" \
+            --roots roots.json --out-params params0.json --out-summary merge0.json --update-offsets
+          rclone copyto params0.json "$R:$JOINT_OUT_DRIVE/params/params0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto merge0.json "$R:$JOINT_OUT_DRIVE/params/merge0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"
 
   joint-pass1:
@@ -190,21 +96,26 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python -m pip install --disable-pip-version-check --quiet pyarrow
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Unified joint E-step pass 1 and final chain reconstruction
+      - name: Install runtime
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Final passenger inference against one shared recovered service state
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/joint1-$I"; mkdir -p "$W"; cd "$W"
-          rclone copyto "$R:$OUT_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --transfers 1
-          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --transfers 1
-          rclone copyto "$R:$JOINT_OUT_DRIVE/params/params0.json" params0.json --config "$C" --transfers 1
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" shard --edges edges.parquet --roots roots.json --routes routes.json --params params0.json --out-stats "joint1-$I.stats.json" --chains-out "joint1-$I.chains.parquet" --shard-index ${{ matrix.shard }}
-          rclone copyto "joint1-$I.stats.json" "$R:$JOINT_OUT_DRIVE/pass1/joint1-$I.stats.json" --config "$C" --transfers 1
-          rclone copyto "joint1-$I.chains.parquet" "$R:$JOINT_OUT_DRIVE/chains/joint1-$I.chains.parquet" --config "$C" --transfers 1
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/joint1-$I"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$PROPOSAL_DRIVE/partitions/genealogy-$I.edges.parquet" edges.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$JOINT_OUT_DRIVE/params/params0.json" params0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_service_projection.py" shard \
+            --edges edges.parquet --roots roots.json --routes routes.json --params params0.json \
+            --out-stats "joint1-$I.stats.json" --chains-out "joint1-$I.chains.parquet" --shard-index ${{ matrix.shard }}
+          rclone copyto "joint1-$I.stats.json" "$R:$JOINT_OUT_DRIVE/pass1/joint1-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "joint1-$I.chains.parquet" "$R:$JOINT_OUT_DRIVE/chains/joint1-$I.chains.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"
 
   joint-final:
@@ -216,19 +127,26 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Finalize unified full-day R1 result
+      - name: Install runtime
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Finalize full-day joint result
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; W="$RUNNER_TEMP/joint-final"; mkdir -p "$W/stats"; cd "$W"
-          rclone copy "$R:$JOINT_OUT_DRIVE/pass1" stats --config "$C" --transfers 1
-          rclone copyto "$R:$JOINT_OUT_DRIVE/params/params0.json" params0.json --config "$C" --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --transfers 1
-          A=(); for f in stats/joint1-*.stats.json; do A+=(--stats "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" merge "${A[@]}" --old-params params0.json --roots roots.json --out-params params1.json --out-summary merge1.json
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" finalize --params params1.json --roots roots.json --merge-summary merge1.json --out HZ_2019-01-04_R1_JOINT_FULL_DAY.json
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          W="$RUNNER_TEMP/joint-final"; mkdir -p "$W/stats"; cd "$W"
+          rclone copy "$R:$JOINT_OUT_DRIVE/pass1" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$JOINT_OUT_DRIVE/params/params0.json" params0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          test "$(find stats -name 'joint1-*.stats.json' | wc -l)" -eq 8
+          A=(); for f in $(find stats -name 'joint1-*.stats.json' | sort); do A+=(--stats "$f"); done
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" merge "${A[@]}" \
+            --old-params params0.json --roots roots.json --out-params params1.json --out-summary merge1.json
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_joint_full_day.py" finalize \
+            --params params1.json --roots roots.json --merge-summary merge1.json --out HZ_2019-01-04_R1_JOINT_FULL_DAY.json
           python - <<'PY'
           import json
           x=json.load(open('HZ_2019-01-04_R1_JOINT_FULL_DAY.json',encoding='utf-8'))
@@ -243,7 +161,7 @@ jobs:
           assert all(p['transfer_interval_s'][0] >= 5 for z in x['transfer_path_intervals'] for p in z['paths'])
           print(json.dumps({'status':x['status'],'coverage':c,'joint_parameters':x['joint_parameters'],'diagnostics':d},ensure_ascii=False,indent=2))
           PY
-          rclone copyto params1.json "$R:$JOINT_OUT_DRIVE/final/params1.json" --config "$C" --transfers 1
-          rclone copyto merge1.json "$R:$JOINT_OUT_DRIVE/final/merge1.json" --config "$C" --transfers 1
-          rclone copyto HZ_2019-01-04_R1_JOINT_FULL_DAY.json "$R:$JOINT_OUT_DRIVE/final/HZ_2019-01-04_R1_JOINT_FULL_DAY.json" --config "$C" --transfers 1
+          rclone copyto params1.json "$R:$JOINT_OUT_DRIVE/final/params1.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto merge1.json "$R:$JOINT_OUT_DRIVE/final/merge1.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto HZ_2019-01-04_R1_JOINT_FULL_DAY.json "$R:$JOINT_OUT_DRIVE/final/HZ_2019-01-04_R1_JOINT_FULL_DAY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"

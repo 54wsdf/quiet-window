@@ -1,0 +1,110 @@
+name: MPPD R1 AFC Anchor Frontier 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-afc-anchor-frontier-20260906.yml'
+      - 'scripts/mppd_r1_hz_afc_anchor_frontier.py'
+      - 'tests/test_mppd_r1_hz_afc_anchor_frontier.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  AFC_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+  COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  PRESSURE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/event_pressure0
+  FRONTIER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/event_complexity_frontier
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/afc_anchor_frontier
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test AFC anchor audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pytest
+          python -m py_compile scripts/mppd_r1_hz_afc_anchor_frontier.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_afc_anchor_frontier.py
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore Drive configuration and fetch raw AFC plus frontier inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/afcaudit"
+          cd "$RUNNER_TEMP/afcaudit"
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-04.csv.gz" record_2019-01-04.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-05.csv.gz" record_2019-01-05.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$PRESSURE_DRIVE/R1_EVENT_PRESSURE0.json" pressure0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$FRONTIER_DRIVE/R1_EVENT_COMPLEXITY_FRONTIER.json" passenger_frontier.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Rebuild common event proposal and audit every lambda against raw AFC ridges
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/afcaudit"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_update_proposal.py" propose \
+            --services services0.json --pressure pressure0.json --output proposal0.json
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_afc_anchor_frontier.py" \
+            --input record_2019-01-04.csv.gz \
+            --input record_2019-01-05.csv.gz \
+            --service-date "$TARGET_DATE" \
+            --services services0.json \
+            --proposal proposal0.json \
+            --passenger-frontier passenger_frontier.json \
+            --output R1_AFC_ANCHOR_FRONTIER.json
+          python - <<'PY'
+          import json
+          x=json.load(open('R1_AFC_ANCHOR_FRONTIER.json',encoding='utf-8'))
+          assert x['service_trajectory_count']==1841
+          assert x['proposal_event_count']==1096
+          assert x['detected_station_event_count'] > 0
+          assert len(x['points'])==14
+          assert x['semantics']['this_is_not_a_normalized_log_likelihood'] is True
+          assert x['semantics']['no_final_lambda_selected'] is True
+          PY
+      - name: Persist AFC anchor frontier
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/afcaudit"
+          rclone copyto R1_AFC_ANCHOR_FRONTIER.json "$REMOTE_NAME:$OUT_DRIVE/R1_AFC_ANCHOR_FRONTIER.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload scientific artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-afc-anchor-frontier
+          path: ${{ runner.temp }}/afcaudit/R1_AFC_ANCHOR_FRONTIER.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

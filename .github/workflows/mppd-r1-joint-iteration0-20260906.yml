@@ -1,0 +1,182 @@
+name: MPPD R1 Joint Iteration Zero 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-joint-iteration0-20260906.yml'
+      - 'scripts/mppd_r1_joint_iteration0.py'
+      - 'tests/test_mppd_r1_joint_iteration0.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  BOOTSTRAP_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/bootstrap
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  PASSENGER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/iteration0
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test iteration-zero assembly
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile scripts/mppd_r1_joint_iteration0.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_joint_iteration0.py
+
+  full-day-iteration0:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install numerical runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE config' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1iter0"
+      - name: Fetch unshifted joint inputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter0"
+          rclone copyto "$REMOTE_NAME:$BOOTSTRAP_DRIVE/R1_JOINT_WARM_START.json" warm.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$BOOTSTRAP_DRIVE/R1_HZ_NETWORK_AUTHORITY.json" authority.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services_unshifted.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$PASSENGER_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json" passenger.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          s=json.load(open('services_unshifted.json',encoding='utf-8'))
+          assert s['semantics']['train_count_is_input'] is False
+          assert s['semantics']['planned_timetable_used'] is False
+          assert 'absolute_clock_calibration' not in s
+          assert s['inferred_service_trajectory_count']==1841
+          PY
+      - name: Fit station movement initialization on unshifted services only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter0"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_movement_fit.py" \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services services_unshifted.json \
+            --iterations 2 \
+            --output R1_ITER0_UNSHIFTED_MOVEMENT_FIT.json
+          python - <<'PY'
+          import json
+          x=json.load(open('R1_ITER0_UNSHIFTED_MOVEMENT_FIT.json',encoding='utf-8'))
+          assert x['service_trajectory_count']==1841
+          assert x['service_clock_shift_s']==0.0
+          assert x['physical_lower_bounds_s']=={'access':15.0,'egress':15.0,'transfer':5.0}
+          PY
+      - name: Assemble the first joint coarse working state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter0"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_joint_iteration0.py" \
+            --warm-state warm.json \
+            --movement-fit R1_ITER0_UNSHIFTED_MOVEMENT_FIT.json \
+            --passenger-feedback passenger.json \
+            --output R1_JOINT_ITERATION0.json \
+            --summary R1_JOINT_ITERATION0_SUMMARY.json
+          python - <<'PY'
+          import json
+          x=json.load(open('R1_JOINT_ITERATION0_SUMMARY.json',encoding='utf-8'))
+          assert x['status']=='R1_JOINT_COARSE_ITERATION0_READY'
+          assert x['stage']=='COARSE_5S'
+          assert x['inferred_service_count']==1841
+          assert x['movement_initialization_service_clock_shift_s']==0.0
+          assert abs(x['resolved_share']-0.4963105933229201) < 1e-12
+          assert x['direction_specific_transfer_posterior_pending'] is True
+          assert x['event_level_local_update_pending'] is True
+          PY
+      - name: Audit remaining gaps against network-only authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter0"
+          PYTHONPATH="$GITHUB_WORKSPACE" python - <<'PY'
+          import json
+          from scripts.mppd_r1_joint_validation_v2 import validate
+          s=json.load(open('R1_JOINT_ITERATION0.json',encoding='utf-8'))
+          a=json.load(open('authority.json',encoding='utf-8'))
+          r=validate(s,a)
+          assert r['count_free']['inferred_service_count']==1841
+          assert 'authority_service_leakage' not in r['violation_counts']
+          assert r['coverage']['station_movement_count']==81
+          assert r['coverage']['passenger_resolved_share'] is not None
+          assert r['violation_counts'].get('station_movement_coverage',0)==0
+          assert r['violation_counts'].get('passenger_posterior',0)==0
+          assert r['violation_counts'].get('final_resolution',0)==1
+          assert r['violation_counts'].get('transfer_coverage',0)>0
+          open('R1_JOINT_ITERATION0_VALIDATION.json','w',encoding='utf-8').write(json.dumps(r,ensure_ascii=False,indent=2))
+          print(json.dumps(r,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist Iteration 0 artifacts
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter0"
+          for f in R1_ITER0_UNSHIFTED_MOVEMENT_FIT.json R1_JOINT_ITERATION0.json R1_JOINT_ITERATION0_SUMMARY.json R1_JOINT_ITERATION0_VALIDATION.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+      - name: Upload Iteration 0 scientific artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-joint-iteration0
+          path: |
+            ${{ runner.temp }}/r1iter0/R1_ITER0_UNSHIFTED_MOVEMENT_FIT.json
+            ${{ runner.temp }}/r1iter0/R1_JOINT_ITERATION0.json
+            ${{ runner.temp }}/r1iter0/R1_JOINT_ITERATION0_SUMMARY.json
+            ${{ runner.temp }}/r1iter0/R1_JOINT_ITERATION0_VALIDATION.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

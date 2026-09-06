@@ -6,9 +6,12 @@ on:
     paths:
       - '.github/workflows/mppd-r1-rttp-provider-qualification-20260907.yml'
       - 'scripts/mppd_r1_rttp_bridge.py'
+      - 'scripts/mppd_r1_rttp_projection.py'
+      - 'scripts/mppd_r1_joint_model.py'
       - 'scripts/mppd_r1_hz_network_authority.py'
       - 'tests/test_mppd_r1_rttp_bridge.py'
       - 'tests/test_mppd_r1_rttp_bridge_hardening.py'
+      - 'tests/test_mppd_r1_rttp_projection.py'
       - 'contracts/MPPD_R1_RTTP_PROVIDER_LOCK.json'
   workflow_dispatch:
 
@@ -56,11 +59,15 @@ jobs:
           python -m pip install --disable-pip-version-check --quiet pytest
           python -m py_compile \
             scripts/mppd_r1_rttp_bridge.py \
+            scripts/mppd_r1_rttp_projection.py \
+            scripts/mppd_r1_joint_model.py \
             tests/test_mppd_r1_rttp_bridge.py \
-            tests/test_mppd_r1_rttp_bridge_hardening.py
+            tests/test_mppd_r1_rttp_bridge_hardening.py \
+            tests/test_mppd_r1_rttp_projection.py
           PYTHONPATH="$PWD" python -m pytest -q \
             tests/test_mppd_r1_rttp_bridge.py \
-            tests/test_mppd_r1_rttp_bridge_hardening.py
+            tests/test_mppd_r1_rttp_bridge_hardening.py \
+            tests/test_mppd_r1_rttp_projection.py
 
       - name: Exercise real Hangzhou network authority to portable RTTP substrate payload
         shell: bash

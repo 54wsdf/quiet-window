@@ -6,7 +6,9 @@ on:
     paths:
       - '.github/workflows/mppd-r1-hz-count-free-service-probe-20260906.yml'
       - 'scripts/mppd_r1_hz_count_free_service.py'
+      - 'scripts/mppd_r1_hz_count_free_service_v2.py'
       - 'tests/test_mppd_r1_hz_count_free_service.py'
+      - 'tests/test_mppd_r1_hz_count_free_service_v2.py'
   workflow_dispatch:
 
 permissions:
@@ -30,8 +32,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check --quiet numpy pytest
-          python -m py_compile scripts/mppd_r1_hz_count_free_service.py
-          pytest -q tests/test_mppd_r1_hz_count_free_service.py
+          python -m py_compile scripts/mppd_r1_hz_count_free_service.py scripts/mppd_r1_hz_count_free_service_v2.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_count_free_service.py tests/test_mppd_r1_hz_count_free_service_v2.py
 
   full-day-count-free-probe:
     needs: unit-contract
@@ -41,7 +43,7 @@ jobs:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       AFC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
       LEGACY_ROOT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
-      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_2019-01-04_20260906
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
       TARGET_DATE: '2019-01-04'
       PYTHONPATH: ${{ github.workspace }}
     steps:
@@ -57,7 +59,7 @@ jobs:
           python -m pip install --disable-pip-version-check --quiet numpy
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone jq
-          python -m py_compile scripts/mppd_r1_hz_count_free_service.py
+          python -m py_compile scripts/mppd_r1_hz_count_free_service.py scripts/mppd_r1_hz_count_free_service_v2.py
 
       - name: Restore protected Drive configuration
         id: storage
@@ -92,12 +94,12 @@ jobs:
           assert x.get('status')=='QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION'
           PY
 
-      - name: Infer service count and trajectories from AFC without planned train count or timetable
+      - name: Infer service count with shared-event path and direction competition
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/countfree"
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_service.py" \
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_service_v2.py" \
             --input record_2019-01-04.csv.gz \
             --input record_2019-01-05.csv.gz \
             --service-date "$TARGET_DATE" \
@@ -108,7 +110,7 @@ jobs:
             --split-std-s 55 \
             --min-station-support 4 \
             --complexity-penalty 0.60 \
-            --output HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json
+            --output HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json
 
       - name: Build compact scientific comparison report
         shell: bash
@@ -118,7 +120,7 @@ jobs:
           python - <<'PY'
           import json
           from collections import Counter
-          x=json.load(open('HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json',encoding='utf-8'))
+          x=json.load(open('HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json',encoding='utf-8'))
           sem=x['semantics']
           assert sem['train_count_is_input'] is False
           assert sem['planned_timetable_used'] is False
@@ -127,37 +129,39 @@ jobs:
           trains=x['trajectories']
           line=Counter(t['afc_line'] for t in trains)
           direction=Counter(f"{t['afc_line']}:{t['direction']}" for t in trains)
-          ambiguous=sum(bool(t.get('path_ambiguous')) for t in trains)
+          path_ambiguous=sum(bool(t.get('path_ambiguous')) for t in trains)
+          direction_ambiguous=sum(bool(t.get('direction_ambiguous')) for t in trains)
           legacy=(x.get('legacy_baseline') or {}).get('legacy_candidate_root_count')
           report={
-            'schema':'mppd.r1-hz-count-free-service-probe-report.v1',
+            'schema':'mppd.r1-hz-count-free-service-probe-report.v2',
             'service_date':x['service_date'],
-            'status':'COUNT_FREE_PROBE_COMPLETED_REQUIRES_PASSENGER_JOINT_REFINEMENT',
+            'status':'COUNT_FREE_V2_PROBE_COMPLETED_REQUIRES_PASSENGER_JOINT_REFINEMENT',
             'count_free_inferred_service_trajectories':x['inferred_service_trajectory_count'],
             'legacy_candidate_roots_comparison_only':legacy,
             'count_difference_vs_legacy':x['inferred_service_trajectory_count']-legacy if legacy is not None else None,
             'trajectory_count_by_line':dict(line),
             'trajectory_count_by_line_direction':dict(direction),
             'trajectory_count_by_path_direction':x['trajectory_counts'],
-            'path_ambiguous_trajectory_count':ambiguous,
+            'path_ambiguous_trajectory_count':path_ambiguous,
+            'direction_ambiguous_trajectory_count':direction_ambiguous,
             'station_events':x['event_detection'],
             'edge_lag_sources':x['edge_lag_sources'],
             'operations':x['operation_totals'],
             'objective':x['objective'],
             'iteration_summaries':x['iterations'],
-            'scientific_boundary':'This is count-free AFC-only service discovery. It estimates how many service trajectories the passenger-facing AFC field supports before passenger-chain and station-time joint refinement; it is not yet the final R1 timetable.'
+            'scientific_boundary':'Count-free AFC-only discovery with shared station-pulse competition across path and direction hypotheses. No planned timetable or train count is used in estimation. Passenger-chain and station-time joint refinement is still required before final R1 qualification.'
           }
-          open('HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT.json','w',encoding='utf-8').write(json.dumps(report,ensure_ascii=False,indent=2))
+          open('HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT_V2.json','w',encoding='utf-8').write(json.dumps(report,ensure_ascii=False,indent=2))
           print(json.dumps(report,ensure_ascii=False,indent=2))
           PY
 
       - name: Upload probe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hz-2019-01-04-r1-count-free-service-probe
+          name: hz-2019-01-04-r1-count-free-service-probe-v2
           path: |
-            ${{ runner.temp }}/countfree/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json
-            ${{ runner.temp }}/countfree/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT.json
+            ${{ runner.temp }}/countfree/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json
+            ${{ runner.temp }}/countfree/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT_V2.json
           if-no-files-found: error
           retention-days: 30
 
@@ -169,8 +173,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/countfree"
-          rclone copy HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
-          rclone copy HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT_V2.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
           rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
 
       - name: Clean protected configuration

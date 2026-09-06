@@ -1,0 +1,228 @@
+name: MPPD R1 Hangzhou Birth Qualification 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-birth-qualification-20260906.yml'
+      - 'scripts/mppd_r1_hz_birth_lineage_audit.py'
+      - 'tests/test_mppd_r1_hz_birth_lineage_audit.py'
+      - 'scripts/mppd_r1_hz_progressive_birth_refinement.py'
+      - 'scripts/mppd_r1_hz_count_free_movement_fit.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-birth-qualification-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  PARENT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  FINE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/multires_service_count_v2
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/birth_qualification
+  TARGET_DATE: '2019-01-04'
+  BASELINE_RESOLVED_MASS: '598628.0'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test lineage qualification primitives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile scripts/mppd_r1_hz_birth_lineage_audit.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_birth_lineage_audit.py tests/test_mppd_r1_hz_progressive_birth_refinement.py
+
+  qualify:
+    needs: unit-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: n60e100, novelty: 60, evidence: '1.00'}
+          - {label: n45e090, novelty: 45, evidence: '0.90'}
+          - {label: n45e080, novelty: 45, evidence: '0.80'}
+          - {label: n30e100, novelty: 30, evidence: '1.00'}
+          - {label: n30e090, novelty: 30, evidence: '0.90'}
+          - {label: n30e080, novelty: 30, evidence: '0.80'}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install numerical runtime and storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/qual"
+      - name: Restore Drive config and fetch shared inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/qual"
+          rclone copyto "$R:$PARENT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" parent.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$FINE_DRIVE/R1_SERVICE_LEVEL_5S.json" fine5.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Reconstruct candidate world and audit service lineage
+        shell: bash
+        env:
+          NOVELTY: ${{ matrix.novelty }}
+          EVIDENCE: ${{ matrix.evidence }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/qual"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_birth_lineage_audit.py" \
+            --parent-services parent.json --fine-services fine5.json \
+            --novelty-radius-s "$NOVELTY" --minimum-evidence-score "$EVIDENCE" \
+            --minimum-support-stations 6 \
+            --augmented-output augmented.json --audit-output lineage.json
+      - name: Refit access egress and transfer world on candidate service count
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/qual"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_movement_fit.py" \
+            --cohorts cohorts.parquet --routes routes.json --services augmented.json \
+            --iterations 2 --output movement.json
+      - name: Build qualification record
+        shell: bash
+        env:
+          LABEL: ${{ matrix.label }}
+          NOVELTY: ${{ matrix.novelty }}
+          EVIDENCE: ${{ matrix.evidence }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/qual"
+          python - <<'PY'
+          import json,os
+          l=json.load(open('lineage.json',encoding='utf-8'))
+          m=json.load(open('movement.json',encoding='utf-8'))
+          d=m['iteration_diagnostics'][-1]
+          baseline=float(os.environ['BASELINE_RESOLVED_MASS'])
+          audit=m['audit']
+          physical=(audit['access_q05_min_s']>=15 and audit['egress_q05_min_s']>=15 and (audit['transfer_q05_min_s'] is None or audit['transfer_q05_min_s']>=5))
+          station_ok=(audit['access_identified_station_count']>=80 and audit['egress_identified_station_count']>=80)
+          out={
+            'schema':'mppd.r1-hz-progressive-birth-qualification-point.v1',
+            'label':os.environ['LABEL'],
+            'novelty_radius_s':float(os.environ['NOVELTY']),
+            'minimum_evidence_score':float(os.environ['EVIDENCE']),
+            'service_count':int(l['augmented_service_count']),
+            'birth_count':int(l['birth_count']),
+            'births_by_line_direction':l['births_by_line_direction'],
+            'lineage_class_counts':l['lineage_class_counts'],
+            'path_ambiguous_birth_count':int(l['path_ambiguous_birth_count']),
+            'nearest_parent_anchor_distance_s':l['nearest_parent_anchor_distance_s'],
+            'birth_support_station_count':l['birth_support_station_count'],
+            'birth_evidence_score':l['birth_evidence_score'],
+            'parallel_offset_mad_s':l['parallel_offset_mad_s'],
+            'augmented_headway_audit':l['augmented_headway_audit'],
+            'resolved_mass_after_movement_refit':float(d['resolved_mass']),
+            'resolved_share_after_movement_refit':float(d['resolved_share']),
+            'resolved_mass_gain_vs_1841_parent':float(d['resolved_mass'])-baseline,
+            'movement_failure_mass':d['failure_mass'],
+            'access_hazard':float(m['access_hazard']),
+            'transfer_hazard':float(m['transfer_hazard']),
+            'movement_audit':audit,
+            'physical_lower_bounds_preserved':bool(physical),
+            'station_identification_preserved':bool(station_ok),
+            'scientific_boundary':'This point qualifies a service-count candidate against lineage, headway diagnostics, passenger closure and refitted A/E/K physical distributions. It is not yet final N because parent death/split replacement and held-out stability remain open.'
+          }
+          open('qualification.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload qualification point
+        uses: actions/upload-artifact@v4
+        with:
+          name: birth-qualification-${{ matrix.label }}
+          path: ${{ runner.temp }}/qual/qualification.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  summarize:
+    needs: qualify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: birth-qualification-*
+          path: ${{ runner.temp }}/points
+      - name: Summarize qualified service-count frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob,json,pathlib
+          rows=[json.load(open(p,encoding='utf-8')) for p in glob.glob(str(pathlib.Path('${{ runner.temp }}')/'points'/'**'/'qualification.json'),recursive=True)]
+          rows.sort(key=lambda x:x['service_count'])
+          for r in rows:
+              r['passes_current_physical_gates']=bool(r['physical_lower_bounds_preserved'] and r['station_identification_preserved'])
+          admissible=[r for r in rows if r['passes_current_physical_gates']]
+          for r in rows:
+              r['pareto_nondominated_current_gates']=r in admissible and not any(
+                  q['service_count']<=r['service_count'] and q['resolved_mass_gain_vs_1841_parent']>=r['resolved_mass_gain_vs_1841_parent'] and
+                  (q['service_count']<r['service_count'] or q['resolved_mass_gain_vs_1841_parent']>r['resolved_mass_gain_vs_1841_parent'])
+                  for q in admissible
+              )
+          out={
+              'schema':'mppd.r1-hz-progressive-birth-qualified-frontier.v1',
+              'status':'PROGRESSIVE_BIRTH_QUALIFICATION_FRONTIER_COMPLETED_NO_FINAL_N_SELECTED',
+              'baseline_service_count':1841,
+              'points':rows,
+              'best_admissible_closure_point':max(admissible,key=lambda x:x['resolved_mass_after_movement_refit']) if admissible else None,
+              'scientific_boundary':'Final N is not selected until residual births are stable under resampling and parent death/split alternatives are tested. This artifact narrows the plausible count frontier only.'
+          }
+          path=pathlib.Path('${{ runner.temp }}')/'R1_BIRTH_QUALIFIED_FRONTIER.json'
+          path.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist summary to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone copyto '${{ runner.temp }}/R1_BIRTH_QUALIFIED_FRONTIER.json' "$R:$OUT_DRIVE/R1_BIRTH_QUALIFIED_FRONTIER.json" --config "$C" --retries 6 --low-level-retries 15
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-birth-qualified-frontier
+          path: ${{ runner.temp }}/R1_BIRTH_QUALIFIED_FRONTIER.json
+          if-no-files-found: error
+          retention-days: 30

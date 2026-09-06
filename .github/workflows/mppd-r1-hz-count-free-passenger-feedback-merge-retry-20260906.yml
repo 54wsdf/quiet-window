@@ -1,0 +1,76 @@
+name: MPPD R1 Hangzhou Count-Free Passenger Feedback Merge Retry 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-count-free-passenger-feedback-merge-retry-20260906.yml'
+      - 'scripts/mppd_r1_hz_count_free_passenger_coverage.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
+
+jobs:
+  merge-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          python -m py_compile scripts/mppd_r1_hz_count_free_passenger_coverage.py
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/cfpass_merge/shards"
+      - name: Fetch exact eight completed shards and merge
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cfpass_merge"
+          for i in 0 1 2 3 4 5 6 7; do
+            rclone copyto "$REMOTE_NAME:$OUT_DRIVE/shards/shard_$i.json" "shards/shard_$i.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            test -s "shards/shard_$i.json"
+          done
+          ls -lh shards
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge \
+            --input-dir shards \
+            --output HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json
+          rclone copyto HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json "$REMOTE_NAME:$OUT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload merged feedback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-count-free-passenger-feedback-merged
+          path: ${{ runner.temp }}/cfpass_merge/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,0 +1,120 @@
+name: MPPD R1 Event Pressure 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-event-pressure-20260906.yml'
+      - 'scripts/mppd_r1_hz_event_pressure.py'
+      - 'tests/test_mppd_r1_hz_event_pressure.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/event_pressure0
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test event-pressure primitives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow pytest
+          python -m py_compile scripts/mppd_r1_hz_event_pressure.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_event_pressure.py
+
+  full-day-pressure:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/eventpressure"
+      - name: Fetch unshifted full-day inputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/eventpressure"
+          rclone copyto "$REMOTE_NAME:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Extract event-level plus/minus-five-second passenger pressure without applying it
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/eventpressure"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_pressure.py" \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services services.json \
+            --output R1_EVENT_PRESSURE0.json
+          python - <<'PY'
+          import json
+          x=json.load(open('R1_EVENT_PRESSURE0.json',encoding='utf-8'))
+          assert x['service_trajectory_count']==1841
+          assert abs(x['resolved_share']-0.4963105933229201) < 1e-12
+          assert x['event_pressure_count'] > 0
+          assert x['semantics']['single_candidate_event_move_s']==5.0
+          assert x['semantics']['pressure_is_not_a_complete_joint_objective'] is True
+          assert x['semantics']['no_event_time_was_modified'] is True
+          PY
+      - name: Persist pressure artifact
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/eventpressure"
+          rclone copyto R1_EVENT_PRESSURE0.json "$REMOTE_NAME:$OUT_DRIVE/R1_EVENT_PRESSURE0.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload scientific artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-event-pressure0
+          path: ${{ runner.temp }}/eventpressure/R1_EVENT_PRESSURE0.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

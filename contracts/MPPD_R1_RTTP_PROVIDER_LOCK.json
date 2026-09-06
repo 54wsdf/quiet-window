@@ -1,0 +1,45 @@
+{
+  "schema": "mppd.r1-rttp-provider-lock.v1",
+  "provider": {
+    "repository": "54wsdf/rail-transit-timetable-platform",
+    "branch_at_pin": "development/rttp-conditional-research-continuation-20260901",
+    "commit_sha": "72f4a5900bd341bbc4d29c4c6f51604e58c70b00",
+    "module": "rttp.integrations.mppd_r1",
+    "contract_version": "rttp.mppd-r1-provider.v0.2"
+  },
+  "authority_boundary": {
+    "count_free_network_input": "NETWORK_AND_TRANSFER_PHYSICAL_DOMAIN_ONLY",
+    "planned_timetable_used_in_primary_inference": false,
+    "planned_absolute_times_used": false,
+    "planned_trip_count_used": false,
+    "planned_trip_ids_used": false,
+    "train_count_is_input": false,
+    "coarse_afc_ridge_promoted_to_canonical_event": false,
+    "fine_arrival_departure_required_for_canonical_snapshot": true
+  },
+  "responsibility_split": {
+    "rttp": [
+      "canonical_timetable_state",
+      "arrival_departure_stop_events",
+      "service_pattern_after_inference",
+      "vehicle_circulation_chain_without_physical_vehicle_claim",
+      "digest_bound_timetable_patch"
+    ],
+    "mppd_r1_operational_graph": [
+      "physical_route_topology",
+      "shared_trunk_headway",
+      "depot_connectivity",
+      "physical_resource_feasibility",
+      "count_free_passenger_service_inference"
+    ]
+  },
+  "modes": {
+    "COUNT_FREE": {
+      "planned_snapshot_admissible": false
+    },
+    "PLAN_ANCHORED": {
+      "planned_snapshot_admissible": true,
+      "must_not_feed_count_free_route": true
+    }
+  }
+}

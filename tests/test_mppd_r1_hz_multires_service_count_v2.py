@@ -31,6 +31,17 @@ def test_v2_shared_event_competition_collapses_path_rivals():
     assert out[0]["path_ambiguous"] is True
 
 
+def test_v2_materialization_preserves_support_event_ids():
+    c = candidate("B_main", "Down", ["0@100", "1@200", "2@300"])
+    rows = mr2.mr.base.materialize_trajectories(
+        [c],
+        {("B_main", "Down"): {0: 0.0, 1: 60.0, 2: 120.0}},
+        {},
+    )
+    assert rows[0]["support_event_ids"] == ["0@100", "1@200", "2@300"]
+    assert rows[0]["support_event_count"] == 3
+
+
 def test_v2_level_declares_count_inferred_for_passenger_engine():
     counts = np.zeros((81, 300), dtype=np.uint32)
     result = mr2.discover_level_with_v2_contract(

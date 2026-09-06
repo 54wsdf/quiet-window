@@ -1,4 +1,4 @@
-name: MPPD R1 RTTP Exact Provider Qualification 2026-09-07
+name: MPPD R1 RTTP Bridge Contract Qualification 2026-09-07
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/mppd-r1-rttp-provider-qualification-20260907.yml'
       - 'scripts/mppd_r1_rttp_bridge.py'
+      - 'scripts/mppd_r1_hz_network_authority.py'
       - 'tests/test_mppd_r1_rttp_bridge.py'
       - 'tests/test_mppd_r1_rttp_bridge_hardening.py'
       - 'contracts/MPPD_R1_RTTP_PROVIDER_LOCK.json'
@@ -20,30 +21,21 @@ env:
   RTTP_PROVIDER_CONTRACT: rttp.mppd-r1-provider.v0.2
 
 jobs:
-  exact-provider-contract:
+  bridge-contract:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout MPPD R1
         uses: actions/checkout@v5
-
-      - name: Checkout exact RTTP provider source
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ env.RTTP_REPOSITORY }}
-          ref: ${{ env.RTTP_PROVIDER_SHA }}
-          path: _rttp_provider
 
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      - name: Verify exact source and lock agreement
+      - name: Verify exact provider lock agreement
         shell: bash
         run: |
           set -euo pipefail
-          ACTUAL="$(git -C _rttp_provider rev-parse HEAD)"
-          test "$ACTUAL" = "$RTTP_PROVIDER_SHA"
           PYTHONPATH="$PWD" python - <<'PY'
           import json
           from pathlib import Path
@@ -51,52 +43,34 @@ jobs:
 
           code = provider_lock()
           disk = json.loads(Path('contracts/MPPD_R1_RTTP_PROVIDER_LOCK.json').read_text(encoding='utf-8'))['provider']
-          assert code['repository'] == disk['repository']
-          assert code['commit_sha'] == disk['commit_sha']
-          assert code['provider_contract'] == disk['contract_version']
-          assert code['commit_sha'] == '72f4a5900bd341bbc4d29c4c6f51604e58c70b00'
+          assert code['repository'] == disk['repository'] == '54wsdf/rail-transit-timetable-platform'
+          assert code['commit_sha'] == disk['commit_sha'] == '72f4a5900bd341bbc4d29c4c6f51604e58c70b00'
+          assert code['provider_contract'] == disk['contract_version'] == 'rttp.mppd-r1-provider.v0.2'
+          assert len(code['commit_sha']) == 40
           PY
 
-      - name: Install RTTP exact provider with development test dependencies
+      - name: Compile and test the fail-closed bridge
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check --quiet -e './_rttp_provider[dev]'
-
-      - name: Compile cross-repository integration surface
-        shell: bash
-        run: |
-          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
           python -m py_compile \
             scripts/mppd_r1_rttp_bridge.py \
-            _rttp_provider/src/rttp/integrations/mppd_r1.py \
             tests/test_mppd_r1_rttp_bridge.py \
-            tests/test_mppd_r1_rttp_bridge_hardening.py \
-            _rttp_provider/tests/test_mppd_r1_integration.py
-
-      - name: Run focused RTTP and MPPD R1 integration attacks
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD:$PWD/_rttp_provider/src" python -m pytest -q \
-            _rttp_provider/tests/test_mppd_r1_integration.py \
-            _rttp_provider/tests/test_core_invariants.py \
-            _rttp_provider/tests/test_patch_operations.py \
-            _rttp_provider/tests/test_circulation_turnback_orientation.py \
+            tests/test_mppd_r1_rttp_bridge_hardening.py
+          PYTHONPATH="$PWD" python -m pytest -q \
             tests/test_mppd_r1_rttp_bridge.py \
             tests/test_mppd_r1_rttp_bridge_hardening.py
 
-      - name: Exercise real Hangzhou network authority through installed RTTP provider
+      - name: Exercise real Hangzhou network authority to portable RTTP substrate payload
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD:$PWD/_rttp_provider/src" python - <<'PY'
+          PYTHONPATH="$PWD" python - <<'PY'
           from scripts.mppd_r1_hz_network_authority import build_authority
           from scripts.mppd_r1_rttp_bridge import (
+              RTTP_PROVIDER_CONTRACT,
               RTTP_PROVIDER_SHA,
-              build_installed_runtime_substrate,
-              joint_state_to_provider_payload,
-              materialize_installed_runtime_fine_state,
               network_authority_to_provider_payload,
           )
 
@@ -104,97 +78,24 @@ jobs:
               'status': 'QUALIFIED_LINE_AWARE_ROUTE_SUPPORT',
               'route_support': {},
           })
-          network_payload = network_authority_to_provider_payload(
+          payload = network_authority_to_provider_payload(
               authority,
-              network_authority_ref='quiet-window:network-authority:qualification-smoke',
+              network_authority_ref='quiet-window:network-authority:bridge-qualification',
           )
-          assert len(network_payload['routes']) == 8
-          substrate, audit0 = build_installed_runtime_substrate(
-              network_payload,
-              observed_provider_sha=RTTP_PROVIDER_SHA,
-          )
-          assert audit0.count_free_clean
-          assert audit0.canonical_snapshot_materialized is False
-
-          state = {
-              'stage': 'FINE_1S',
-              'config': {
-                  'train_count_is_input': False,
-                  'planned_timetable_used_in_primary_inference': False,
-                  'planned_timetable_role': 'POST_HOC_EXTERNAL_COMPARISON_ONLY',
-              },
-              'services': [{
-                  'trajectory_id': 'qualification-smoke-A-down',
-                  'line_id': 'A',
-                  'direction_id': 'Down',
-                  'path_id': 'A_main',
-                  'events': [
-                      {
-                          'station_id': '67',
-                          'sequence_index': 0,
-                          'anchor_time_s': 102.5,
-                          'arrival_time_s': 100,
-                          'departure_time_s': 110,
-                      },
-                      {
-                          'station_id': '68',
-                          'sequence_index': 1,
-                          'anchor_time_s': 172.5,
-                          'arrival_time_s': 170,
-                          'departure_time_s': 180,
-                      },
-                  ],
-              }],
-          }
-          state_payload = joint_state_to_provider_payload(state)
-          snapshot, audit1 = materialize_installed_runtime_fine_state(
-              state_payload=state_payload,
-              network_substrate=substrate,
-              snapshot_id='mppd-r1-rttp-qualification-smoke',
-              service_date='2019-01-04',
-              timezone_id='Asia/Shanghai',
-              observed_provider_sha=RTTP_PROVIDER_SHA,
-          )
-          assert snapshot.structurally_valid
-          assert len(snapshot.trips) == 1
-          assert len(snapshot.stop_events) == 2
-          assert len(snapshot.service_patterns) == 1
-          assert snapshot.trips[0].train_no_display is None
-          assert snapshot.metadata['planned_absolute_times_used'] is False
-          assert snapshot.metadata['planned_trip_count_used'] is False
-          assert audit1.count_free_clean
+          assert len(payload['routes']) == 8
+          assert payload['provider_contract'] == RTTP_PROVIDER_CONTRACT
+          assert payload['semantics']['canonical_timetable_materialized'] is False
+          assert payload['semantics']['service_pattern_materialized'] is False
+          assert payload['semantics']['service_instance_count_materialized'] is False
+          assert payload['semantics']['physical_route_structure_only'] is True
+          assert payload['metadata']['planned_absolute_times_used'] is False
+          assert payload['metadata']['planned_trip_count_used'] is False
+          assert payload['metadata']['planned_trip_ids_used'] is False
           print({
-              'status': 'R1_RTTP_EXACT_PROVIDER_SMOKE_PASS',
-              'routes': len(network_payload['routes']),
-              'trips': len(snapshot.trips),
-              'stop_events': len(snapshot.stop_events),
+              'status': 'R1_RTTP_BRIDGE_CONTRACT_PASS',
+              'provider_sha_lock': RTTP_PROVIDER_SHA,
+              'provider_runtime_qualified_here': False,
+              'provider_runtime_boundary': 'RTTP_SOURCE_NOT_ACCESSIBLE_TO_QUIET_WINDOW_GITHUB_TOKEN',
+              'route_structures': len(payload['routes']),
           })
           PY
-
-  rttp-full-regression:
-    needs: exact-provider-contract
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
-      - name: Checkout exact RTTP provider source
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ env.RTTP_REPOSITORY }}
-          ref: ${{ env.RTTP_PROVIDER_SHA }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Install RTTP development dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --disable-pip-version-check --quiet -e '.[dev]'
-
-      - name: Run full RTTP regression suite at exact provider SHA
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$RTTP_PROVIDER_SHA"
-          python -m pytest -q

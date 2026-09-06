@@ -1,11 +1,13 @@
 from collections import defaultdict
 import importlib.util
 from pathlib import Path
+import sys
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "mppd_r1_hz_count_free_service.py"
 SPEC = importlib.util.spec_from_file_location("mppd_r1_hz_count_free_service", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 m = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = m
 SPEC.loader.exec_module(m)
 
 

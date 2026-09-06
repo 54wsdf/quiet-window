@@ -1,4 +1,4 @@
-name: MPPD R1 HZ Projected Event-Feedback 1K Probe 2026-09-06
+name: MPPD R1 HZ Projected Event-Feedback 1K Closed Probe 2026-09-06
 
 on:
   push:
@@ -19,9 +19,9 @@ env:
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  projected-1k:
+  closed-1k:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -31,18 +31,18 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --quiet numpy pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          python -m py_compile scripts/mppd_r1_hz_clean_projected.py
-      - name: Run deterministic 1k cohort projected probe
+          python -m py_compile scripts/mppd_r1_hz_clean_projected.py scripts/mppd_r1_hz_projected_event_merge.py scripts/mppd_r1_hz_clean_joint.py
+      - name: Run projected feedback and exact shared-timetable check
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          W="$RUNNER_TEMP/proj1k"; mkdir -p "$W"; cd "$W"
+          W="$RUNNER_TEMP/proj1kclosed"; mkdir -p "$W"; cd "$W"
           rclone copyto "$R:$SOURCE_DRIVE/shards/part-04.parquet" cohorts-full.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$EVENT_BASE_DRIVE/params/event_params1.json" params.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$EVENT_BASE_DRIVE/params/event_params1.json" params0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           python - <<'PY'
           import pyarrow.parquet as pq
           t=pq.read_table('cohorts-full.parquet').slice(0,1000)
@@ -50,11 +50,32 @@ jobs:
           print('sample_rows',t.num_rows)
           PY
           python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_clean_projected.py" \
-            --cohorts cohorts.parquet --roots roots.json --routes routes.json --params params.json \
-            --out-stats projected1k.stats.json --shard-index 4
+            --cohorts cohorts.parquet --roots roots.json --routes routes.json --params params0.json \
+            --out-stats projected.stats.json --shard-index 4
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_projected_event_merge.py" \
+            --stats projected.stats.json --old-params params0.json --roots roots.json \
+            --out-params params1.json --out-summary projected_merge.json
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_clean_joint.py" \
+            --cohorts cohorts.parquet --roots roots.json --routes routes.json --params params1.json \
+            --out-stats exact.stats.json --shard-index 4
           python - <<'PY'
           import json
-          x=json.load(open('projected1k.stats.json',encoding='utf-8'))
-          print(json.dumps({'passenger_mass':x['passenger_mass'],'resolved_mass':x['resolved_mass'],'resolved_share':x['resolved_mass']/x['passenger_mass'],'cohort_count':x['cohort_count'],'resolved_cohort_count':x['resolved_cohort_count'],'event_projection_anchor_count':len(x['event_projection_stats']),'diagnostics':x['diagnostics']},ensure_ascii=False,indent=2))
+          p=json.load(open('projected.stats.json',encoding='utf-8'))
+          m=json.load(open('projected_merge.json',encoding='utf-8'))
+          e=json.load(open('exact.stats.json',encoding='utf-8'))
+          out={
+            'passenger_mass':p['passenger_mass'],
+            'projected_resolved_mass':p['resolved_mass'],
+            'projected_resolved_share':p['resolved_mass']/p['passenger_mass'],
+            'shared_exact_resolved_mass':e['resolved_mass'],
+            'shared_exact_resolved_share':e['resolved_mass']/e['passenger_mass'],
+            'event_projection_anchor_count':len(p['event_projection_stats']),
+            'shared_event_abs_offset_median_s':m['service_event_abs_offset_median_s'],
+            'shared_event_abs_offset_p90_s':m['service_event_abs_offset_p90_s'],
+            'shared_event_abs_offset_max_s':m['service_event_abs_offset_max_s'],
+            'shared_event_bound_hits':m['service_event_offset_bound_hits'],
+            'exact_diagnostics':e['diagnostics'],
+          }
+          print(json.dumps(out,ensure_ascii=False,indent=2))
           PY
           shred -u "$C" 2>/dev/null || rm -f "$C"

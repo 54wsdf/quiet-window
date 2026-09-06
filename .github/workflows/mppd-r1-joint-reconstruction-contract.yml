@@ -6,6 +6,8 @@ on:
     paths:
       - 'scripts/mppd_r1_joint_reconstruction_validate.py'
       - 'scripts/mppd_r1_hz_joint_full_day.py'
+      - 'scripts/mppd_r1_hz_joint_service_projection.py'
+      - 'scripts/mppd_r1_hz_event_level_joint.py'
       - 'tests/test_mppd_r1_joint_reconstruction_validate.py'
       - '.github/workflows/mppd-r1-joint-reconstruction-contract.yml'
   workflow_dispatch:
@@ -22,10 +24,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Install solver runtime
+        run: python -m pip install --disable-pip-version-check --quiet numpy pyarrow
       - name: Compile R1 code
         run: |
           python -m py_compile scripts/mppd_r1_joint_reconstruction_validate.py
           python -m py_compile scripts/mppd_r1_hz_joint_full_day.py
+          python -m py_compile scripts/mppd_r1_hz_joint_service_projection.py
+          python -m py_compile scripts/mppd_r1_hz_event_level_joint.py
       - name: Run deterministic validator self-test
         run: python scripts/mppd_r1_joint_reconstruction_validate.py self-test
       - name: Run scientific gate tests

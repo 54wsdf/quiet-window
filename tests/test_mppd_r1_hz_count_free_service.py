@@ -1,6 +1,12 @@
 from collections import defaultdict
+import importlib.util
+from pathlib import Path
 
-import scripts.mppd_r1_hz_count_free_service as m
+MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "mppd_r1_hz_count_free_service.py"
+SPEC = importlib.util.spec_from_file_location("mppd_r1_hz_count_free_service", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
 
 
 def make_events(path_id, direction, starts, station_count=8, step=120.0):

@@ -1,0 +1,217 @@
+name: MPPD R1 Hangzhou Operating Circulation Audit 2026-09-07
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-operating-circulation-audit-20260907.yml'
+      - 'scripts/mppd_r1_hz_operating_authority.py'
+      - 'scripts/mppd_r1_hz_operating_audit.py'
+      - 'scripts/mppd_r1_hz_circulation_sensitivity.py'
+      - 'scripts/mppd_r1_service_circulation.py'
+      - 'scripts/mppd_r1_joint_model.py'
+      - 'scripts/mppd_r1_hz_network_authority.py'
+      - 'tests/test_mppd_r1_hz_operating_authority.py'
+      - 'tests/test_mppd_r1_hz_operating_audit.py'
+      - 'tests/test_mppd_r1_service_circulation.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-operating-circulation-audit-20260907
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  OLD_COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/operating_circulation_audit
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile operating and circulation audit code
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile \
+            scripts/mppd_r1_hz_operating_authority.py \
+            scripts/mppd_r1_hz_operating_audit.py \
+            scripts/mppd_r1_hz_circulation_sensitivity.py \
+            scripts/mppd_r1_service_circulation.py
+          PYTHONPATH="$PWD" python -m pytest -q \
+            tests/test_mppd_r1_hz_operating_authority.py \
+            tests/test_mppd_r1_hz_operating_audit.py \
+            tests/test_mppd_r1_service_circulation.py
+
+  full-day-audit:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1_operating_circulation"
+
+      - name: Restore protected storage configuration and fetch qualified 1841 warm start
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          test -n "$GDRIVE_CONFIG_B64"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1_operating_circulation"
+          rclone copyto \
+            "$R:$OLD_COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" \
+            services_1841.json \
+            --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          test -s services_1841.json
+          sha256sum services_1841.json
+          python - <<'PY'
+          import json
+          x=json.load(open('services_1841.json',encoding='utf-8'))
+          assert x['inferred_service_trajectory_count'] == 1841
+          sem=x['semantics']
+          assert sem['train_count_is_input'] is False
+          assert sem['planned_timetable_used'] is False
+          assert sem['legacy_candidate_roots_used_as_input'] is False
+          print({'status':'QUALIFIED_1841_WARM_START_FETCHED','service_count':1841})
+          PY
+
+      - name: Audit physical and verified operating headways
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_operating_circulation"
+          PYTHONPATH="$GITHUB_WORKSPACE" python \
+            "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_operating_audit.py" \
+            --services services_1841.json \
+            --output operating_audit.json \
+            --authority-output operating_authority.json
+          test -s operating_audit.json
+          test -s operating_authority.json
+
+      - name: Audit circulation feasibility across explicit turnback windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_operating_circulation"
+          PYTHONPATH="$GITHUB_WORKSPACE" python \
+            "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_circulation_sensitivity.py" \
+            --services services_1841.json \
+            --output circulation_sensitivity.json
+          test -s circulation_sensitivity.json
+
+      - name: Build scientific audit manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_operating_circulation"
+          python - <<'PY'
+          import hashlib, json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          operating=json.load(open('operating_audit.json',encoding='utf-8'))
+          circulation=json.load(open('circulation_sensitivity.json',encoding='utf-8'))
+          authority=json.load(open('operating_authority.json',encoding='utf-8'))
+          manifest={
+              'schema':'mppd.r1-hz-operating-circulation-audit-manifest.v1',
+              'status':'R1_1841_OPERATING_CIRCULATION_AUDIT_COMPLETED_NO_STRUCTURE_MUTATION',
+              'service_date':'2019-01-04',
+              'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+              'git_sha':os.environ['GITHUB_SHA'],
+              'input':{
+                  'name':'HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json',
+                  'sha256':sha('services_1841.json'),
+                  'service_count':operating['inferred_service_count'],
+                  'role':'COARSE_WARM_START_NOT_FIXED_TRUTH',
+              },
+              'outputs':{
+                  'operating_authority_sha256':sha('operating_authority.json'),
+                  'operating_audit_sha256':sha('operating_audit.json'),
+                  'circulation_sensitivity_sha256':sha('circulation_sensitivity.json'),
+              },
+              'headline':{
+                  'absolute_physical_headway_violation_pairs':operating['headway']['absolute_physical_violation_pair_count'],
+                  'verified_operating_envelope_violation_pairs':operating['headway']['verified_operating_envelope_violation_pair_count'],
+                  'direction_balance_by_path':operating['direction_balance']['by_path'],
+                  'maximum_matched_circulation_links':circulation['envelope']['maximum_matched_link_count'],
+                  'minimum_circulation_chain_count':circulation['envelope']['minimum_circulation_chain_count'],
+              },
+              'source_refs':authority['sources'],
+              'semantics':{
+                  'service_count_changed':False,
+                  'planned_absolute_timetable_used':False,
+                  'planned_trip_count_used':False,
+                  'planned_trip_ids_used':False,
+                  'physical_vehicle_identity_claimed':False,
+                  'depot_network_station_mapping_resolved':False,
+                  'turnback_window_selected':False,
+              },
+          }
+          Path('manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(manifest['headline'],ensure_ascii=False,indent=2))
+          PY
+          sha256sum operating_authority.json operating_audit.json circulation_sensitivity.json manifest.json
+
+      - name: Persist audit products to long-term storage
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_operating_circulation"
+          for F in operating_authority.json operating_audit.json circulation_sensitivity.json manifest.json; do
+            rclone copyto "$F" "$REMOTE_NAME:$OUT_DRIVE/$F" \
+              --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+            rclone lsf "$REMOTE_NAME:$OUT_DRIVE/$F" --config "$CONFIG_FILE" | grep -F "$(basename "$F")"
+          done
+
+      - name: Upload compact audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-operating-circulation-audit
+          path: |
+            ${{ runner.temp }}/r1_operating_circulation/operating_authority.json
+            ${{ runner.temp }}/r1_operating_circulation/operating_audit.json
+            ${{ runner.temp }}/r1_operating_circulation/circulation_sensitivity.json
+            ${{ runner.temp }}/r1_operating_circulation/manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

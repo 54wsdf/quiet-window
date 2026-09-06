@@ -27,7 +27,7 @@ jobs:
         run: python scripts/mppd_r1_joint_reconstruction_validate.py self-test
       - name: Run scientific gate tests
         run: python tests/test_mppd_r1_joint_reconstruction_validate.py
-      - name: Exercise canonical CLI on a valid joint world
+      - name: Exercise canonical CLI with independent authority
         shell: bash
         run: |
           python - <<'PY'
@@ -37,12 +37,17 @@ jobs:
           spec=importlib.util.spec_from_file_location('r1v',p)
           m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
           Path('/tmp/r1_joint_fixture.json').write_text(json.dumps(m.fixture()),encoding='utf-8')
+          Path('/tmp/r1_authority.json').write_text(json.dumps(m.authority_fixture()),encoding='utf-8')
           PY
-          python scripts/mppd_r1_joint_reconstruction_validate.py validate --input /tmp/r1_joint_fixture.json --out /tmp/r1_joint_report.json
+          python scripts/mppd_r1_joint_reconstruction_validate.py validate \
+            --input /tmp/r1_joint_fixture.json \
+            --authority /tmp/r1_authority.json \
+            --out /tmp/r1_joint_report.json
           python - <<'PY'
           import json
           x=json.load(open('/tmp/r1_joint_report.json',encoding='utf-8'))
           assert x['status']=='QUALIFIED_R1_JOINT_RECONSTRUCTION'
           assert all(x['qualification_gates'].values())
+          assert x['authority']['schema']=='mppd.r1-reconstruction-authority.v1'
           print(json.dumps(x,ensure_ascii=False,indent=2))
           PY

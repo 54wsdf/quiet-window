@@ -1,0 +1,315 @@
+name: MPPD R1 Joint Iteration One Local Update 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-joint-iteration1-local-update-20260906.yml'
+      - 'scripts/mppd_r1_hz_event_update_proposal.py'
+      - 'tests/test_mppd_r1_hz_event_update_proposal.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  PRESSURE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/event_pressure0
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/iteration1_local_update
+  TARGET_DATE: '2019-01-04'
+  SHARD_COUNT: '8'
+  BASELINE_RESOLVED_MASS: '598628.0'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test sparse update contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile scripts/mppd_r1_hz_event_update_proposal.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_event_update_proposal.py
+
+  propose-and-apply-working-state:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1iter1"
+      - name: Fetch current unshifted service world and event pressure
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          rclone copyto "$REMOTE_NAME:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services0.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$PRESSURE_DRIVE/R1_EVENT_PRESSURE0.json" pressure0.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Build Pareto-safe sparse five-second proposal
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_update_proposal.py" propose \
+            --services services0.json \
+            --pressure pressure0.json \
+            --output R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json
+          python - <<'PY'
+          import json
+          x=json.load(open('R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json',encoding='utf-8'))
+          assert x['proposed_event_update_count'] > 0
+          assert x['proposed_event_update_count']==x['proposed_trajectory_update_count']
+          assert x['semantics']['at_most_one_event_per_trajectory'] is True
+          assert all(abs(float(u['delta_s']))==5.0 for u in x['updates'])
+          assert all(float(u['direct_rescue_mass']) > float(u['direct_damage_mass']) for u in x['updates'])
+          PY
+      - name: Materialize temporary Iteration 1 service world
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_update_proposal.py" apply \
+            --services services0.json \
+            --proposal R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json \
+            --output R1_ITERATION1_SERVICES_WORKING.json
+      - name: Upload working state for parallel posterior rerun
+        uses: actions/upload-artifact@v4
+        with:
+          name: r1-iteration1-working-service
+          path: |
+            ${{ runner.temp }}/r1iter1/R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json
+            ${{ runner.temp }}/r1iter1/R1_ITERATION1_SERVICES_WORKING.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  passenger-shard:
+    needs: propose-and-apply-working-state
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Download proposed service world
+        uses: actions/download-artifact@v5
+        with:
+          name: r1-iteration1-working-service
+          path: ${{ runner.temp }}/r1iter1
+      - name: Restore Drive configuration and fetch passenger domain
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1iter1"
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Recompute passenger posterior shard
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services R1_ITERATION1_SERVICES_WORKING.json \
+            --shard-index "$SHARD" \
+            --shard-count "$SHARD_COUNT" \
+            --output "shard_$SHARD.json"
+      - name: Upload deterministic posterior shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: r1-iteration1-passenger-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/r1iter1/shard_${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  merge-and-refit-movement:
+    needs: passenger-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install numerical runtime and Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy scipy pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1iter1/shards"
+      - name: Download working services and all passenger shards
+        uses: actions/download-artifact@v5
+        with:
+          pattern: r1-iteration1-*
+          path: ${{ runner.temp }}/r1iter1/downloads
+      - name: Normalize downloaded artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          find downloads -type f -name 'R1_ITERATION1_SERVICES_WORKING.json' -exec cp {} . \;
+          find downloads -type f -name 'R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json' -exec cp {} . \;
+          find downloads -type f -name 'shard_*.json' -exec cp {} shards/ \;
+          test "$(find shards -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 8
+      - name: Merge full-day passenger posterior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge \
+            --input-dir shards \
+            --output R1_ITERATION1_PASSENGER_FEEDBACK.json
+      - name: Restore Drive configuration and fetch domain for movement refit
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1iter1"
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Refit station movement initialization against updated local service world
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_movement_fit.py" \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services R1_ITERATION1_SERVICES_WORKING.json \
+            --iterations 2 \
+            --output R1_ITERATION1_MOVEMENT_FIT.json
+      - name: Decide whether the sparse working update survives posterior reevaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          python - <<'PY'
+          import json, os
+          p=json.load(open('R1_ITERATION1_PASSENGER_FEEDBACK.json',encoding='utf-8'))
+          m=json.load(open('R1_ITERATION1_MOVEMENT_FIT.json',encoding='utf-8'))
+          q=json.load(open('R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json',encoding='utf-8'))
+          baseline=float(os.environ['BASELINE_RESOLVED_MASS'])
+          physical=m['physical_lower_bounds_s']=={'access':15.0,'egress':15.0,'transfer':5.0}
+          improved=float(p['resolved_mass']) > baseline
+          movement_unshifted=abs(float(m.get('service_clock_shift_s',0.0))) < 1e-9
+          accepted=bool(improved and physical and movement_unshifted)
+          out={
+            'schema':'mppd.r1-joint-iteration1-acceptance.v1',
+            'status':'R1_COARSE_ITERATION1_WORKING_UPDATE_ACCEPTED' if accepted else 'R1_COARSE_ITERATION1_WORKING_UPDATE_REJECTED',
+            'accepted':accepted,
+            'baseline_resolved_mass':baseline,
+            'iteration1_resolved_mass':float(p['resolved_mass']),
+            'resolved_mass_change':float(p['resolved_mass'])-baseline,
+            'iteration1_resolved_share':float(p['resolved_share']),
+            'proposal_event_count':int(q['proposed_event_update_count']),
+            'proposal_direct_rescue_mass_not_deduplicated':float(q['sum_direct_rescue_mass_not_deduplicated']),
+            'proposal_direct_damage_mass_not_deduplicated':float(q['sum_direct_damage_mass_not_deduplicated']),
+            'failure_mass':p['failure_mass'],
+            'physical_lower_bounds_s':m['physical_lower_bounds_s'],
+            'movement_service_clock_shift_s':float(m.get('service_clock_shift_s',0.0)),
+            'scientific_boundary':'Acceptance here means the sparse 5 s working update survives full-day passenger re-inference and movement physical gates. It is not final R1 qualification and does not freeze the service structure.'
+          }
+          open('R1_ITERATION1_ACCEPTANCE.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist Iteration 1 evaluation artifacts
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1iter1"
+          for f in R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json R1_ITERATION1_SERVICES_WORKING.json R1_ITERATION1_PASSENGER_FEEDBACK.json R1_ITERATION1_MOVEMENT_FIT.json R1_ITERATION1_ACCEPTANCE.json; do
+            rclone copyto "$f" "$REMOTE_NAME:$OUT_DRIVE/$f" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+      - name: Upload Iteration 1 evaluation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-iteration1-evaluation
+          path: |
+            ${{ runner.temp }}/r1iter1/R1_ITERATION1_EVENT_UPDATE_PROPOSAL.json
+            ${{ runner.temp }}/r1iter1/R1_ITERATION1_PASSENGER_FEEDBACK.json
+            ${{ runner.temp }}/r1iter1/R1_ITERATION1_MOVEMENT_FIT.json
+            ${{ runner.temp }}/r1iter1/R1_ITERATION1_ACCEPTANCE.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

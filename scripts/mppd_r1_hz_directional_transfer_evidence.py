@@ -92,6 +92,7 @@ def run(
 ) -> dict[str, Any]:
     routes = cov.load_routes(routes_path)
     services, service_raw = cov.load_services(services_path)
+    index = cov.LegIndex(services)
     authority = json.loads(authority_path.read_text(encoding="utf-8"))
     option_line, authority_moves = authority_maps(authority)
 
@@ -113,7 +114,7 @@ def run(
             chosen = None
             result = None
             for route in rr:
-                r = cov.evaluate_route(row, route, cov.LegIndex(services))
+                r = cov.evaluate_route(row, route, index)
                 if r["ok"]:
                     chosen = route
                     result = r

@@ -1,0 +1,74 @@
+name: MPPD R1 Service Circulation Qualification 2026-09-07
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-service-circulation-20260907.yml'
+      - 'scripts/mppd_r1_joint_model.py'
+      - 'scripts/mppd_r1_joint_solver.py'
+      - 'scripts/mppd_r1_service_circulation.py'
+      - 'scripts/mppd_r1_hz_network_authority.py'
+      - 'tests/test_mppd_r1_joint_model.py'
+      - 'tests/test_mppd_r1_joint_solver.py'
+      - 'tests/test_mppd_r1_service_circulation.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  circulation-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and run unified R1 circulation attacks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile \
+            scripts/mppd_r1_joint_model.py \
+            scripts/mppd_r1_joint_solver.py \
+            scripts/mppd_r1_service_circulation.py \
+            scripts/mppd_r1_hz_network_authority.py
+          PYTHONPATH="$PWD" python -m pytest -q \
+            tests/test_mppd_r1_joint_model.py \
+            tests/test_mppd_r1_joint_solver.py \
+            tests/test_mppd_r1_service_circulation.py
+
+      - name: Derive only geometric terminal reversals from Hangzhou network authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD" python - <<'PY'
+          from scripts.mppd_r1_hz_network_authority import build_authority
+          from scripts.mppd_r1_service_circulation import turnback_rules_from_network_authority
+
+          authority = build_authority({
+              'status': 'QUALIFIED_LINE_AWARE_ROUTE_SUPPORT',
+              'route_support': {},
+          })
+          # These bounds are deliberately qualification-test assumptions only; the
+          # production R1 solver must receive calibrated/physical bounds explicitly.
+          rules = turnback_rules_from_network_authority(
+              authority,
+              min_turnback_s=20.0,
+              max_turnback_s=600.0,
+          )
+          assert len(authority['line_paths']) == 8
+          assert len(rules) == 8
+          assert all(rule.from_direction_id != rule.to_direction_id for rule in rules)
+          assert all(rule.path_id in {'A_main','B_main','B_branch','C_main'} for rule in rules)
+          print({
+              'status': 'R1_COUNT_FREE_CIRCULATION_GEOMETRY_PASS',
+              'route_structures': len(authority['line_paths']),
+              'turnback_relations': len(rules),
+              'planned_timetable_used': False,
+              'production_turnback_window_calibrated_here': False,
+          })
+          PY

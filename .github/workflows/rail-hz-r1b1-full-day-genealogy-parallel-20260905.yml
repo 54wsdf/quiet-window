@@ -1,4 +1,4 @@
-name: MPPD R1 HZ Clean Raw-Cohort Joint Inversion 2026-09-06
+name: MPPD R1 HZ Projected Event-Feedback Probe 2026-09-06
 
 on:
   push:
@@ -15,16 +15,12 @@ env:
   SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_distributed_2019-01-04_20260905
   SINGLE_DAY_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
   EVENT_BASE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_event_level_full_day_2019-01-04_20260906
-  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_clean_raw_full_day_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_r1_joint_projected_probe_2019-01-04_20260906
   TARGET_DATE: '2019-01-04'
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  clean-pass0:
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0,1,2,3,4,5,6,7]
+  projected-shard4:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -36,135 +32,25 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --quiet numpy pyarrow
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          python -m py_compile scripts/mppd_r1_hz_clean_joint.py scripts/mppd_r1_hz_event_level_joint.py
-      - name: Infer directly from raw AFC cohort shard
+          python -m py_compile scripts/mppd_r1_hz_clean_projected.py scripts/mppd_r1_hz_projected_event_merge.py
+      - name: Project all passenger constraints to train-station events
         shell: bash
         run: |
           set -euo pipefail
           C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/clean0-$I"; mkdir -p "$W"; cd "$W"
-          rclone copyto "$R:$SOURCE_DRIVE/shards/part-$I.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          W="$RUNNER_TEMP/proj4"; mkdir -p "$W"; cd "$W"
+          rclone copyto "$R:$SOURCE_DRIVE/shards/part-04.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           rclone copyto "$R:$EVENT_BASE_DRIVE/params/event_params1.json" params.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_clean_joint.py" \
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_clean_projected.py" \
             --cohorts cohorts.parquet --roots roots.json --routes routes.json --params params.json \
-            --out-stats "clean0-$I.stats.json" --shard-index ${{ matrix.shard }}
-          rclone copyto "clean0-$I.stats.json" "$R:$OUT_DRIVE/pass0/clean0-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          shred -u "$C" 2>/dev/null || rm -f "$C"
-
-  clean-merge0:
-    needs: clean-pass0
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install runtime
-        run: |
-          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Jointly update event timetable and movement distributions
-        shell: bash
-        run: |
-          set -euo pipefail
-          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          W="$RUNNER_TEMP/clean-merge0"; mkdir -p "$W/stats"; cd "$W"
-          rclone copy "$R:$OUT_DRIVE/pass0" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$EVENT_BASE_DRIVE/params/event_params1.json" old.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          test "$(find stats -name 'clean0-*.stats.json' | wc -l)" -eq 8
-          A=(); for f in $(find stats -name 'clean0-*.stats.json' | sort); do A+=(--stats "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" merge "${A[@]}" \
-            --old-params old.json --roots roots.json --out-params clean_params0.json --out-summary clean_merge0.json --update-events
-          rclone copyto clean_params0.json "$R:$OUT_DRIVE/params/clean_params0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto clean_merge0.json "$R:$OUT_DRIVE/params/clean_merge0.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          shred -u "$C" 2>/dev/null || rm -f "$C"
-
-  clean-pass1:
-    needs: clean-merge0
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0,1,2,3,4,5,6,7]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install runtime
-        run: |
-          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Re-infer raw cohorts against updated shared latent world
-        shell: bash
-        run: |
-          set -euo pipefail
-          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          I=$(printf '%02d' ${{ matrix.shard }}); W="$RUNNER_TEMP/clean1-$I"; mkdir -p "$W"; cd "$W"
-          rclone copyto "$R:$SOURCE_DRIVE/shards/part-$I.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SOURCE_DRIVE/static/routes.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$OUT_DRIVE/params/clean_params0.json" params.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_clean_joint.py" \
-            --cohorts cohorts.parquet --roots roots.json --routes routes.json --params params.json \
-            --out-stats "clean1-$I.stats.json" --chains-out "clean1-$I.chains.parquet" --shard-index ${{ matrix.shard }}
-          rclone copyto "clean1-$I.stats.json" "$R:$OUT_DRIVE/pass1/clean1-$I.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "clean1-$I.chains.parquet" "$R:$OUT_DRIVE/chains/clean1-$I.chains.parquet" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          shred -u "$C" 2>/dev/null || rm -f "$C"
-
-  clean-final:
-    needs: clean-pass1
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install runtime
-        run: |
-          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-      - name: Freeze shared service state and finalize clean joint result
-        shell: bash
-        run: |
-          set -euo pipefail
-          C="$RUNNER_TEMP/rclone.conf"; umask 077; printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
-          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
-          W="$RUNNER_TEMP/clean-final"; mkdir -p "$W/stats"; cd "$W"
-          rclone copy "$R:$OUT_DRIVE/pass1" stats --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$OUT_DRIVE/params/clean_params0.json" old.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto "$R:$SINGLE_DAY_DRIVE/record_$TARGET_DATE.service_roots.json" roots.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          test "$(find stats -name 'clean1-*.stats.json' | wc -l)" -eq 8
-          A=(); for f in $(find stats -name 'clean1-*.stats.json' | sort); do A+=(--stats "$f"); done
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" merge "${A[@]}" \
-            --old-params old.json --roots roots.json --out-params clean_params_final.json --out-summary clean_merge_final.json
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_level_joint.py" finalize \
-            --params clean_params_final.json --roots roots.json --merge-summary clean_merge_final.json \
-            --out HZ_2019-01-04_R1_CLEAN_RAW_JOINT_FULL_DAY.json
+            --out-stats projected4.stats.json --shard-index 4
           python - <<'PY'
           import json
-          x=json.load(open('HZ_2019-01-04_R1_CLEAN_RAW_JOINT_FULL_DAY.json',encoding='utf-8'))
-          c=x['coverage']; j=x['joint_parameters']; d=x['diagnostics']
-          assert c['service_root_count']==1673, c
-          assert c['service_event_count']==43584, c
-          assert c['station_count']==81, c
-          assert c['transfer_movement_count']==9 and c['transfer_path_count']==18, c
-          assert c['passenger_mass']==1206156.0, c
-          assert d['max_abs_map_chain_time_closure_error_s'] <= 1e-6, d
-          assert all(z['access_interval_s'][0]>=5 and z['egress_interval_s'][0]>=5 for z in x['station_movement_intervals'])
-          assert all(p['transfer_interval_s'][0]>=5 for z in x['transfer_path_intervals'] for p in z['paths'])
-          print(json.dumps({'status':x['status'],'coverage':c,'joint_parameters':j,'diagnostics':d},ensure_ascii=False,indent=2))
+          x=json.load(open('projected4.stats.json',encoding='utf-8'))
+          print(json.dumps({'passenger_mass':x['passenger_mass'],'resolved_mass':x['resolved_mass'],'resolved_share':x['resolved_mass']/x['passenger_mass'],'cohort_count':x['cohort_count'],'resolved_cohort_count':x['resolved_cohort_count'],'event_projection_anchor_count':len(x['event_projection_stats']),'diagnostics':x['diagnostics']},ensure_ascii=False,indent=2))
           PY
-          rclone copyto clean_params_final.json "$R:$OUT_DRIVE/final/clean_params_final.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto clean_merge_final.json "$R:$OUT_DRIVE/final/clean_merge_final.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
-          rclone copyto HZ_2019-01-04_R1_CLEAN_RAW_JOINT_FULL_DAY.json "$R:$OUT_DRIVE/final/HZ_2019-01-04_R1_CLEAN_RAW_JOINT_FULL_DAY.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto projected4.stats.json "$R:$OUT_DRIVE/projected4.stats.json" --config "$C" --retries 6 --low-level-retries 15 --transfers 1
           shred -u "$C" 2>/dev/null || rm -f "$C"

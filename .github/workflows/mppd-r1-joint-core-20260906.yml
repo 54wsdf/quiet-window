@@ -8,8 +8,10 @@ on:
       - 'scripts/mppd_r1_joint_model.py'
       - 'scripts/mppd_r1_joint_solver.py'
       - 'scripts/mppd_r1_bootstrap_count_free.py'
+      - 'scripts/mppd_r1_joint_validation_v2.py'
       - 'tests/test_mppd_r1_joint_model.py'
       - 'tests/test_mppd_r1_joint_solver.py'
+      - 'tests/test_mppd_r1_joint_validation_v2.py'
   workflow_dispatch:
 
 permissions:
@@ -37,10 +39,12 @@ jobs:
           python -m py_compile \
             scripts/mppd_r1_joint_model.py \
             scripts/mppd_r1_joint_solver.py \
-            scripts/mppd_r1_bootstrap_count_free.py
+            scripts/mppd_r1_bootstrap_count_free.py \
+            scripts/mppd_r1_joint_validation_v2.py
           PYTHONPATH="$PWD" pytest -q \
             tests/test_mppd_r1_joint_model.py \
-            tests/test_mppd_r1_joint_solver.py
+            tests/test_mppd_r1_joint_solver.py \
+            tests/test_mppd_r1_joint_validation_v2.py
 
   hangzhou-count-free-warm-start:
     needs: unit-contract

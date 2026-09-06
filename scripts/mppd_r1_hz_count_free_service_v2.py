@@ -116,6 +116,7 @@ def materialize_with_ambiguity(
                 "reference_time_s": t0,
                 "support_station_count": int(c["station_count"]),
                 "support_event_count": int(c["event_count"]),
+                "support_event_ids": sorted(str(x) for x in c.get("event_ids", [])),
                 "support_weight": float(c["support_weight"]),
                 "evidence_score": float(c["evidence_score"]),
                 "objective_gain": float(c["objective_gain"]),

@@ -1,0 +1,184 @@
+name: MPPD R1 Hangzhou Count-Free Service Probe 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-count-free-service-probe-20260906.yml'
+      - 'scripts/mppd_r1_hz_count_free_service.py'
+      - 'tests/test_mppd_r1_hz_count_free_service.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-count-free-service-probe-20260906
+  cancel-in-progress: false
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test count-free engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pytest
+          python -m py_compile scripts/mppd_r1_hz_count_free_service.py
+          pytest -q tests/test_mppd_r1_hz_count_free_service.py
+
+  full-day-count-free-probe:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      AFC_SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+      LEGACY_ROOT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_2019-01-04_20260905
+      OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_2019-01-04_20260906
+      TARGET_DATE: '2019-01-04'
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          python -m py_compile scripts/mppd_r1_hz_count_free_service.py
+
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"
+          test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/countfree"
+
+      - name: Fetch full 04:00-to-04:00 AFC boundary and legacy roots for comparison only
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/countfree"
+          rclone copyto "$REMOTE_NAME:$AFC_SOURCE_DRIVE/record_2019-01-04.csv.gz" record_2019-01-04.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$AFC_SOURCE_DRIVE/record_2019-01-05.csv.gz" record_2019-01-05.csv.gz --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$REMOTE_NAME:$LEGACY_ROOT_DRIVE/record_2019-01-04.service_roots.json" legacy_roots.json --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          x=json.load(open('legacy_roots.json',encoding='utf-8'))
+          print('legacy_candidate_roots=',x.get('root_count_total',len(x.get('roots',[]))))
+          assert x.get('status')=='QUALIFIED_CANDIDATE_SERVICE_ROOT_COMPLETION'
+          PY
+
+      - name: Infer service count and trajectories from AFC without planned train count or timetable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/countfree"
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_service.py" \
+            --input record_2019-01-04.csv.gz \
+            --input record_2019-01-05.csv.gz \
+            --service-date "$TARGET_DATE" \
+            --baseline-roots legacy_roots.json \
+            --bin-s 5 \
+            --iterations 3 \
+            --cluster-radius-s 55 \
+            --split-std-s 55 \
+            --min-station-support 4 \
+            --complexity-penalty 0.60 \
+            --output HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json
+
+      - name: Build compact scientific comparison report
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/countfree"
+          python - <<'PY'
+          import json
+          from collections import Counter
+          x=json.load(open('HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json',encoding='utf-8'))
+          sem=x['semantics']
+          assert sem['train_count_is_input'] is False
+          assert sem['planned_timetable_used'] is False
+          assert sem['legacy_candidate_roots_used_as_input'] is False
+          assert sem['service_trajectory_count_is_inferred'] is True
+          trains=x['trajectories']
+          line=Counter(t['afc_line'] for t in trains)
+          direction=Counter(f"{t['afc_line']}:{t['direction']}" for t in trains)
+          ambiguous=sum(bool(t.get('path_ambiguous')) for t in trains)
+          legacy=(x.get('legacy_baseline') or {}).get('legacy_candidate_root_count')
+          report={
+            'schema':'mppd.r1-hz-count-free-service-probe-report.v1',
+            'service_date':x['service_date'],
+            'status':'COUNT_FREE_PROBE_COMPLETED_REQUIRES_PASSENGER_JOINT_REFINEMENT',
+            'count_free_inferred_service_trajectories':x['inferred_service_trajectory_count'],
+            'legacy_candidate_roots_comparison_only':legacy,
+            'count_difference_vs_legacy':x['inferred_service_trajectory_count']-legacy if legacy is not None else None,
+            'trajectory_count_by_line':dict(line),
+            'trajectory_count_by_line_direction':dict(direction),
+            'trajectory_count_by_path_direction':x['trajectory_counts'],
+            'path_ambiguous_trajectory_count':ambiguous,
+            'station_events':x['event_detection'],
+            'edge_lag_sources':x['edge_lag_sources'],
+            'operations':x['operation_totals'],
+            'objective':x['objective'],
+            'iteration_summaries':x['iterations'],
+            'scientific_boundary':'This is count-free AFC-only service discovery. It estimates how many service trajectories the passenger-facing AFC field supports before passenger-chain and station-time joint refinement; it is not yet the final R1 timetable.'
+          }
+          open('HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT.json','w',encoding='utf-8').write(json.dumps(report,ensure_ascii=False,indent=2))
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-count-free-service-probe
+          path: |
+            ${{ runner.temp }}/countfree/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json
+            ${{ runner.temp }}/countfree/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Persist results to Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/countfree"
+          rclone copy HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copy HZ_2019-01-04_R1_COUNT_FREE_SERVICE_PROBE_REPORT.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" | sort
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

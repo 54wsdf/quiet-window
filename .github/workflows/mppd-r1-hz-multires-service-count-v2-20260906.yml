@@ -1,0 +1,173 @@
+name: MPPD R1 Hangzhou Multires Service Count V2 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-multires-service-count-v2-20260906.yml'
+      - 'scripts/mppd_r1_hz_multires_service_count.py'
+      - 'scripts/mppd_r1_hz_multires_service_count_v2.py'
+      - 'scripts/mppd_r1_hz_count_free_service.py'
+      - 'scripts/mppd_r1_hz_count_free_service_v2.py'
+      - 'scripts/mppd_r1_hz_count_free_passenger_coverage.py'
+      - 'tests/test_mppd_r1_hz_multires_service_count.py'
+      - 'tests/test_mppd_r1_hz_multires_service_count_v2.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-multires-service-count-v2-20260906
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  AFC_DRIVE: rail_transit/CN_HZ_Tianchi_2019/raw_afc_gzip
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  OLD_COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/multires_service_count_v2
+  TARGET_DATE: '2019-01-04'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test multiresolution v2 semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pytest
+          python -m py_compile scripts/mppd_r1_hz_multires_service_count.py scripts/mppd_r1_hz_multires_service_count_v2.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_hz_multires_service_count.py tests/test_mppd_r1_hz_multires_service_count_v2.py
+
+  full-day-ladder:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet numpy pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/multires_v2/services"
+      - name: Restore protected Drive configuration and fetch common inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/multires_v2"
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-04.csv.gz" afc_04.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$AFC_DRIVE/record_2019-01-05.csv.gz" afc_05.csv.gz --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$OLD_COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" old_1841.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Re-estimate N independently at 60 30 15 and 5 second structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/multires_v2"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_multires_service_count_v2.py" \
+            --input afc_04.csv.gz --input afc_05.csv.gz \
+            --service-date "$TARGET_DATE" \
+            --output-dir services \
+            --summary R1_MULTIRES_SERVICE_COUNT_LADDER_V2.json \
+            --iterations 3 --complexity-penalty 0.60
+          python - <<'PY'
+          import json
+          p='R1_MULTIRES_SERVICE_COUNT_LADDER_V2.json'
+          x=json.load(open(p,encoding='utf-8'))
+          old=json.load(open('old_1841.json',encoding='utf-8'))
+          assert old['inferred_service_trajectory_count']==1841
+          x['historical_coarse_comparison']={
+              'historical_count_free_v2_count':1841,
+              'historical_count_is_constraint':False,
+              'N60_minus_historical_1841':int(x['service_count_sequence']['N_60s'])-1841,
+              'comparison_semantics':'Historical 1841 is comparison-only; all four N values are re-estimated from raw AFC with the same v2 shared-event competition layer.'
+          }
+          open(p,'w',encoding='utf-8').write(json.dumps(x,ensure_ascii=False,indent=2))
+          print(json.dumps({'service_count_sequence':x['service_count_sequence'],'N60_minus_1841':x['historical_coarse_comparison']['N60_minus_historical_1841']},ensure_ascii=False,indent=2))
+          PY
+      - name: Recompute full-day passenger closure at every structural resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/multires_v2"
+          for LEVEL in 60 30 15 5; do
+            PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+              --cohorts cohorts.parquet --routes routes.json \
+              --services "services/R1_SERVICE_LEVEL_${LEVEL}S.json" \
+              --shard-index 0 --shard-count 1 --output "coverage_${LEVEL}s.json"
+          done
+          python - <<'PY'
+          import json
+          p='R1_MULTIRES_SERVICE_COUNT_LADDER_V2.json'
+          x=json.load(open(p,encoding='utf-8'))
+          c={}
+          for level in (60,30,15,5):
+              y=json.load(open(f'coverage_{level}s.json',encoding='utf-8'))
+              c[f'{level}s']={
+                  'passenger_mass':float(y['passenger_mass']),
+                  'resolved_mass':float(y['resolved_mass']),
+                  'resolved_share':float(y['resolved_share']),
+                  'failure_mass':y['failure_mass']
+              }
+          x['passenger_closure_by_structural_resolution']=c
+          x['status']='MULTIRES_V2_SERVICE_COUNT_AND_PASSENGER_CLOSURE_COMPLETED_REQUIRES_SCIENTIFIC_AUDIT'
+          open(p,'w',encoding='utf-8').write(json.dumps(x,ensure_ascii=False,indent=2))
+          print(json.dumps({'N':x['service_count_sequence'],'closure':{k:v['resolved_share'] for k,v in c.items()}},ensure_ascii=False,indent=2))
+          PY
+      - name: Persist results
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/multires_v2"
+          rclone copyto R1_MULTIRES_SERVICE_COUNT_LADDER_V2.json "$REMOTE_NAME:$OUT_DRIVE/R1_MULTIRES_SERVICE_COUNT_LADDER_V2.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          for LEVEL in 60 30 15 5; do
+            rclone copyto "services/R1_SERVICE_LEVEL_${LEVEL}S.json" "$REMOTE_NAME:$OUT_DRIVE/R1_SERVICE_LEVEL_${LEVEL}S.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+            rclone copyto "coverage_${LEVEL}s.json" "$REMOTE_NAME:$OUT_DRIVE/R1_PASSENGER_CLOSURE_${LEVEL}S.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          done
+      - name: Upload scientific artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-multires-service-count-v2
+          path: |
+            ${{ runner.temp }}/multires_v2/R1_MULTIRES_SERVICE_COUNT_LADDER_V2.json
+            ${{ runner.temp }}/multires_v2/services/R1_SERVICE_LEVEL_60S.json
+            ${{ runner.temp }}/multires_v2/services/R1_SERVICE_LEVEL_30S.json
+            ${{ runner.temp }}/multires_v2/services/R1_SERVICE_LEVEL_15S.json
+            ${{ runner.temp }}/multires_v2/services/R1_SERVICE_LEVEL_5S.json
+            ${{ runner.temp }}/multires_v2/coverage_60s.json
+            ${{ runner.temp }}/multires_v2/coverage_30s.json
+            ${{ runner.temp }}/multires_v2/coverage_15s.json
+            ${{ runner.temp }}/multires_v2/coverage_5s.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

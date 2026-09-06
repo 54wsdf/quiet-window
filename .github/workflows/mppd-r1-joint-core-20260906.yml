@@ -1,0 +1,131 @@
+name: MPPD R1 Joint Core Rebuild 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-joint-core-20260906.yml'
+      - 'scripts/mppd_r1_joint_model.py'
+      - 'scripts/mppd_r1_joint_solver.py'
+      - 'scripts/mppd_r1_bootstrap_count_free.py'
+      - 'tests/test_mppd_r1_joint_model.py'
+      - 'tests/test_mppd_r1_joint_solver.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/bootstrap
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test new R1 joint core
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile \
+            scripts/mppd_r1_joint_model.py \
+            scripts/mppd_r1_joint_solver.py \
+            scripts/mppd_r1_bootstrap_count_free.py
+          PYTHONPATH="$PWD" pytest -q \
+            tests/test_mppd_r1_joint_model.py \
+            tests/test_mppd_r1_joint_solver.py
+
+  hangzhou-count-free-warm-start:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE config' >&2; exit 3; }
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/r1joint"
+      - name: Fetch current AFC-only count-free service warm start
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1joint"
+          rclone copyto \
+            "$REMOTE_NAME:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" \
+            count_free.json \
+            --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Materialize new joint-state warm start without fixing service count
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1joint"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_bootstrap_count_free.py" \
+            --input count_free.json \
+            --output R1_JOINT_WARM_START.json \
+            --summary R1_JOINT_WARM_START_SUMMARY.json
+          python - <<'PY'
+          import json
+          x=json.load(open('R1_JOINT_WARM_START_SUMMARY.json',encoding='utf-8'))
+          assert x['status']=='R1_JOINT_COUNT_FREE_WARM_START_READY'
+          assert x['inferred_service_count'] > 0
+          assert x['semantics']['service_count_is_fixed'] is False
+          assert x['semantics']['train_count_is_input'] is False
+          assert x['semantics']['planned_timetable_used_in_primary_inference'] is False
+          assert x['semantics']['legacy_candidate_roots_used_as_input'] is False
+          assert x['semantics']['coarse_resolution_s']==5.0
+          assert x['semantics']['fine_resolution_s']==1.0
+          assert x['semantics']['single_event_update_trust_region_s']==5.0
+          PY
+      - name: Persist bootstrap authority artifacts
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1joint"
+          rclone copyto R1_JOINT_WARM_START.json "$REMOTE_NAME:$OUT_DRIVE/R1_JOINT_WARM_START.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto R1_JOINT_WARM_START_SUMMARY.json "$REMOTE_NAME:$OUT_DRIVE/R1_JOINT_WARM_START_SUMMARY.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload joint warm-start artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-joint-warm-start
+          path: |
+            ${{ runner.temp }}/r1joint/R1_JOINT_WARM_START.json
+            ${{ runner.temp }}/r1joint/R1_JOINT_WARM_START_SUMMARY.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

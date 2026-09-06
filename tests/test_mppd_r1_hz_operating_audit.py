@@ -68,7 +68,11 @@ def test_shared_trunk_competes_main_and_branch_as_one_physical_resource():
 
 
 def test_branch_exclusive_segment_uses_430_second_special_peak_floor():
-    start = clock_to_service_seconds(8, 0)
+    # The headway authority is evaluated where the pair actually occupies the
+    # physical resource, not at the route origin.  Starting at 07:30 means these
+    # synthetic trains reach the branch-exclusive segment during the 07:30-08:30
+    # special-peak authority window despite the 21 shared-trunk events upstream.
+    start = clock_to_service_seconds(7, 30)
     rows = [
         trajectory("b1", "B", "B_branch", "Down", B_BRANCH, start),
         trajectory("b2", "B", "B_branch", "Down", B_BRANCH, start + 420),

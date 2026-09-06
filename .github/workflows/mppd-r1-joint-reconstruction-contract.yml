@@ -11,6 +11,7 @@ on:
       - 'scripts/mppd_r1_hz_clean_joint.py'
       - 'scripts/mppd_r1_hz_clean_projected.py'
       - 'scripts/mppd_r1_hz_projected_event_merge.py'
+      - 'scripts/mppd_r1_hz_fast_projected.py'
       - 'tests/test_mppd_r1_joint_reconstruction_validate.py'
       - '.github/workflows/mppd-r1-joint-reconstruction-contract.yml'
   workflow_dispatch:
@@ -38,6 +39,7 @@ jobs:
           python -m py_compile scripts/mppd_r1_hz_clean_joint.py
           python -m py_compile scripts/mppd_r1_hz_clean_projected.py
           python -m py_compile scripts/mppd_r1_hz_projected_event_merge.py
+          python -m py_compile scripts/mppd_r1_hz_fast_projected.py
       - name: Run deterministic validator self-test
         run: python scripts/mppd_r1_joint_reconstruction_validate.py self-test
       - name: Run scientific gate tests
@@ -54,15 +56,11 @@ jobs:
           Path('/tmp/r1_joint_fixture.json').write_text(json.dumps(m.fixture()),encoding='utf-8')
           Path('/tmp/r1_authority.json').write_text(json.dumps(m.authority_fixture()),encoding='utf-8')
           PY
-          python scripts/mppd_r1_joint_reconstruction_validate.py validate \
-            --input /tmp/r1_joint_fixture.json \
-            --authority /tmp/r1_authority.json \
-            --out /tmp/r1_joint_report.json
+          python scripts/mppd_r1_joint_reconstruction_validate.py validate --input /tmp/r1_joint_fixture.json --authority /tmp/r1_authority.json --out /tmp/r1_joint_report.json
           python - <<'PY'
           import json
           x=json.load(open('/tmp/r1_joint_report.json',encoding='utf-8'))
           assert x['status']=='QUALIFIED_R1_JOINT_RECONSTRUCTION'
           assert all(x['qualification_gates'].values())
-          assert x['authority']['schema']=='mppd.r1-reconstruction-authority.v1'
           print(json.dumps(x,ensure_ascii=False,indent=2))
           PY

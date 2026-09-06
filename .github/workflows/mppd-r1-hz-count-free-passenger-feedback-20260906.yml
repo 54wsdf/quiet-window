@@ -109,16 +109,13 @@ jobs:
             --shard-index "$SHARD" \
             --shard-count "$SHARD_COUNT" \
             --output "shard_$SHARD.json"
-      - name: Persist shard feedback
-        shell: bash
-        env:
-          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
-          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
-          SHARD: ${{ matrix.shard }}
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/cfpass"
-          rclone copyto "shard_$SHARD.json" "$REMOTE_NAME:$OUT_DRIVE/shards/shard_$SHARD.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+      - name: Upload deterministic shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: count-free-passenger-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/cfpass/shard_${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Clean protected configuration
         if: always()
         shell: bash
@@ -143,7 +140,23 @@ jobs:
           python -m pip install --disable-pip-version-check --quiet pyarrow
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone
-      - name: Restore protected Drive configuration
+          mkdir -p "$RUNNER_TEMP/cfpass_merge/shards"
+      - name: Download all eight shard artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: count-free-passenger-shard-*
+          path: ${{ runner.temp }}/cfpass_merge/shards
+          merge-multiple: true
+      - name: Merge passenger-feedback shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cfpass_merge"
+          test "$(find shards -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 8
+          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge \
+            --input-dir shards \
+            --output HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json
+      - name: Restore protected Drive configuration for final result only
         id: storage
         shell: bash
         run: |
@@ -153,8 +166,7 @@ jobs:
           R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
           echo "config_file=$C" >> "$GITHUB_OUTPUT"
           echo "remote_name=$R" >> "$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/cfpass_merge/shards"
-      - name: Fetch and merge all passenger-feedback shards
+      - name: Persist final merged feedback
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
@@ -162,12 +174,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/cfpass_merge"
-          rclone copy "$REMOTE_NAME:$OUT_DRIVE/shards" shards --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 8
-          test "$(find shards -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 8
-          python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge \
-            --input-dir shards \
-            --output HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json
-          rclone copy HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+          rclone copyto HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json "$REMOTE_NAME:$OUT_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
       - name: Upload merged scientific probe
         uses: actions/upload-artifact@v4
         with:

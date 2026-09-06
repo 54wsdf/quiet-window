@@ -19,7 +19,7 @@ concurrency:
 env:
   GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
   DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
-  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_service_init_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
   SERVICE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
   OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
   TARGET_DATE: '2019-01-04'

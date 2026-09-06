@@ -1,0 +1,201 @@
+name: MPPD R1 Event Modification Complexity Frontier 2026-09-06
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-event-complexity-frontier-20260906.yml'
+      - 'scripts/mppd_r1_event_complexity_frontier.py'
+      - 'tests/test_mppd_r1_event_complexity_frontier.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  COUNT_FREE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  PRESSURE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/event_pressure0
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/event_complexity_frontier
+  TARGET_DATE: '2019-01-04'
+  BASELINE_RESOLVED_MASS: '598628.0'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test complexity frontier logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile scripts/mppd_r1_event_complexity_frontier.py scripts/mppd_r1_hz_event_update_proposal.py
+          PYTHONPATH="$PWD" pytest -q tests/test_mppd_r1_event_complexity_frontier.py tests/test_mppd_r1_hz_event_update_proposal.py
+
+  lambda-sweep:
+    needs: unit-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        lambda_event: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Restore protected Drive configuration and fetch common inputs
+        id: storage
+        shell: bash
+        env:
+          LAMBDA_EVENT: ${{ matrix.lambda_event }}
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/frontier"
+          cd "$RUNNER_TEMP/frontier"
+          rclone copyto "$R:$COUNT_FREE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$PRESSURE_DRIVE/R1_EVENT_PRESSURE0.json" pressure0.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Build common Pareto-safe proposal and lambda-filtered service world
+        shell: bash
+        env:
+          LAMBDA_EVENT: ${{ matrix.lambda_event }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/frontier"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_update_proposal.py" propose \
+            --services services0.json --pressure pressure0.json --output proposal0.json
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_event_complexity_frontier.py" filter \
+            --proposal proposal0.json --lambda-event "$LAMBDA_EVENT" --output proposal_filtered.json
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_event_update_proposal.py" apply \
+            --services services0.json --proposal proposal_filtered.json --output services_filtered.json
+      - name: Recompute complete full-day passenger posterior at this event complexity
+        shell: bash
+        env:
+          LAMBDA_EVENT: ${{ matrix.lambda_event }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/frontier"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+            --cohorts cohorts.parquet --routes routes.json --services services_filtered.json \
+            --shard-index 0 --shard-count 1 --output posterior.json
+          python - <<'PY'
+          import json, os
+          q=json.load(open('proposal_filtered.json',encoding='utf-8'))
+          p=json.load(open('posterior.json',encoding='utf-8'))
+          baseline=float(os.environ['BASELINE_RESOLVED_MASS'])
+          n=int(q['proposed_event_update_count'])
+          gain=float(p['resolved_mass'])-baseline
+          out={
+            'schema':'mppd.r1-event-complexity-point.v1',
+            'lambda_event':float(os.environ['LAMBDA_EVENT']),
+            'modified_event_count':n,
+            'modified_trajectory_count':int(q['proposed_trajectory_update_count']),
+            'resolved_mass':float(p['resolved_mass']),
+            'resolved_share':float(p['resolved_share']),
+            'resolved_mass_gain':gain,
+            'gain_per_modified_event':gain/n if n else None,
+            'failure_mass':p['failure_mass'],
+            'direct_rescue_mass_not_deduplicated':float(q['sum_direct_rescue_mass_not_deduplicated']),
+            'direct_damage_mass_not_deduplicated':float(q['sum_direct_damage_mass_not_deduplicated'])
+          }
+          open('frontier_point.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload frontier point
+        uses: actions/upload-artifact@v4
+        with:
+          name: r1-event-frontier-lambda-${{ matrix.lambda_event }}
+          path: ${{ runner.temp }}/frontier/frontier_point.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  summarize-frontier:
+    needs: lambda-sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download all event-complexity points
+        uses: actions/download-artifact@v5
+        with:
+          pattern: r1-event-frontier-lambda-*
+          path: ${{ runner.temp }}/frontier_points
+      - name: Build empirical passenger-posterior frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, glob, pathlib
+          rows=[]
+          for p in glob.glob(str(pathlib.Path('${{ runner.temp }}')/'frontier_points'/'**'/'frontier_point.json'),recursive=True):
+              rows.append(json.load(open(p,encoding='utf-8')))
+          rows.sort(key=lambda x:x['lambda_event'])
+          # Empirical Pareto: no other point may use <= modified events and achieve >= gain,
+          # with at least one strict inequality.
+          for r in rows:
+              r['pareto_nondominated']=not any(
+                  (q['modified_event_count']<=r['modified_event_count'] and q['resolved_mass_gain']>=r['resolved_mass_gain'] and
+                   (q['modified_event_count']<r['modified_event_count'] or q['resolved_mass_gain']>r['resolved_mass_gain']))
+                  for q in rows
+              )
+          best=max(rows,key=lambda x:x['resolved_mass'])
+          efficient=max(rows,key=lambda x:(x['gain_per_modified_event'] if x['gain_per_modified_event'] is not None else -1))
+          out={
+            'schema':'mppd.r1-event-complexity-frontier-full-day.v1',
+            'status':'FULL_DAY_EVENT_COMPLEXITY_FRONTIER_COMPLETED_NO_FINAL_LAMBDA_SELECTED',
+            'points':rows,
+            'best_passenger_only_point':best,
+            'best_gain_per_event_point':efficient,
+            'scientific_boundary':'This sweep measures passenger posterior response to event L0 regularization. It does not yet include final AFC likelihood and therefore cannot by itself select the accepted R1 event update.'
+          }
+          path=pathlib.Path('${{ runner.temp }}')/'R1_EVENT_COMPLEXITY_FRONTIER.json'
+          path.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Install protected storage client and persist frontier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          rclone copyto '${{ runner.temp }}/R1_EVENT_COMPLEXITY_FRONTIER.json' "$R:$OUT_DRIVE/R1_EVENT_COMPLEXITY_FRONTIER.json" --config "$C" --retries 6 --low-level-retries 15
+          shred -u "$C" 2>/dev/null || rm -f "$C"
+      - name: Upload full frontier artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-event-complexity-frontier
+          path: ${{ runner.temp }}/R1_EVENT_COMPLEXITY_FRONTIER.json
+          if-no-files-found: error
+          retention-days: 30

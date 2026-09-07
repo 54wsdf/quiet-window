@@ -1,0 +1,241 @@
+name: MPPD R1 Hangzhou Lineage Timing MAP Frontier 2026-09-07
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-lineage-timing-map-20260907.yml'
+      - 'scripts/mppd_r1_hz_lineage_timing_map.py'
+      - 'tests/test_mppd_r1_hz_lineage_timing_map.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  FRONTIER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/operating_repair_frontier_v1
+  LINEAGE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/operating_fragment_lineage_v1
+  BASELINE_PASSENGER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/lineage_timing_map_v1
+  LABELS: 'pw_0p0 pw_1p0 pw_2p0 pw_4p0'
+  SHARD_COUNT: '8'
+
+jobs:
+  prepare-map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test timing MAP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet scipy pytest
+          python -m py_compile scripts/mppd_r1_hz_lineage_timing_map.py tests/test_mppd_r1_hz_lineage_timing_map.py
+          PYTHONPATH="$PWD" python -m pytest -q tests/test_mppd_r1_hz_lineage_timing_map.py
+      - name: Install storage client and fetch full-day inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq; sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1timemap/input" "$RUNNER_TEMP/r1timemap/out"
+          cd "$RUNNER_TEMP/r1timemap/input"
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          rclone copyto "$R:$SOURCE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" original.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$FRONTIER_DRIVE/structural/services_pw_4p0.json" candidate.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$LINEAGE_DRIVE/lineage_pw_4p0.json" lineage.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASELINE_PASSENGER_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json" passenger.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Solve coherent full-network timing hypothesis MAPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_lineage_timing_map.py" \
+            --original-services "$RUNNER_TEMP/r1timemap/input/original.json" \
+            --candidate-services "$RUNNER_TEMP/r1timemap/input/candidate.json" \
+            --lineage "$RUNNER_TEMP/r1timemap/input/lineage.json" \
+            --passenger-feedback "$RUNNER_TEMP/r1timemap/input/passenger.json" \
+            --output-dir "$RUNNER_TEMP/r1timemap/out" --weights 0 1 2 4
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'r1timemap/out/frontier.json'
+          x=json.loads(p.read_text(encoding='utf-8'))
+          assert len(x['candidates'])==4
+          assert all(r['service_count']==1569 for r in x['candidates'])
+          print(json.dumps(x['candidates'],ensure_ascii=False,indent=2))
+          PY
+      - name: Persist MAP worlds
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1timemap/out"
+          for F in *.json; do rclone copyto "$F" "$REMOTE_NAME:$OUT_DRIVE/structural/$F" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hz-r1-lineage-timing-map-worlds
+          path: ${{ runner.temp }}/r1timemap/out/*.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  passenger-shard:
+    needs: prepare-map
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install runtime and storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq; sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1timemap_pass/worlds" "$RUNNER_TEMP/r1timemap_pass/out"
+      - uses: actions/download-artifact@v5
+        with:
+          name: hz-r1-lineage-timing-map-worlds
+          path: ${{ runner.temp }}/r1timemap_pass/worlds
+      - name: Fetch passenger cohorts and route support
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1timemap_pass"
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/2019-01-04.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+      - name: Re-evaluate all timing MAPs on passenger shard
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1timemap_pass"
+          for LABEL in $LABELS; do
+            PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+              --cohorts cohorts.parquet --routes routes.json --services "worlds/services_${LABEL}.json" \
+              --shard-index "$SHARD" --shard-count "$SHARD_COUNT" --output "out/${LABEL}_shard_${SHARD}.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timemap-passenger-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/r1timemap_pass/out/*.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  merge:
+    needs: passenger-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install merge runtime and storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq; sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1timemap_merge/all" "$RUNNER_TEMP/r1timemap_merge/worlds" "$RUNNER_TEMP/r1timemap_merge/out"
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: timemap-passenger-shard-*
+          path: ${{ runner.temp }}/r1timemap_merge/all
+          merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: hz-r1-lineage-timing-map-worlds
+          path: ${{ runner.temp }}/r1timemap_merge/worlds
+      - name: Merge and compare timing MAP passenger results
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1timemap_merge"
+          for LABEL in $LABELS; do
+            mkdir -p "tmp_$LABEL"; cp all/${LABEL}_shard_*.json "tmp_$LABEL/"
+            for F in tmp_$LABEL/${LABEL}_shard_*.json; do B=$(basename "$F"); mv "$F" "tmp_$LABEL/${B#${LABEL}_}"; done
+            PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge --input-dir "tmp_$LABEL" --output "out/passenger_${LABEL}.json"
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'r1timemap_merge'
+          frontier=json.loads((root/'worlds/frontier.json').read_text(encoding='utf-8'))
+          meta={x['label']:x for x in frontier['candidates']}
+          baseline=0.4963105933229201
+          rows=[]
+          for label in os.environ['LABELS'].split():
+            p=json.loads((root/f'out/passenger_{label}.json').read_text(encoding='utf-8'))
+            rows.append({**meta[label], 'resolved_mass':p['resolved_mass'],'resolved_share':p['resolved_share'],
+              'resolved_share_change_vs_1841':p['resolved_share']-baseline,'failure_mass':p['failure_mass']})
+          result={'schema':'mppd.r1-hz-lineage-timing-map-passenger-result.v1',
+            'status':'COHERENT_LINEAGE_TIMING_MAP_PASSENGER_FRONTIER_COMPLETED_NO_FINAL_TIMING_SELECTED',
+            'baseline_service_count':1841,'latent_service_count':1569,'baseline_resolved_share':baseline,
+            'candidates':rows,'semantics':{'planned_timetable_used':False,'all_worlds_headway_legal':True,
+              'service_count_changed_across_timing_frontier':False,'candidate_world_is_final_r1':False}}
+          (root/'out/manifest.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(rows,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist timing MAP comparison
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1timemap_merge/out"
+          for F in *.json; do rclone copyto "$F" "$R:$OUT_DRIVE/passenger/$F" --config "$C" --retries 6 --low-level-retries 15 --transfers 1; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hz-r1-lineage-timing-map-final
+          path: ${{ runner.temp }}/r1timemap_merge/out/*.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

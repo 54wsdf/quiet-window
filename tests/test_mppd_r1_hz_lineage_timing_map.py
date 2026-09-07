@@ -1,4 +1,5 @@
 from scripts.mppd_r1_hz_lineage_timing_map import solve_timing_map
+from scripts.mppd_r1_hz_operating_authority import clock_to_service_seconds
 
 
 A_NODES = [67, 68, 69, 70, 71, 72, 73, 74, 5, 75, 76, 77, 46, 78, 79, 80, 15, 16]
@@ -36,8 +37,9 @@ def feedback(**mass):
 
 
 def test_single_group_can_choose_removed_high_passenger_timing_hypothesis():
-    keep = tr("keep", 7 * 3600, evidence=1.0)
-    drop = tr("drop", 7 * 3600 + 80, evidence=1.0)
+    start = clock_to_service_seconds(7, 40)
+    keep = tr("keep", start, evidence=1.0)
+    drop = tr("drop", start + 80, evidence=1.0)
     result, report = solve_timing_map(
         world([keep, drop]),
         world([keep]),
@@ -58,10 +60,11 @@ def test_single_group_can_choose_removed_high_passenger_timing_hypothesis():
 
 
 def test_two_latent_services_never_choose_illegal_close_hypotheses_together():
-    base1 = tr("g1", 7 * 3600, evidence=1.0)
-    alt1 = tr("g1alt", 7 * 3600 + 80, evidence=1.0)
-    base2 = tr("g2", 7 * 3600 + 300, evidence=1.0)
-    alt2 = tr("g2alt", 7 * 3600 + 180, evidence=1.0)
+    start = clock_to_service_seconds(7, 40)
+    base1 = tr("g1", start, evidence=1.0)
+    alt1 = tr("g1alt", start + 80, evidence=1.0)
+    base2 = tr("g2", start + 300, evidence=1.0)
+    alt2 = tr("g2alt", start + 180, evidence=1.0)
     original = world([base1, alt1, base2, alt2])
     candidate = world([base1, base2])
     lin = lineage([
@@ -82,8 +85,9 @@ def test_two_latent_services_never_choose_illegal_close_hypotheses_together():
 
 
 def test_zero_passenger_weight_keeps_survivor_on_exact_evidence_tie():
-    keep = tr("keep", 7 * 3600, evidence=1.0)
-    drop = tr("drop", 7 * 3600 + 80, evidence=1.0)
+    start = clock_to_service_seconds(7, 40)
+    keep = tr("keep", start, evidence=1.0)
+    drop = tr("drop", start + 80, evidence=1.0)
     result, report = solve_timing_map(
         world([keep, drop]), world([keep]),
         lineage([{"removed_trajectory_id":"drop","survivor_trajectory_id":"keep","lineage_class":"PARALLEL_SAME_PATH_FRAGMENT"}]),

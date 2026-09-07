@@ -1,0 +1,362 @@
+name: MPPD R1 Hangzhou Operating-Constrained Repair 2026-09-07
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-operating-constrained-repair-20260907.yml'
+      - 'scripts/mppd_r1_hz_operating_authority.py'
+      - 'scripts/mppd_r1_hz_operating_audit.py'
+      - 'scripts/mppd_r1_hz_operating_repair.py'
+      - 'scripts/mppd_r1_hz_circulation_sensitivity.py'
+      - 'scripts/mppd_r1_hz_count_free_passenger_coverage.py'
+      - 'scripts/mppd_r1_service_circulation.py'
+      - 'tests/test_mppd_r1_hz_operating_authority.py'
+      - 'tests/test_mppd_r1_hz_operating_audit.py'
+      - 'tests/test_mppd_r1_hz_operating_repair.py'
+      - 'tests/test_mppd_r1_hz_count_free_passenger_coverage.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-operating-constrained-repair-20260907
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  DOMAIN_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_full_service_day_domain_20260905
+  ROUTE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/derived_single_full_service_day_r1b_2019-01-04_20260905
+  BASELINE_PASSENGER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/operating_constrained_repair_v1
+  TARGET_DATE: '2019-01-04'
+  SHARD_COUNT: '8'
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test constrained repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow pytest
+          python -m py_compile \
+            scripts/mppd_r1_hz_operating_authority.py \
+            scripts/mppd_r1_hz_operating_audit.py \
+            scripts/mppd_r1_hz_operating_repair.py \
+            scripts/mppd_r1_hz_circulation_sensitivity.py \
+            scripts/mppd_r1_hz_count_free_passenger_coverage.py \
+            scripts/mppd_r1_service_circulation.py
+          PYTHONPATH="$PWD" python -m pytest -q \
+            tests/test_mppd_r1_hz_operating_authority.py \
+            tests/test_mppd_r1_hz_operating_audit.py \
+            tests/test_mppd_r1_hz_operating_repair.py \
+            tests/test_mppd_r1_hz_count_free_passenger_coverage.py
+
+  prepare-repaired-world:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1repair"
+      - name: Restore protected storage configuration and fetch 1841 warm start
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          test -n "$GDRIVE_CONFIG_B64"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1repair"
+          rclone copyto "$R:$SOURCE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" services_1841.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          x=json.load(open('services_1841.json',encoding='utf-8'))
+          assert x['inferred_service_trajectory_count']==1841
+          assert x['semantics']['train_count_is_input'] is False
+          assert x['semantics']['planned_timetable_used'] is False
+          assert x['semantics']['legacy_candidate_roots_used_as_input'] is False
+          PY
+      - name: Build death-only operating-constrained candidate world
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1repair"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_operating_repair.py" \
+            --services services_1841.json \
+            --output-services services_repaired.json \
+            --output-report repair_report.json
+          python - <<'PY'
+          import json
+          r=json.load(open('repair_report.json',encoding='utf-8'))
+          s=json.load(open('services_repaired.json',encoding='utf-8'))
+          assert r['service_count_before']==1841
+          assert r['service_count_after']==s['inferred_service_trajectory_count']
+          assert r['after']['headway']['total_normal_floor_violation_pair_count']==0
+          assert r['semantics']['birth_operations_applied']==0
+          assert r['semantics']['candidate_world_is_final_r1'] is False
+          print({'status':r['status'],'N_before':1841,'N_after':r['service_count_after'],'removed':r['removed_service_count'],'rounds':r['round_count']})
+          PY
+      - name: Recompute circulation sensitivity on repaired world
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1repair"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_circulation_sensitivity.py" \
+            --services services_repaired.json \
+            --output circulation_repaired.json
+          test -s circulation_repaired.json
+      - name: Persist repaired structural products
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1repair"
+          for F in services_repaired.json repair_report.json circulation_repaired.json; do
+            rclone copyto "$F" "$REMOTE_NAME:$OUT_DRIVE/$F" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+      - name: Upload repaired service world
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-r1-operating-repaired-world
+          path: |
+            ${{ runner.temp }}/r1repair/services_repaired.json
+            ${{ runner.temp }}/r1repair/repair_report.json
+            ${{ runner.temp }}/r1repair/circulation_repaired.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  passenger-shard:
+    needs: prepare-repaired-world
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install passenger runtime and storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1repair_pass"
+      - name: Download repaired service artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: hz-r1-operating-repaired-world
+          path: ${{ runner.temp }}/r1repair_pass/repaired
+      - name: Fetch cohorts and qualified route support
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1repair_pass"
+          rclone copyto "$R:$DOMAIN_DRIVE/cohorts/$TARGET_DATE.journey_cohorts.parquet" cohorts.parquet --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$ROUTE_DRIVE/expanded_route_support_k32.json" routes.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          r=json.load(open('routes.json',encoding='utf-8'))
+          s=json.load(open('repaired/services_repaired.json',encoding='utf-8'))
+          assert r['status']=='QUALIFIED_LINE_AWARE_ROUTE_SUPPORT'
+          assert s['semantics']['train_count_is_input'] is False
+          assert s['semantics']['planned_timetable_used'] is False
+          assert s['semantics']['service_trajectory_count_is_inferred'] is True
+          PY
+      - name: Regenerate complete passenger chains on repaired world
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1repair_pass"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" shard \
+            --cohorts cohorts.parquet \
+            --routes routes.json \
+            --services repaired/services_repaired.json \
+            --shard-index "$SHARD" \
+            --shard-count "$SHARD_COUNT" \
+            --output "shard_$SHARD.json"
+      - name: Upload repaired passenger shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-passenger-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/r1repair_pass/shard_${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi
+
+  merge-and-compare:
+    needs: passenger-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install merge runtime and storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyarrow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1repair_merge/shards" "$RUNNER_TEMP/r1repair_merge/repaired"
+      - name: Download repaired world and all passenger shards
+        uses: actions/download-artifact@v5
+        with:
+          pattern: repaired-passenger-shard-*
+          path: ${{ runner.temp }}/r1repair_merge/shards
+          merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: hz-r1-operating-repaired-world
+          path: ${{ runner.temp }}/r1repair_merge/repaired
+      - name: Merge repaired passenger posterior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1repair_merge"
+          test "$(find shards -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 8
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_count_free_passenger_coverage.py" merge \
+            --input-dir shards \
+            --output passenger_repaired.json
+      - name: Fetch baseline passenger posterior and build comparison manifest
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1repair_merge"
+          rclone copyto "$R:$BASELINE_PASSENGER_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json" passenger_1841.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import hashlib,json,os
+          from datetime import datetime,timezone
+          from pathlib import Path
+          def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          base=json.load(open('passenger_1841.json',encoding='utf-8'))
+          new=json.load(open('passenger_repaired.json',encoding='utf-8'))
+          repair=json.load(open('repaired/repair_report.json',encoding='utf-8'))
+          circ=json.load(open('repaired/circulation_repaired.json',encoding='utf-8'))
+          assert abs(float(base['passenger_mass'])-float(new['passenger_mass'])) < 1e-9
+          manifest={
+            'schema':'mppd.r1-hz-operating-constrained-repair-manifest.v1',
+            'status':'OPERATING_CONSTRAINED_DEATH_CANDIDATE_WORLD_PASSENGER_REEVALUATED',
+            'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+            'git_sha':os.environ['GITHUB_SHA'],
+            'service_count_before':repair['service_count_before'],
+            'service_count_after':repair['service_count_after'],
+            'removed_service_count':repair['removed_service_count'],
+            'repair_round_count':repair['round_count'],
+            'remaining_normal_headway_conflicts':repair['after']['headway']['total_normal_floor_violation_pair_count'],
+            'direction_balance_before':repair['before']['direction_balance']['by_path'],
+            'direction_balance_after':repair['after']['direction_balance']['by_path'],
+            'passenger':{
+              'mass':new['passenger_mass'],
+              'resolved_mass_before':base['resolved_mass'],
+              'resolved_mass_after':new['resolved_mass'],
+              'resolved_mass_change':new['resolved_mass']-base['resolved_mass'],
+              'resolved_share_before':base['resolved_share'],
+              'resolved_share_after':new['resolved_share'],
+              'resolved_share_change':new['resolved_share']-base['resolved_share'],
+              'failure_mass_before':base['failure_mass'],
+              'failure_mass_after':new['failure_mass'],
+            },
+            'circulation_repaired_envelope':circ.get('envelope',{}),
+            'sha256':{
+              'repair_report':sha('repaired/repair_report.json'),
+              'services_repaired':sha('repaired/services_repaired.json'),
+              'circulation_repaired':sha('repaired/circulation_repaired.json'),
+              'passenger_repaired':sha('passenger_repaired.json'),
+            },
+            'semantics':{
+              'candidate_world_is_final_r1':False,
+              'birth_operations_applied':0,
+              'planned_absolute_timetable_used':False,
+              'planned_trip_count_used':False,
+              'depot_boundary_resolution_applied':False,
+              'physical_vehicle_identity_claimed':False,
+            },
+          }
+          Path('manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:manifest[k] for k in ('status','service_count_before','service_count_after','removed_service_count','passenger')},ensure_ascii=False,indent=2))
+          PY
+      - name: Persist final comparison products
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1repair_merge"
+          for F in passenger_repaired.json manifest.json; do
+            rclone copyto "$F" "$REMOTE_NAME:$OUT_DRIVE/$F" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          done
+      - name: Upload final scientific comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-r1-operating-constrained-repair-final
+          path: |
+            ${{ runner.temp }}/r1repair_merge/passenger_repaired.json
+            ${{ runner.temp }}/r1repair_merge/manifest.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

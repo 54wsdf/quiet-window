@@ -17,7 +17,7 @@ from scripts.mppd_r1_hz_operating_authority import (
 
 AUDIT_SCHEMA = "mppd.r1-hz-operating-service-audit.v1"
 
-# Physical-resource scopes are deliberately explicit.  B_main and B_branch compete
+# Physical-resource scopes are deliberately explicit. B_main and B_branch compete
 # together on their shared trunk; their exclusive branches are audited separately.
 AUDIT_RESOURCES: tuple[dict[str, Any], ...] = (
     {
@@ -293,8 +293,11 @@ def audit_service_world(
             "absolute_physical_violation_pair_count": len(physical_violations),
             "verified_operating_envelope_violation_pair_count": len(operating_violations),
             "total_normal_floor_violation_pair_count": len(any_violations),
-            "by_resource": by_resource,
+            # Full frontier is required by structural repair. The compact top-200
+            # view remains for human diagnostics and backwards compatibility.
+            "violation_pairs": violations_sorted,
             "worst_violation_pairs": violations_sorted[:200],
+            "by_resource": by_resource,
         },
         "direction_balance": {
             "by_path": path_balance,

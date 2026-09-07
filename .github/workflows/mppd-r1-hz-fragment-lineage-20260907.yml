@@ -1,0 +1,104 @@
+name: MPPD R1 Hangzhou Operating Fragment Lineage 2026-09-07
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-fragment-lineage-20260907.yml'
+      - 'scripts/mppd_r1_hz_fragment_lineage.py'
+      - 'tests/test_mppd_r1_hz_fragment_lineage.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  FRONTIER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/operating_repair_frontier_v1
+  BASELINE_PASSENGER_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_passenger_feedback_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/operating_fragment_lineage_v1
+
+jobs:
+  lineage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test lineage contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile scripts/mppd_r1_hz_fragment_lineage.py tests/test_mppd_r1_hz_fragment_lineage.py
+          PYTHONPATH="$PWD" python -m pytest -q tests/test_mppd_r1_hz_fragment_lineage.py
+      - name: Install storage client and fetch qualified inputs
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq; sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1lineage"; cd "$RUNNER_TEMP/r1lineage"
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"; echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          rclone copyto "$R:$SOURCE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" original.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$FRONTIER_DRIVE/structural/services_pw_4p0.json" candidate.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          rclone copyto "$R:$BASELINE_PASSENGER_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_PASSENGER_FEEDBACK.json" passenger.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          python - <<'PY'
+          import json
+          o=json.load(open('original.json',encoding='utf-8')); c=json.load(open('candidate.json',encoding='utf-8'))
+          assert o['inferred_service_trajectory_count']==1841
+          assert c['inferred_service_trajectory_count']==1569
+          PY
+      - name: Audit deleted-to-survivor fragment lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1lineage"
+          PYTHONPATH="$GITHUB_WORKSPACE" python "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_fragment_lineage.py" \
+            --original-services original.json --candidate-services candidate.json \
+            --passenger-feedback passenger.json --output lineage.json \
+            --parallel-residual-gate-s 20 --max-offset-s 450
+          python - <<'PY'
+          import json
+          x=json.load(open('lineage.json',encoding='utf-8'))
+          assert x['service_count_original']==1841
+          assert x['service_count_candidate']==1569
+          assert x['removed_service_count']==272
+          assert x['semantics']['event_times_changed'] is False
+          print(json.dumps({
+            'status':x['status'],'lineage_classes':x['lineage_class_counts'],
+            'parallel_lineage_share':x['parallel_lineage_share_of_removed'],
+            'parallel_assignment_share':x['parallel_lineage_assignment_mass_share_of_removed'],
+            'median_abs_offset_s':x['parallel_absolute_offset_median_s'],
+            'median_parallel_p90_s':x['parallel_p90_residual_median_s'],
+            'survivor_group_count':x['survivor_group_count'],
+          },ensure_ascii=False,indent=2))
+          PY
+      - name: Persist and upload lineage audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1lineage"
+          rclone copyto lineage.json "$REMOTE_NAME:$OUT_DRIVE/lineage_pw_4p0.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hz-r1-operating-fragment-lineage
+          path: ${{ runner.temp }}/r1lineage/lineage.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

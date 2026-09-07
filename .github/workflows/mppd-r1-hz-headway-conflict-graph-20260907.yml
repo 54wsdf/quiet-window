@@ -1,0 +1,140 @@
+name: MPPD R1 Hangzhou Headway Conflict Graph 2026-09-07
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mppd-r1-hz-headway-conflict-graph-20260907.yml'
+      - 'scripts/mppd_r1_hz_headway_conflict_graph.py'
+      - 'scripts/mppd_r1_hz_operating_authority.py'
+      - 'scripts/mppd_r1_hz_operating_audit.py'
+      - 'tests/test_mppd_r1_hz_headway_conflict_graph.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mppd-r1-hz-headway-conflict-graph-20260907
+  cancel-in-progress: false
+
+env:
+  GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+  SOURCE_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_count_free_service_v2_2019-01-04_20260906
+  OUT_DRIVE: rail_transit/CN_HZ_Tianchi_2019/r1_joint_rebuild_2019-01-04_20260906/headway_conflict_graph
+
+jobs:
+  unit-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Compile and test conflict graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m py_compile \
+            scripts/mppd_r1_hz_headway_conflict_graph.py \
+            scripts/mppd_r1_hz_operating_authority.py \
+            scripts/mppd_r1_hz_operating_audit.py
+          PYTHONPATH="$PWD" python -m pytest -q \
+            tests/test_mppd_r1_hz_headway_conflict_graph.py \
+            tests/test_mppd_r1_hz_operating_authority.py \
+            tests/test_mppd_r1_hz_operating_audit.py
+
+  full-day-graph:
+    needs: unit-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install protected storage client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          mkdir -p "$RUNNER_TEMP/r1_headway_graph"
+      - name: Fetch exact historical 1841 warm start
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/rclone.conf"; umask 077
+          test -n "$GDRIVE_CONFIG_B64"
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$C"
+          R="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$C")"; test -n "$R"
+          echo "config_file=$C" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$R" >> "$GITHUB_OUTPUT"
+          cd "$RUNNER_TEMP/r1_headway_graph"
+          rclone copyto \
+            "$R:$SOURCE_DRIVE/HZ_2019-01-04_R1_COUNT_FREE_SERVICE_DISCOVERY_V2.json" \
+            services_1841.json --config "$C" --retries 6 --low-level-retries 15 --transfers 1
+          test -s services_1841.json
+          python - <<'PY'
+          import hashlib,json
+          p='services_1841.json'
+          x=json.load(open(p,encoding='utf-8'))
+          assert x['inferred_service_trajectory_count']==1841
+          assert hashlib.sha256(open(p,'rb').read()).hexdigest()=='2224838bf861540bc58073f19bdf32e32b32188312a1ac02ab142c15a3dc1499'
+          print({'status':'EXACT_1841_WARM_START_VERIFIED','sha256':'2224838bf861540bc58073f19bdf32e32b32188312a1ac02ab142c15a3dc1499'})
+          PY
+      - name: Build full headway conflict graph and repair bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_headway_graph"
+          PYTHONPATH="$GITHUB_WORKSPACE" python \
+            "$GITHUB_WORKSPACE/scripts/mppd_r1_hz_headway_conflict_graph.py" \
+            --services services_1841.json \
+            --output headway_conflict_graph.json
+          test -s headway_conflict_graph.json
+          python - <<'PY'
+          import json
+          x=json.load(open('headway_conflict_graph.json',encoding='utf-8'))
+          assert x['service_count_before']==1841
+          assert x['semantics']['service_world_mutated'] is False
+          assert x['semantics']['planned_absolute_timetable_used'] is False
+          print(json.dumps({
+            'status':x['status'],
+            'conflict_graph':x['conflict_graph'],
+            'repair_bounds':x['repair_bounds'],
+            'diagnostic_repair':{k:v for k,v in x['diagnostic_repair'].items() if k!='removed_trajectory_ids'},
+          },ensure_ascii=False,indent=2))
+          PY
+      - name: Persist conflict graph
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/r1_headway_graph"
+          sha256sum headway_conflict_graph.json
+          rclone copyto headway_conflict_graph.json \
+            "$REMOTE_NAME:$OUT_DRIVE/headway_conflict_graph.json" \
+            --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1
+          rclone lsf "$REMOTE_NAME:$OUT_DRIVE/headway_conflict_graph.json" --config "$CONFIG_FILE" | grep -F headway_conflict_graph.json
+      - name: Upload conflict graph artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-2019-01-04-r1-headway-conflict-graph
+          path: ${{ runner.temp }}/r1_headway_graph/headway_conflict_graph.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

@@ -1,0 +1,161 @@
+name: Shanghai MetroFlow Canonical Parquet V2 2026-09-08
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/shanghai-metroflow-canonical-parquet-v2-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_URL: https://ndownloader.figshare.com/files/68207551
+      SOURCE_ZIP_SHA256: 427e7c8e3021d4007114db876db9fb6d1b35674b29ad950ebc64cf1a838cab88
+      SOURCE_ZIP_BYTES: '1211783206'
+      SOURCE_OD_BYTES: '12102430926'
+      DRIVE_ROOT: transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675/canonical_od_date_v1
+
+    steps:
+      - name: Check durable-storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${GDRIVE_CONFIG_B64:-}" ]] || { echo 'Missing storage config' >&2; exit 3; }
+
+      - name: Checkout data worker
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install processing runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'numpy>=2.0,<3' 'pandas>=2.2,<3' 'pyarrow>=18,<24' 'requests>=2.32,<3'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          [[ -n "$REMOTE_NAME" ]] || exit 4
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Patch verifier and build canonical Parquet dataset
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/processing/shanghai_metroflow_canonical_parquet.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'flow_table = pq.read_table(path, columns=list(FLOW_COLUMNS))'
+          new = 'flow_table = parquet_file.read(columns=list(FLOW_COLUMNS))'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one verifier call, found {count}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          OUT="$RUNNER_TEMP/metroflow-canonical"
+          python scripts/processing/shanghai_metroflow_canonical_parquet.py \
+            --source-url "$SOURCE_URL" \
+            --output-dir "$OUT" \
+            --expected-zip-sha256 "$SOURCE_ZIP_SHA256" \
+            --expected-zip-bytes "$SOURCE_ZIP_BYTES" \
+            --expected-od-bytes "$SOURCE_OD_BYTES" \
+            --chunksize 500000 \
+            | tee "$RUNNER_TEMP/canonical-build.log"
+          test -f "$OUT/QUALIFIED.json"
+          test -f "$OUT/manifest.json"
+          test "$(find "$OUT" -mindepth 2 -maxdepth 2 -name od.parquet | wc -l)" -eq 123
+
+      - name: Upload versioned qualified build to Google Drive
+        id: upload
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/metroflow-canonical"
+          BUILD_PATH="$DRIVE_ROOT/builds/${GITHUB_RUN_ID}"
+          rclone copy "$OUT" "$REMOTE_NAME:$BUILD_PATH" \
+            --config "$CONFIG_FILE" \
+            --retries 8 --low-level-retries 20 --transfers 4 --checkers 8 \
+            --drive-chunk-size 128M --stats 60s --stats-one-line
+          rclone check "$OUT" "$REMOTE_NAME:$BUILD_PATH" \
+            --config "$CONFIG_FILE" --size-only --one-way --checkers 8
+          echo "build_path=$BUILD_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Publish latest-qualified pointer only after remote verification
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          BUILD_PATH: ${{ steps.upload.outputs.build_path }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/metroflow-canonical"
+          POINTER="$RUNNER_TEMP/LATEST_QUALIFIED.json"
+          python - "$OUT" "$BUILD_PATH" "$POINTER" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+          from datetime import datetime, timezone
+
+          out = pathlib.Path(sys.argv[1])
+          build_path = sys.argv[2]
+          pointer = pathlib.Path(sys.argv[3])
+          manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
+          manifest_sha = hashlib.sha256((out / 'manifest.json').read_bytes()).hexdigest()
+          qualified_sha = hashlib.sha256((out / 'QUALIFIED.json').read_bytes()).hexdigest()
+          payload = {
+              'schema': 'shanghai-metroflow-canonical-latest-v1',
+              'state': 'QUALIFIED',
+              'build_path': build_path,
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'github_sha': os.environ.get('GITHUB_SHA'),
+              'manifest_sha256': manifest_sha,
+              'qualification_sha256': qualified_sha,
+              'date_count': manifest['date_count'],
+              'source_rows': manifest['source_rows'],
+              'flow_totals': manifest['flow_totals'],
+              'source_zip_sha256': manifest['source']['zip_sha256'],
+              'published_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          pointer.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+          rclone copyto "$POINTER" "$REMOTE_NAME:$DRIVE_ROOT/LATEST_QUALIFIED.json" \
+            --config "$CONFIG_FILE" \
+            --retries 8 --low-level-retries 20 --drive-chunk-size 128M
+          rclone lsjson "$REMOTE_NAME:$DRIVE_ROOT/LATEST_QUALIFIED.json" --config "$CONFIG_FILE"
+
+      - name: Clean temporary storage configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

@@ -1,0 +1,215 @@
+name: OpenCity M02 Tempe Target Schema Census 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-target-schema-census-20260909.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  census-target-schemas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FULL_AUDIT_RUN_ID: '34252421694'
+    steps:
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download frozen full-archive audit artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: opencity-m02-tempe-full-archive-acquire-audit
+          path: audit_input
+          github-token: ${{ github.token }}
+          run-id: ${{ env.FULL_AUDIT_RUN_ID }}
+
+      - name: Install workbook runtime
+        run: python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+
+      - name: Download targeted unsupported cohorts and census workbook structures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p schema_census_output
+          python - <<'PY'
+          import concurrent.futures as cf
+          import csv,hashlib,json,re,time,urllib.request
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          import pandas as pd
+
+          AUDIT=Path('audit_input/full_archive_parser_audit.csv')
+          MANIFEST=Path('audit_input/source_acquisition_manifest.json')
+          OUT=Path('schema_census_output')
+          RAW=OUT/'raw'; RAW.mkdir(parents=True,exist_ok=True)
+          UA='OpenCity-Organizer-Reproducibility/2.0'
+
+          audit=list(csv.DictReader(AUDIT.open(encoding='utf-8-sig')))
+          manifest=json.loads(MANIFEST.read_text(encoding='utf-8'))
+          by_rel={r['relative_path']:r for r in manifest}
+
+          def rel_from_source(path):
+              parts=Path(path).parts
+              return '/'.join(parts[-2:])
+
+          def node_from_source(path):
+              folder=Path(path).parts[-2]
+              m=re.match(r'^([^_]+)_On_',folder,re.I)
+              return m.group(1).strip() if m else ''
+
+          def vol_year(path):
+              name=Path(path).name
+              m=re.search(r'(?i)Vol\s*[_-]?\s*(\d{2,4})',name)
+              if not m: return None
+              v=int(m.group(1)); return 2000+v if v<100 else v
+
+          targets=[]
+          for r in audit:
+              y=vol_year(r['source_file'])
+              node=node_from_source(r['source_file'])
+              status=r['status']
+              wanted=(status=='UNSUPPORTED_SCHEMA' and y==2018) or \
+                     (status=='UNSUPPORTED_SCHEMA' and y==2019) or \
+                     (status=='UNSUPPORTED_SCHEMA' and node=='128' and y in {2016,2017})
+              if not wanted: continue
+              rel=rel_from_source(r['source_file'])
+              src=by_rel.get(rel)
+              if not src: raise RuntimeError(f'missing acquisition manifest row for {rel}')
+              targets.append({**r,'year_token':y,'street_node':node,'relative_path':rel,'url':src['url'],'source_sha256':src['sha256'],'source_bytes':src['bytes']})
+
+          counts=Counter((t['year_token'],t['street_node']=='128') for t in targets)
+          assert sum(1 for t in targets if t['year_token']==2018)==81
+          assert sum(1 for t in targets if t['year_token']==2019)==17
+          assert sum(1 for t in targets if t['street_node']=='128' and t['year_token'] in {2016,2017})==6
+          assert len(targets)==104,len(targets)
+
+          def fetch(t):
+              dest=RAW/f"{len(list(RAW.glob('*'))):04d}_{Path(t['relative_path']).name}"
+              # Avoid the concurrent filename counter by hashing the relative path.
+              suffix=Path(t['relative_path']).suffix.lower()
+              dest=RAW/(hashlib.sha1(t['relative_path'].encode()).hexdigest()[:12]+suffix)
+              last=None
+              for attempt in range(5):
+                  try:
+                      req=urllib.request.Request(t['url'],headers={'User-Agent':UA})
+                      with urllib.request.urlopen(req,timeout=120) as resp: data=resp.read()
+                      sha=hashlib.sha256(data).hexdigest()
+                      if sha!=t['source_sha256']:
+                          raise RuntimeError(f"source bytes changed: expected {t['source_sha256']} got {sha}")
+                      dest.write_bytes(data)
+                      return t,dest
+                  except Exception as e:
+                      last=e; time.sleep(min(2**attempt,8))
+              raise RuntimeError(f"download failed {t['relative_path']}: {last}")
+
+          downloaded=[]
+          with cf.ThreadPoolExecutor(max_workers=8) as ex:
+              futs=[ex.submit(fetch,t) for t in targets]
+              for f in cf.as_completed(futs): downloaded.append(f.result())
+
+          keywords=['count date','count time','start date','traffic count summary','traffic count','morning','afternoon','direction','route','location','volume','time','date','northbound','southbound','eastbound','westbound','nb','sb','eb','wb']
+
+          def sval(v):
+              if v is None: return ''
+              try:
+                  if pd.isna(v): return ''
+              except Exception: pass
+              return re.sub(r'\s+',' ',str(v).strip())
+
+          def norm(v): return sval(v).lower().rstrip(':')
+
+          rows=[]; snapshots=[]
+          for t,path in sorted(downloaded,key=lambda x:x[0]['relative_path']):
+              try:
+                  xl=pd.ExcelFile(path,engine='calamine')
+                  sheet_meta=[]; workbook_tokens=[]
+                  for sheet_name in xl.sheet_names:
+                      df=pd.read_excel(path,sheet_name=sheet_name,header=None,engine='calamine')
+                      hits=[]
+                      limr=min(len(df),45); limc=min(len(df.columns),28)
+                      snap=[]
+                      for i in range(limr):
+                          vals=[sval(df.iat[i,j]) for j in range(limc)]
+                          nonempty=[(j,v) for j,v in enumerate(vals) if v]
+                          if nonempty:
+                              snap.append({'row':i,'cells':nonempty})
+                          for j,v in nonempty:
+                              n=norm(v)
+                              for k in keywords:
+                                  if k in n:
+                                      hits.append([k,i,j,v])
+                                      workbook_tokens.append(k)
+                      sheet_meta.append({'name':sheet_name,'rows':len(df),'cols':len(df.columns),'hits':hits[:120]})
+                      # Keep a compact representative snapshot, not entire workbook content.
+                      if len(snapshots)<30:
+                          snapshots.append({'relative_path':t['relative_path'],'year_token':t['year_token'],'street_node':t['street_node'],'sheet':sheet_name,'snapshot':snap[:35]})
+                  norm_names=[]
+                  for n in xl.sheet_names:
+                      u=n.strip().upper()
+                      norm_names.append('DIR' if u in {'NB','SB','EB','WB'} else re.sub(r'\d+','#',u))
+                  signature={
+                      'sheet_count':len(xl.sheet_names),
+                      'sheet_names':norm_names,
+                      'tokens':sorted(set(workbook_tokens)),
+                      'dims':[[m['rows'],m['cols']] for m in sheet_meta],
+                  }
+                  sig_text=json.dumps(signature,sort_keys=True,separators=(',',':'))
+                  sig=hashlib.sha256(sig_text.encode()).hexdigest()[:16]
+                  rows.append({
+                      'relative_path':t['relative_path'],'year_token':t['year_token'],'street_node':t['street_node'],
+                      'status':'INSPECTED','signature':sig,'sheet_count':len(xl.sheet_names),
+                      'sheet_names':'|'.join(xl.sheet_names),'tokens':'|'.join(sorted(set(workbook_tokens))),
+                      'dimensions':'|'.join(f"{m['rows']}x{m['cols']}" for m in sheet_meta),'error':'',
+                  })
+                  (OUT/f"detail_{hashlib.sha1(t['relative_path'].encode()).hexdigest()[:12]}.json").write_text(json.dumps({'target':t,'signature':signature,'sheets':sheet_meta},indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+              except Exception as e:
+                  rows.append({'relative_path':t['relative_path'],'year_token':t['year_token'],'street_node':t['street_node'],'status':'INSPECTION_ERROR','signature':'','sheet_count':'','sheet_names':'','tokens':'','dimensions':'','error':f'{type(e).__name__}: {e}'})
+
+          with (OUT/'target_schema_census.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+
+          cluster=defaultdict(list)
+          for r in rows:
+              cluster[(str(r['year_token']),r['signature'],r['sheet_names'],r['tokens'])].append(r)
+          cluster_rows=[]
+          for (year,sig,names,toks),members in sorted(cluster.items(),key=lambda kv:(kv[0][0],-len(kv[1]),kv[0][1])):
+              cluster_rows.append({'year_token':year,'signature':sig,'count':len(members),'sheet_names':names,'tokens':toks,'representative':members[0]['relative_path'],'street_nodes':'|'.join(m['street_node'] for m in members[:20])})
+          with (OUT/'target_schema_clusters.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(cluster_rows[0].keys())); w.writeheader(); w.writerows(cluster_rows)
+          (OUT/'representative_snapshots.json').write_text(json.dumps(snapshots,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          summary={
+              'target_files':len(targets),
+              'inspected':sum(r['status']=='INSPECTED' for r in rows),
+              'inspection_errors':sum(r['status']!='INSPECTED' for r in rows),
+              'cluster_count':len(cluster_rows),
+              'year_target_counts':dict(Counter(str(t['year_token']) for t in targets)),
+              'node128_targets':sum(t['street_node']=='128' for t in targets),
+              'source_byte_integrity':'every downloaded target required SHA-256 equality with frozen acquisition manifest',
+              'boundary':'schema census only; no parser rule added and no observation is scored'
+          }
+          (OUT/'target_schema_census_summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          print(json.dumps(summary,indent=2))
+          print('--- CLUSTERS ---')
+          for r in cluster_rows: print(json.dumps(r,ensure_ascii=False))
+          if summary['inspection_errors']:
+              raise SystemExit('targeted schema census has inspection errors')
+          PY
+
+      - name: Remove downloaded source bytes from artifact payload
+        run: rm -rf schema_census_output/raw
+
+      - name: Upload targeted schema census
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-target-schema-census
+          path: schema_census_output/
+          if-no-files-found: error
+          retention-days: 30

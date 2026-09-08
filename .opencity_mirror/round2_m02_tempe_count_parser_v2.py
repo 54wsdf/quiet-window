@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -82,6 +83,7 @@ def active_halfday_columns(df: pd.DataFrame, header_row: int) -> dict[int, str]:
     return selected
 
 
+# Replace only the one schema-selection hook used by parse_family_b.
 base.active_halfday_columns = active_halfday_columns
 
 

@@ -1,0 +1,249 @@
+name: OpenCity M02 Tempe Full Archive Acquire Audit 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-full-archive-acquire-audit-20260909.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  acquire-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DRIVE_PATH: ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data/M02_Tempe_Historical_Traffic_Counts_Archive_20260909
+      ENUMERATION_RUN_ID: '34252106158'
+      CANONICAL_V1_BLOB_SHA: 36d1dea2edaede04e2aaf255cd10fec9660a1acb
+      CANONICAL_V2_BLOB_SHA: b067215aa82126cc7d5636ed8de072f64ac3fb30
+
+    steps:
+      - name: Preflight canonical execution channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = '54wsdf/quiet-window'
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          case "$DRIVE_PATH" in
+            ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/*) ;;
+            *) echo "BLOCKED non-canonical Drive path: $DRIVE_PATH" >&2; exit 4 ;;
+          esac
+
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify parser mirrors are byte-locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser.py)" = "$CANONICAL_V1_BLOB_SHA"
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser_v2.py)" = "$CANONICAL_V2_BLOB_SHA"
+
+      - name: Download frozen archive enumeration artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: opencity-m02-tempe-archive-enumeration
+          path: enumeration_input
+          github-token: ${{ github.token }}
+          run-id: ${{ env.ENUMERATION_RUN_ID }}
+
+      - name: Validate frozen enumeration universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          root=Path('enumeration_input')
+          rows=json.loads((root/'tempe_archive_files.json').read_text(encoding='utf-8'))
+          summary=json.loads((root/'tempe_archive_summary.json').read_text(encoding='utf-8'))
+          assert len(rows)==1132,(len(rows),summary)
+          ext=Counter(r['extension'] for r in rows)
+          assert ext=={'.xls':696,'.xlsx':401,'.pdf':35},ext
+          assert summary['page_failures']==0,summary
+          urls=[r['url'] for r in rows]
+          rel=[r['relative_path'] for r in rows]
+          assert len(urls)==len(set(urls))==1132
+          assert len(rel)==len(set(rel))==1132
+          print(json.dumps({'files':len(rows),'extensions':dict(ext),'enumeration_run':34252106158},indent=2))
+          PY
+
+      - name: Download all frozen source objects with provenance hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tempe-full-archive/raw" acquisition_output
+          python - "$RUNNER_TEMP/tempe-full-archive/raw" <<'PY'
+          import concurrent.futures as cf
+          import hashlib,json,os,sys,time,urllib.request
+          from pathlib import Path, PurePosixPath
+
+          raw_root=Path(sys.argv[1])
+          rows=json.loads(Path('enumeration_input/tempe_archive_files.json').read_text(encoding='utf-8'))
+          UA='OpenCity-Organizer-Reproducibility/2.0'
+
+          def acquire(row):
+              rel=row['relative_path']
+              p=PurePosixPath(rel)
+              if p.is_absolute() or '..' in p.parts:
+                  return {**row,'status':'BLOCKED_UNSAFE_PATH','error':rel}
+              dest=raw_root.joinpath(*p.parts)
+              dest.parent.mkdir(parents=True,exist_ok=True)
+              last=None
+              for attempt in range(6):
+                  try:
+                      req=urllib.request.Request(row['url'],headers={'User-Agent':UA})
+                      with urllib.request.urlopen(req,timeout=120) as r:
+                          data=r.read(); status=getattr(r,'status',200); final_url=r.geturl()
+                      if status!=200: raise RuntimeError(f'HTTP {status}')
+                      if len(data)<50: raise RuntimeError(f'implausibly small source object: {len(data)} bytes')
+                      dest.write_bytes(data)
+                      return {**row,'status':'ACQUIRED','bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'final_url':final_url,'error':''}
+                  except Exception as e:
+                      last=e; time.sleep(min(1.5*(2**attempt),10))
+              return {**row,'status':'FAILED','bytes':0,'sha256':'','final_url':'','error':f'{type(last).__name__}: {last}'}
+
+          results=[]
+          with cf.ThreadPoolExecutor(max_workers=8) as ex:
+              futs=[ex.submit(acquire,r) for r in rows]
+              for i,f in enumerate(cf.as_completed(futs),1):
+                  results.append(f.result())
+                  if i%100==0: print(f'acquired attempts completed: {i}/{len(rows)}',flush=True)
+          results.sort(key=lambda r:r['url'])
+          failures=[r for r in results if r['status']!='ACQUIRED']
+          total_bytes=sum(int(r.get('bytes') or 0) for r in results)
+          summary={'enumerated_files':len(rows),'acquired_files':len(rows)-len(failures),'failures':len(failures),'total_bytes':total_bytes,'workers':8}
+          Path('acquisition_output/source_acquisition_manifest.json').write_text(json.dumps(results,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          Path('acquisition_output/source_acquisition_summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
+          Path('acquisition_output/source_acquisition_failures.json').write_text(json.dumps(failures,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          if failures:
+              print(json.dumps(failures[:20],indent=2,ensure_ascii=False))
+              raise SystemExit(f'archive acquisition incomplete: {len(failures)} failures')
+          PY
+
+      - name: Install parser and storage runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 2
+
+      - name: Run qualified v2 parser across complete acquired archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/tempe-full-archive/raw"
+          python .opencity_mirror/round2_m02_tempe_count_parser_v2.py \
+            --input-root "$RAW" \
+            --interval-output acquisition_output/full_archive_intervals.csv \
+            --am-output acquisition_output/full_archive_am.csv \
+            --audit-output acquisition_output/full_archive_parser_audit.csv \
+            --summary-output acquisition_output/full_archive_parser_summary.json
+          python - <<'PY'
+          import csv,json
+          from collections import Counter
+          from pathlib import Path
+          summary=json.loads(Path('acquisition_output/full_archive_parser_summary.json').read_text())
+          rows=list(csv.DictReader(Path('acquisition_output/full_archive_parser_audit.csv').open(encoding='utf-8-sig')))
+          status=Counter(r['status'] for r in rows)
+          family=Counter(r['schema_family'] for r in rows if r['schema_family'])
+          workbook_rows=[r for r in rows if r['extension'] in {'.xls','.xlsx'}]
+          workbook_status=Counter(r['status'] for r in workbook_rows)
+          report={
+              'source_objects':len(rows),
+              'workbook_candidates':len(workbook_rows),
+              'all_status_counts':dict(status),
+              'workbook_status_counts':dict(workbook_status),
+              'schema_family_counts':dict(family),
+              'interval_records':summary['interval_records'],
+              'am_direction_records':summary['am_direction_records'],
+              'complete_am_direction_records':summary['complete_am_direction_records'],
+              'boundary':'schema audit only; held-out vintage selection, map matching, GEH/NMAE, V and OpenScore remain downstream gates'
+          }
+          Path('acquisition_output/full_archive_qualification_summary.json').write_text(json.dumps(report,indent=2)+'\n')
+          print(json.dumps(report,indent=2))
+          assert len(rows)==1132, len(rows)
+          assert len(workbook_rows)==1097, len(workbook_rows)
+          PY
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse overwrite of an existing canonical archive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          EXISTING="$RUNNER_TEMP/existing.txt"
+          if rclone lsf "$REMOTE_NAME:$DRIVE_PATH" --config "$CONFIG_FILE" --max-depth 2 > "$EXISTING" 2>/dev/null; then
+            if [[ -s "$EXISTING" ]]; then
+              echo "BLOCKED_DUPLICATE: canonical archive path already contains objects: $DRIVE_PATH" >&2
+              head -n 30 "$EXISTING" >&2
+              exit 20
+            fi
+          fi
+
+      - name: Persist raw archive and qualification metadata to Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/tempe-full-archive/raw"
+          rclone copy "$RAW" "$REMOTE_NAME:$DRIVE_PATH/raw" --config "$CONFIG_FILE" --transfers 8 --checkers 16 --retries 8 --low-level-retries 20
+          rclone copy acquisition_output "$REMOTE_NAME:$DRIVE_PATH/metadata" --config "$CONFIG_FILE" --transfers 4 --checkers 8 --retries 8 --low-level-retries 20
+          rclone copy enumeration_input "$REMOTE_NAME:$DRIVE_PATH/enumeration" --config "$CONFIG_FILE" --transfers 4 --checkers 8 --retries 8 --low-level-retries 20
+
+      - name: Verify persistent raw archive by count and bytes
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/tempe-full-archive/raw"
+          LOCAL_JSON="$(rclone size "$RAW" --json)"
+          REMOTE_JSON="$(rclone size "$REMOTE_NAME:$DRIVE_PATH/raw" --config "$CONFIG_FILE" --json)"
+          python - "$LOCAL_JSON" "$REMOTE_JSON" <<'PY'
+          import json,sys
+          local=json.loads(sys.argv[1]); remote=json.loads(sys.argv[2])
+          print('local',local); print('remote',remote)
+          assert local['count']==1132,local
+          assert remote['count']==local['count'],(local,remote)
+          assert remote['bytes']==local['bytes'],(local,remote)
+          PY
+          rclone check "$RAW" "$REMOTE_NAME:$DRIVE_PATH/raw" --config "$CONFIG_FILE" --size-only --one-way --checkers 16
+          printf '%s\n' "$LOCAL_JSON" > acquisition_output/local_raw_rclone_size.json
+          printf '%s\n' "$REMOTE_JSON" > acquisition_output/remote_raw_rclone_size.json
+
+      - name: Upload compact acquisition and parser evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-full-archive-acquire-audit
+          path: acquisition_output/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,100 @@
+name: Shanghai Qualified OD Count Views 2026-09-08
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/shanghai-qualified-od-views-20260908.yml'
+      - 'scripts/processing/qualified_od_views.py'
+      - 'scripts/processing/test_qualified_od_views.py'
+permissions:
+  contents: read
+concurrency:
+  group: shanghai-qualified-od-views
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install data runtime
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=2,<3' 'pandas>=2.2,<3' 'pyarrow>=18,<24' 'scipy>=1.14,<2' 'pytest>=8,<10'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Test reader and count reductions before reading real data
+        run: |
+          set -euo pipefail
+          python -m pytest -q scripts/processing/test_qualified_od_views.py --junitxml="$RUNNER_TEMP/tests.xml" | tee "$RUNNER_TEMP/tests.log"
+          python -m compileall -q scripts/processing/qualified_od_views.py scripts/processing/test_qualified_od_views.py
+      - name: Restore qualified canonical input and build views
+        env:
+          STORAGE_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$STORAGE_B64"
+          printf '%s' "$STORAGE_B64" | base64 --decode > "$RUNNER_TEMP/od-rclone.conf"
+          CFG="$RUNNER_TEMP/od-rclone.conf"
+          REMOTE="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          test -n "$REMOTE"
+          BASE='transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675'
+          CANON="$BASE/canonical_od_date_v1"
+          mkdir -p "$RUNNER_TEMP/source"
+          rclone copyto "$REMOTE:$CANON/LATEST_QUALIFIED.json" "$RUNNER_TEMP/source-pointer.json" --config "$CFG" --retries 5
+          python - "$RUNNER_TEMP/source-pointer.json" <<'PY'
+          import json, sys
+          p = json.load(open(sys.argv[1]))
+          assert p['state'] == 'QUALIFIED'
+          assert p['github_run_id'] == '34210499950'
+          assert p['manifest_sha256'] == '49fc30196d29663d1022f99325893347159c60d40335cd3f2f926e39be39bba2'
+          assert p['date_count'] == 123 and p['source_rows'] == 267318222
+          PY
+          rclone copy "$REMOTE:$CANON/builds/34210499950" "$RUNNER_TEMP/source" --config "$CFG" --transfers 4 --checkers 8 --retries 5
+          python scripts/processing/qualified_od_views.py "$RUNNER_TEMP/source" "$RUNNER_TEMP/views" --manifest-sha256 49fc30196d29663d1022f99325893347159c60d40335cd3f2f926e39be39bba2 | tee "$RUNNER_TEMP/build.log"
+          mkdir -p "$RUNNER_TEMP/views/reproducibility"
+          cp scripts/processing/qualified_od_views.py scripts/processing/test_qualified_od_views.py "$RUNNER_TEMP/views/reproducibility/"
+          cp "$RUNNER_TEMP/tests.xml" "$RUNNER_TEMP/tests.log" "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/views/reproducibility/"
+          cp "$RUNNER_TEMP/source/manifest.json" "$RUNNER_TEMP/views/source_manifest.json"
+          cp "$RUNNER_TEMP/source/QUALIFIED.json" "$RUNNER_TEMP/views/source_QUALIFIED.json"
+          cp "$RUNNER_TEMP/source-pointer.json" "$RUNNER_TEMP/views/source_pointer.json"
+      - name: Upload and compare remote contents before publication
+        run: |
+          set -euo pipefail
+          CFG="$RUNNER_TEMP/od-rclone.conf"
+          REMOTE="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CFG")"
+          ROOT='transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675/canonical_q6_q10_v1'
+          BUILD="$ROOT/builds/${GITHUB_RUN_ID}"
+          rclone copy "$RUNNER_TEMP/views" "$REMOTE:$BUILD" --config "$CFG" --transfers 4 --checkers 8 --retries 5
+          rclone check "$RUNNER_TEMP/views" "$REMOTE:$BUILD" --config "$CFG" --download --one-way --checkers 4
+          python - "$RUNNER_TEMP/views" "$BUILD" "$RUNNER_TEMP/VIEW_LATEST.json" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          from datetime import datetime, timezone
+          root = pathlib.Path(sys.argv[1]); m = json.loads((root / 'manifest.json').read_text())
+          p = {'state': m['state'], 'build_path': sys.argv[2],
+               'github_run_id': os.environ['GITHUB_RUN_ID'], 'github_sha': os.environ['GITHUB_SHA'],
+               'manifest_sha256': hashlib.sha256((root / 'manifest.json').read_bytes()).hexdigest(),
+               'source_manifest_sha256': m['source_manifest_sha256'], 'source_rows': m['source_rows'],
+               'date_count': len(m['dates']), 'flow_totals': m['flow_totals'],
+               'remote_verification': 'ALL_FILES_DOWNLOAD_CONTENT_COMPARISON',
+               'published_at_utc': datetime.now(timezone.utc).isoformat()}
+          pathlib.Path(sys.argv[3]).write_text(json.dumps(p, indent=2))
+          print(json.dumps(p))
+          PY
+          rclone copyto "$RUNNER_TEMP/VIEW_LATEST.json" "$REMOTE:$ROOT/LATEST_QUALIFIED.json" --config "$CFG" --retries 5
+          rclone cat "$REMOTE:$ROOT/LATEST_QUALIFIED.json" --config "$CFG" > "$RUNNER_TEMP/VIEW_READBACK.json"
+          cmp "$RUNNER_TEMP/VIEW_LATEST.json" "$RUNNER_TEMP/VIEW_READBACK.json"
+          rclone lsjson "$REMOTE:$ROOT/LATEST_QUALIFIED.json" --config "$CFG"
+          rclone lsjson "$REMOTE:$BUILD/manifest.json" --config "$CFG"
+      - name: Remove temporary credentials
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/od-rclone.conf" ]; then
+            shred -u "$RUNNER_TEMP/od-rclone.conf"
+          fi

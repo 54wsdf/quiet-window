@@ -1,0 +1,111 @@
+name: OpenCity M02 Canonical Tempe Parser Smoke 20260908
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-canonical-tempe-parser-smoke-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-parser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact canonical knowledge-hub parser commit
+        uses: actions/checkout@v5
+        with:
+          repository: 54wsdf/knowledge-hub
+          ref: 818e7792e98761bc91629340ab5da48c25fc638a
+          path: knowledge-hub
+
+      - name: Install parser runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+
+      - name: Download four independent source workbooks and run canonical parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/tempe-parser-smoke"
+          RAW="$WORK/raw"
+          OUT="$WORK/out"
+          mkdir -p "$RAW" "$OUT"
+          python - "$RAW" <<'PY'
+          import sys,time,urllib.parse,urllib.request
+          from pathlib import Path
+          raw=Path(sys.argv[1])
+          base='https://gis.tempe.gov/traffic-counts/folders/0_On_Continental%20Dr_From_College_To_McAllister/'
+          files=[
+            'Vol08_0(ebwb).xls',
+            'Vol10_0_continental%20btwn%20college%20&%20mcallister(ebwb).xlsx',
+            'Vol16_0%20Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave%20(ebwb).xlsx',
+            'Vol19_00_Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave.xls',
+          ]
+          for encoded in files:
+              url=base+encoded
+              dest=raw/urllib.parse.unquote(encoded).replace('/','_')
+              last=None
+              for i in range(5):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'OpenCity-Organizer-Reproducibility/2.0'})
+                      with urllib.request.urlopen(req,timeout=90) as r: data=r.read()
+                      dest.write_bytes(data); break
+                  except Exception as e:
+                      last=e; time.sleep(min(2**i,8))
+              else: raise last
+              print(dest.name,len(dest.read_bytes()))
+          PY
+
+          PARSER="knowledge-hub/domains/academic-research/projects/open-city-traffic-challenge-rehearsal/code/round2_m02_tempe_count_parser.py"
+          python "$PARSER" \
+            --input-root "$RAW" \
+            --interval-output "$OUT/intervals.csv" \
+            --am-output "$OUT/am.csv" \
+            --audit-output "$OUT/audit.csv" \
+            --summary-output "$OUT/summary.json"
+
+          cat "$OUT/summary.json"
+          echo '--- AUDIT ---'
+          cat "$OUT/audit.csv"
+          echo '--- AM ---'
+          cat "$OUT/am.csv"
+
+          python - "$OUT" <<'PY'
+          import csv,json,math,sys
+          from pathlib import Path
+          out=Path(sys.argv[1])
+          summary=json.loads((out/'summary.json').read_text(encoding='utf-8'))
+          assert summary['source_files_seen']==4, summary
+          assert summary['audit_status_counts'].get('PARSED')==4, summary
+          assert summary['schema_family_counts']=={
+              'A_LEGACY_HOURLY_SUMMARY':1,
+              'B_DIRECTION_SHEET_15MIN_AMPM':2,
+              'C_COMBINED_15MIN_MORNING_AFTERNOON':1,
+          }, summary
+          assert summary['complete_am_direction_records']==8, summary
+          rows=list(csv.DictReader((out/'am.csv').open(encoding='utf-8-sig')))
+          assert len(rows)==8
+          assert all(r['complete_am']=='True' for r in rows)
+          # Evidence values from the source workbooks; these catch half-day/time-window mistakes.
+          expected={
+              ('2008-04-01','EB'):44.333333,
+              ('2008-04-01','WB'):59.333333,
+              ('2010-01-28','EB'):60.666667,
+              ('2010-01-28','WB'):45.333333,
+              ('2016-03-29','EB'):50.333333,
+              ('2016-03-29','WB'):64.333333,
+              ('2019-09-25','EB'):71.333333,
+              ('2019-09-25','WB'):74.666667,
+          }
+          got={(r['observation_date'],r['direction']):float(r['am_average_vph']) for r in rows}
+          assert got.keys()==expected.keys(), (got,expected)
+          for k,v in expected.items():
+              assert math.isclose(got[k],v,abs_tol=1e-5), (k,got[k],v)
+          print('CANONICAL_PARSER_SMOKE_PASS')
+          PY

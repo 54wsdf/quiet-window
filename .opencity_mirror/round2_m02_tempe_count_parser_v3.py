@@ -111,6 +111,7 @@ def parse_family_d(path: Path, sheets: dict[str, pd.DataFrame]) -> list[Any]:
     records = []
     parsed_daily_sheets = 0
     for sheet_name, df in sheets.items():
+        # Averages are derived products, not independent observation dates.
         if "average" in sheet_name.lower():
             continue
         date_row = _exact_label_row(df, "Volumes for")
@@ -133,6 +134,7 @@ def parse_family_d(path: Path, sheets: dict[str, pd.DataFrame]) -> list[Any]:
             minute = base.parse_clock_minutes(row[0] if row else None)
             if minute is None:
                 continue
+            # Left block represents 00:00-11:45 in 15-minute increments.
             if minute >= 12 * 60:
                 continue
             for col, direction in active.items():
@@ -183,6 +185,8 @@ def parse_family_e(path: Path, sheets: dict[str, pd.DataFrame]) -> list[Any]:
     sub = [base.norm(v) for v in df.iloc[header_row + 1].tolist()]
     morning_cols = [i for i, v in enumerate(sub) if v == "morning"]
     afternoon_cols = [i for i, v in enumerate(sub) if v == "afternoon"]
+    # The first Morning/Afternoon pair contains 15-minute observations; later
+    # same-named columns contain hourly totals and must not be double counted.
     if not morning_cols or not afternoon_cols:
         raise ValueError("single-direction report missing Morning/Afternoon columns")
     mcol, pcol = morning_cols[0], afternoon_cols[0]
@@ -255,6 +259,8 @@ def _detect_family_f(sheets: dict[str, pd.DataFrame]) -> bool:
     if found is None:
         return False
     header_row, _ = found
+    # Require an explicit AM/PM anchor in the following rows so ordinary 15-min
+    # reports cannot be mistaken for this hourly family.
     for i in range(header_row + 1, min(len(df), header_row + 30)):
         s = base.txt(df.iloc[i, 0] if len(df.columns) else None).upper()
         if s in {"12:00 AM", "12:00 PM"}:
@@ -343,6 +349,8 @@ def parse_file(path: Path):
         return [], base.FileAudit(str(path), path.suffix.lower(), "ERROR", "", 0, "", "", "", f"{type(e).__name__}: {e}")
 
 
+# Patch only the file-dispatch boundary; all v1/v2 record structures, AM
+# derivation, CSV writers, summaries, and v2 duplicate-column rules stay intact.
 base.parse_file = parse_file
 
 

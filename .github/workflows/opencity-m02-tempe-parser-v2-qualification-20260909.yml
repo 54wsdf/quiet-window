@@ -1,0 +1,162 @@
+name: OpenCity M02 Tempe Parser V2 Qualification 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-parser-v2-qualification-20260909.yml'
+      - '.opencity_mirror/round2_m02_tempe_count_parser.py'
+      - '.opencity_mirror/round2_m02_tempe_count_parser_v2.py'
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-parser-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CANONICAL_V1_BLOB_SHA: 36d1dea2edaede04e2aaf255cd10fec9660a1acb
+      CANONICAL_V2_BLOB_SHA: b067215aa82126cc7d5636ed8de072f64ac3fb30
+    steps:
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify mirrors are byte-locked to canonical knowledge-hub blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          V1='.opencity_mirror/round2_m02_tempe_count_parser.py'
+          V2='.opencity_mirror/round2_m02_tempe_count_parser_v2.py'
+          test "$(git hash-object "$V1")" = "$CANONICAL_V1_BLOB_SHA"
+          test "$(git hash-object "$V2")" = "$CANONICAL_V2_BLOB_SHA"
+          echo "V1=$CANONICAL_V1_BLOB_SHA"
+          echo "V2=$CANONICAL_V2_BLOB_SHA"
+
+      - name: Install parser runtime
+        run: python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+
+      - name: Prove exact-duplicate collapse and conflicting-duplicate rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util,sys
+          from pathlib import Path
+          import pandas as pd
+          p=Path('.opencity_mirror/round2_m02_tempe_count_parser_v2.py')
+          spec=importlib.util.spec_from_file_location('tempe_v2_test',p)
+          m=importlib.util.module_from_spec(spec); sys.modules[spec.name]=m; spec.loader.exec_module(m)
+          rows=[
+              ['Count Time','AM','PM',None,'AM','PM'],
+              ['06:00:00',1,4,None,1,4],
+              ['06:15:00',2,5,None,2,5],
+              ['06:30:00',3,6,None,3,6],
+          ]
+          df=pd.DataFrame(rows)
+          got=m.active_halfday_columns(df,0)
+          assert got=={1:'AM',2:'PM'}, got
+          bad=df.copy(); bad.iloc[2,4]=99
+          try:
+              m.active_halfday_columns(bad,0)
+          except ValueError as e:
+              assert 'conflicting active AM columns' in str(e), e
+          else:
+              raise AssertionError('conflicting duplicate AM column was not rejected')
+          print('DUPLICATE_COLUMN_RULE_PASS')
+          PY
+
+      - name: Download four public Tempe workbooks and run v2 parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/tempe-parser-v2"
+          RAW="$WORK/raw"
+          OUT="$WORK/out"
+          mkdir -p "$RAW" "$OUT"
+          python - "$RAW" <<'PY'
+          import hashlib,json,sys,time,urllib.parse,urllib.request
+          from pathlib import Path
+          raw=Path(sys.argv[1])
+          base='https://gis.tempe.gov/traffic-counts/folders/0_On_Continental%20Dr_From_College_To_McAllister/'
+          files=[
+            'Vol08_0(ebwb).xls',
+            'Vol10_0_continental%20btwn%20college%20&%20mcallister(ebwb).xlsx',
+            'Vol16_0%20Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave%20(ebwb).xlsx',
+            'Vol19_00_Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave.xls',
+          ]
+          manifest=[]
+          for encoded in files:
+              url=base+encoded
+              dest=raw/urllib.parse.unquote(encoded).replace('/','_')
+              last=None
+              for i in range(5):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'OpenCity-Organizer-Reproducibility/2.0'})
+                      with urllib.request.urlopen(req,timeout=90) as r: data=r.read()
+                      if len(data)<100: raise RuntimeError(f'implausibly small payload {len(data)}')
+                      dest.write_bytes(data); break
+                  except Exception as e:
+                      last=e; time.sleep(min(2**i,8))
+              else: raise last
+              manifest.append({'file':dest.name,'url':url,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+          (raw/'SOURCE_MANIFEST.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          print(json.dumps(manifest,indent=2))
+          PY
+
+          python .opencity_mirror/round2_m02_tempe_count_parser_v2.py \
+            --input-root "$RAW" \
+            --interval-output "$OUT/intervals.csv" \
+            --am-output "$OUT/am.csv" \
+            --audit-output "$OUT/audit.csv" \
+            --summary-output "$OUT/summary.json"
+
+          cp "$RAW/SOURCE_MANIFEST.json" "$OUT/source_manifest.json"
+          cat "$OUT/summary.json"
+          cat "$OUT/audit.csv"
+          cat "$OUT/am.csv"
+
+          python - "$OUT" <<'PY'
+          import csv,json,math,sys
+          from pathlib import Path
+          out=Path(sys.argv[1])
+          summary=json.loads((out/'summary.json').read_text())
+          assert summary['source_files_seen']==4, summary
+          assert summary['audit_status_counts']=={'PARSED':4}, summary
+          assert summary['schema_family_counts']=={
+              'A_LEGACY_HOURLY_SUMMARY':1,
+              'B_DIRECTION_SHEET_15MIN_AMPM':2,
+              'C_COMBINED_15MIN_MORNING_AFTERNOON':1,
+          }, summary
+          assert summary['complete_am_direction_records']==8, summary
+          rows=list(csv.DictReader((out/'am.csv').open(encoding='utf-8-sig')))
+          assert len(rows)==8 and all(r['complete_am']=='True' for r in rows), rows
+          expected={
+              ('2008-04-01','EB'):44.333333,
+              ('2008-04-01','WB'):59.333333,
+              ('2010-01-28','EB'):60.666667,
+              ('2010-01-28','WB'):45.333333,
+              ('2016-03-29','EB'):50.333333,
+              ('2016-03-29','WB'):64.333333,
+              ('2019-09-25','EB'):71.333333,
+              ('2019-09-25','WB'):74.666667,
+          }
+          got={(r['observation_date'],r['direction']):float(r['am_average_vph']) for r in rows}
+          assert got.keys()==expected.keys(), (got,expected)
+          for k,v in expected.items(): assert math.isclose(got[k],v,abs_tol=1e-5),(k,got[k],v)
+          print('TEMPE_PARSER_V2_REAL_WORKBOOK_PASS')
+          PY
+
+          mkdir -p qualification_output
+          cp "$OUT"/* qualification_output/
+
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-parser-v2-qualification
+          path: qualification_output/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,221 @@
+name: OpenCity M02 Tempe Parser V3 Qualification 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-parser-v3-qualification-20260909.yml'
+      - '.opencity_mirror/round2_m02_tempe_count_parser.py'
+      - '.opencity_mirror/round2_m02_tempe_count_parser_v2.py'
+      - '.opencity_mirror/round2_m02_tempe_count_parser_v3.py'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  qualify-parser-v3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FULL_AUDIT_RUN_ID: '34252421694'
+      CANONICAL_V1_BLOB_SHA: 36d1dea2edaede04e2aaf255cd10fec9660a1acb
+      CANONICAL_V2_BLOB_SHA: b067215aa82126cc7d5636ed8de072f64ac3fb30
+      CANONICAL_V3_BLOB_SHA: 9f1275ff01f2080442049a1839bf7a3deb49c627
+
+    steps:
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify all parser mirrors are byte-locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser.py)" = "$CANONICAL_V1_BLOB_SHA"
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser_v2.py)" = "$CANONICAL_V2_BLOB_SHA"
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser_v3.py)" = "$CANONICAL_V3_BLOB_SHA"
+          printf 'v1=%s\nv2=%s\nv3=%s\n' "$CANONICAL_V1_BLOB_SHA" "$CANONICAL_V2_BLOB_SHA" "$CANONICAL_V3_BLOB_SHA"
+
+      - name: Download frozen full-archive audit artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: opencity-m02-tempe-full-archive-acquire-audit
+          path: audit_input
+          github-token: ${{ github.token }}
+          run-id: ${{ env.FULL_AUDIT_RUN_ID }}
+
+      - name: Install parser runtime
+        run: python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+
+      - name: Re-acquire exact 104 target workbooks from frozen manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v3-targets" qualification_output
+          python - "$RUNNER_TEMP/v3-targets" <<'PY'
+          import concurrent.futures as cf
+          import csv,hashlib,json,re,time,urllib.request
+          from pathlib import Path, PurePosixPath
+
+          root=Path(__import__('sys').argv[1])
+          audit=list(csv.DictReader(open('audit_input/full_archive_parser_audit.csv',encoding='utf-8-sig')))
+          manifest=json.load(open('audit_input/source_acquisition_manifest.json',encoding='utf-8'))
+          by_rel={r['relative_path']:r for r in manifest}
+
+          def rel_from_source(path):
+              parts=Path(path).parts
+              return '/'.join(parts[-2:])
+          def node(path):
+              folder=Path(path).parts[-2]
+              m=re.match(r'^([^_]+)_On_',folder,re.I)
+              return m.group(1).strip() if m else ''
+          def vol_year(path):
+              m=re.search(r'(?i)Vol\s*[_-]?\s*(\d{2,4})',Path(path).name)
+              if not m:return None
+              v=int(m.group(1)); return 2000+v if v<100 else v
+
+          targets=[]
+          for r in audit:
+              if r['status']!='UNSUPPORTED_SCHEMA': continue
+              y=vol_year(r['source_file']); n=node(r['source_file'])
+              if not (y==2018 or y==2019 or (n=='128' and y in {2016,2017})):
+                  continue
+              rel=rel_from_source(r['source_file'])
+              src=by_rel[rel]
+              targets.append({'relative_path':rel,'url':src['url'],'sha256':src['sha256'],'bytes':src['bytes'],'year_token':y,'street_node':n})
+          assert len(targets)==104,len(targets)
+          assert sum(t['year_token']==2018 for t in targets)==81
+          assert sum(t['year_token']==2019 for t in targets)==17
+          assert sum(t['street_node']=='128' and t['year_token'] in {2016,2017} for t in targets)==6
+
+          def fetch(t):
+              p=PurePosixPath(t['relative_path'])
+              dest=root.joinpath(*p.parts); dest.parent.mkdir(parents=True,exist_ok=True)
+              last=None
+              for attempt in range(5):
+                  try:
+                      req=urllib.request.Request(t['url'],headers={'User-Agent':'OpenCity-Organizer-Reproducibility/3.0'})
+                      with urllib.request.urlopen(req,timeout=120) as r:data=r.read()
+                      got=hashlib.sha256(data).hexdigest()
+                      if got!=t['sha256']:raise RuntimeError(f"SHA drift {got} != {t['sha256']}")
+                      dest.write_bytes(data); return {**t,'status':'ACQUIRED'}
+                  except Exception as e:
+                      last=e; time.sleep(min(2**attempt,8))
+              raise RuntimeError(f"download failed {t['relative_path']}: {last}")
+
+          with cf.ThreadPoolExecutor(max_workers=8) as ex:
+              results=list(ex.map(fetch,targets))
+          json.dump(results,open('qualification_output/target_source_manifest.json','w'),indent=2)
+          print(json.dumps({'targets':len(results),'bytes':sum(int(r['bytes']) for r in results)},indent=2))
+          PY
+
+      - name: Run v3 over the 104 target workbooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/v3-targets"
+          python .opencity_mirror/round2_m02_tempe_count_parser_v3.py \
+            --input-root "$ROOT" \
+            --interval-output qualification_output/target_intervals.csv \
+            --am-output qualification_output/target_am.csv \
+            --audit-output qualification_output/target_audit.csv \
+            --summary-output qualification_output/target_summary.json
+
+          python - <<'PY'
+          import csv,json,math
+          from collections import Counter
+          from pathlib import Path
+          audits=list(csv.DictReader(open('qualification_output/target_audit.csv',encoding='utf-8-sig')))
+          intervals=list(csv.DictReader(open('qualification_output/target_intervals.csv',encoding='utf-8-sig')))
+          am=list(csv.DictReader(open('qualification_output/target_am.csv',encoding='utf-8-sig')))
+          summary=json.load(open('qualification_output/target_summary.json'))
+          assert len(audits)==104,len(audits)
+          status=Counter(r['status'] for r in audits)
+          family=Counter(r['schema_family'] for r in audits)
+          assert status=={'PARSED':104},status
+          assert family=={
+              'D_DAY_VOLUME_15MIN':87,
+              'E_SINGLE_DIRECTION_15MIN':13,
+              'F_SINGLE_DIRECTION_HOURLY_24H':4,
+          },family
+          # No derived average sheet is allowed to become an independent record.
+          assert not any('average' in r['source_sheet'].lower() for r in intervals), 'derived average sheet leaked into observations'
+          # Prove content-date semantics: Vol18_100 is actually dated 2017-01-10.
+          v100=[r for r in audits if 'Vol18_100 Baseline Rd Btwn Mill Ave and Rural Rd.xlsx' in r['source_file']]
+          assert len(v100)==1,v100
+          assert v100[0]['observation_dates']=='2017-01-10',v100[0]
+          # Prove special hourly Price report semantics for node 119.
+          a119=[r for r in am if 'Vol19_119_SB Price Rd btwn Baseline Rd and Guadalupe Rd.xls' in r['source_file'] and r['direction']=='SB']
+          assert len(a119)==1,a119
+          assert a119[0]['complete_am']=='True',a119[0]
+          assert math.isclose(float(a119[0]['am_average_vph']),319.0,abs_tol=1e-9),a119[0]
+          # All newly emitted AM rows must have supported 15- or 60-minute resolution.
+          assert all(r['resolution_minutes'] in {'15','60'} for r in am), Counter(r['resolution_minutes'] for r in am)
+          report={
+              'target_files':len(audits),
+              'status_counts':dict(status),
+              'family_file_counts':dict(family),
+              'interval_records':len(intervals),
+              'am_direction_records':len(am),
+              'complete_am_direction_records':sum(r['complete_am']=='True' for r in am),
+              'content_date_sentinel':'Vol18_100 -> 2017-01-10',
+              'hourly_sentinel':'Vol19_119 SB -> 319.0 AM average vph',
+              'average_sheet_policy':'2-Day Average excluded from primary observations'
+          }
+          Path('qualification_output/v3_target_qualification.json').write_text(json.dumps(report,indent=2)+'\n')
+          print(json.dumps(report,indent=2))
+          print('TEMPE_PARSER_V3_TARGET_104_PASS')
+          PY
+
+      - name: Regress the four v2 qualification workbooks through v3
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/v3-regression"
+          mkdir -p "$RAW"
+          python - "$RAW" <<'PY'
+          import sys,time,urllib.parse,urllib.request
+          from pathlib import Path
+          raw=Path(sys.argv[1])
+          base='https://gis.tempe.gov/traffic-counts/folders/0_On_Continental%20Dr_From_College_To_McAllister/'
+          files=['Vol08_0(ebwb).xls','Vol10_0_continental%20btwn%20college%20&%20mcallister(ebwb).xlsx','Vol16_0%20Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave%20(ebwb).xlsx','Vol19_00_Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave.xls']
+          for enc in files:
+              url=base+enc; dest=raw/urllib.parse.unquote(enc).replace('/','_'); last=None
+              for i in range(5):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'OpenCity-Organizer-Reproducibility/3.0'})
+                      with urllib.request.urlopen(req,timeout=90) as r:data=r.read()
+                      dest.write_bytes(data); break
+                  except Exception as e:last=e;time.sleep(min(2**i,8))
+              else:raise last
+          PY
+          python .opencity_mirror/round2_m02_tempe_count_parser_v3.py \
+            --input-root "$RAW" \
+            --interval-output qualification_output/regression_intervals.csv \
+            --am-output qualification_output/regression_am.csv \
+            --audit-output qualification_output/regression_audit.csv \
+            --summary-output qualification_output/regression_summary.json
+          python - <<'PY'
+          import csv,json,math
+          s=json.load(open('qualification_output/regression_summary.json'))
+          assert s['source_files_seen']==4,s
+          assert s['audit_status_counts']=={'PARSED':4},s
+          assert s['complete_am_direction_records']==8,s
+          rows=list(csv.DictReader(open('qualification_output/regression_am.csv',encoding='utf-8-sig')))
+          expected={('2008-04-01','EB'):44.333333,('2008-04-01','WB'):59.333333,('2010-01-28','EB'):60.666667,('2010-01-28','WB'):45.333333,('2016-03-29','EB'):50.333333,('2016-03-29','WB'):64.333333,('2019-09-25','EB'):71.333333,('2019-09-25','WB'):74.666667}
+          got={(r['observation_date'],r['direction']):float(r['am_average_vph']) for r in rows}
+          assert got.keys()==expected.keys(),(got,expected)
+          for k,v in expected.items():assert math.isclose(got[k],v,abs_tol=1e-5),(k,got[k],v)
+          print('TEMPE_PARSER_V3_V2_REGRESSION_PASS')
+          PY
+
+      - name: Upload v3 qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-parser-v3-qualification
+          path: qualification_output/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,213 @@
+name: OpenCity M02 Tempe Traffic Counts 20260908
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-traffic-counts-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  acquire-tempe-counts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_PAGE: https://www.tempe.gov/government/transportation-and-sustainability/transportation/streets-signals-traffic/traffic-counts
+      SOURCE_LAYER: https://gis.tempe.gov/arcgis/rest/services/Open_Data/TrafficCountSegment/FeatureServer/0
+      SOURCE_URL: "https://gis.tempe.gov/arcgis/rest/services/Open_Data/TrafficCountSegment/FeatureServer/0/query?where=1%3D1&outFields=*&returnGeometry=true&outSR=4326&f=geojson"
+      TERMS_URL: https://gis.tempe.gov/ordinances/open-data-terms-of-use.pdf
+      DRIVE_PATH: ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data/M02_Tempe_City_Traffic_Counts_20260908
+      FILENAME: tempe_traffic_count_segments_20260908.geojson
+
+    steps:
+      - name: Preflight execution repository and Drive credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "54wsdf/quiet-window"
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo 'BLOCKED: GDRIVE_RCLONE_CONFIG_B64 is missing; no source request will be made.' >&2
+            exit 3
+          fi
+          case "$DRIVE_PATH" in
+            ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/*) ;;
+            *) echo "BLOCKED: non-canonical Drive path: $DRIVE_PATH" >&2; exit 4 ;;
+          esac
+
+      - name: Checkout execution utilities
+        uses: actions/checkout@v5
+
+      - name: Install rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 2
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing canonical snapshot
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          if rclone lsf "$REMOTE_NAME:$DRIVE_PATH" --config "$CONFIG_FILE" --max-depth 1 > "$RUNNER_TEMP/existing.txt" 2>/dev/null; then
+            if grep -Fxq "$FILENAME" "$RUNNER_TEMP/existing.txt" || grep -Fxq "$FILENAME.manifest.json" "$RUNNER_TEMP/existing.txt"; then
+              echo "BLOCKED_DUPLICATE: canonical snapshot already exists at $DRIVE_PATH" >&2
+              cat "$RUNNER_TEMP/existing.txt"
+              exit 20
+            fi
+          fi
+
+      - name: Fetch and validate City of Tempe traffic-count snapshot
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKDIR="$RUNNER_TEMP/tempe-counts"
+          mkdir -p "$WORKDIR"
+          PAYLOAD="$WORKDIR/$FILENAME"
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 300 \
+            -H 'User-Agent: OpenCity-Organizer-Reproducibility/2.0' \
+            "$SOURCE_URL" -o "$PAYLOAD"
+
+          python - "$PAYLOAD" "$WORKDIR/$FILENAME.manifest.json" <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = Path(sys.argv[1])
+          manifest_path = Path(sys.argv[2])
+          obj = json.loads(payload.read_text(encoding='utf-8'))
+          if obj.get('type') != 'FeatureCollection':
+              raise SystemExit('Expected GeoJSON FeatureCollection')
+          features = obj.get('features') or []
+          if len(features) < 100:
+              raise SystemExit(f'Expected >=100 traffic-count segments, got {len(features)}')
+          required = {
+              'CaptureDate','StreetOn','StreetFrom','StreetTo','CountFirst','CountSecond',
+              'TotalVolume','DirectionFirst','DirectionSecond'
+          }
+          prop_keys = set()
+          for feat in features:
+              prop_keys.update((feat.get('properties') or {}).keys())
+          missing = sorted(required - prop_keys)
+          if missing:
+              raise SystemExit(f'Missing required fields: {missing}')
+          if not all((feat.get('geometry') or {}).get('type') in {'LineString','MultiLineString'} for feat in features):
+              raise SystemExit('Unexpected non-line geometry in traffic-count segment layer')
+
+          raw = payload.read_bytes()
+          sha = hashlib.sha256(raw).hexdigest()
+          dates = [(f.get('properties') or {}).get('CaptureDate') for f in features]
+          dates = [d for d in dates if d not in (None, '')]
+          manifest = {
+              'dataset_id': 'opencity_m02_tempe_city_traffic_counts_20260908',
+              'state': 'FETCHED_VALIDATED_PENDING_DRIVE',
+              'publisher': 'City of Tempe Department of Transportation',
+              'source_page': '${{ env.SOURCE_PAGE }}',
+              'source_layer': '${{ env.SOURCE_LAYER }}',
+              'source_query': '${{ env.SOURCE_URL }}',
+              'terms_url': '${{ env.TERMS_URL }}',
+              'round2_source_family': 'traffic_count',
+              'feature_count': len(features),
+              'capture_date_raw_min': min(map(str, dates)) if dates else None,
+              'capture_date_raw_max': max(map(str, dates)) if dates else None,
+              'required_fields_verified': sorted(required),
+              'geometry': 'line segments, outSR=EPSG:4326',
+              'bytes': len(raw),
+              'sha256': sha,
+              'acquired_at_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'git_repository': '${{ github.repository }}',
+              'git_sha': '${{ github.sha }}',
+              'workflow_run_id': '${{ github.run_id }}',
+              'notes': 'Phase-A snapshot of the public segment layer. City source page separately advertises historical directional 15-minute counts and peak-hour volumes; those historical records are a follow-on acquisition, not silently inferred from this latest-count layer.'
+          }
+          manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+          print(json.dumps({'feature_count': len(features), 'bytes': len(raw), 'sha256': sha}, indent=2))
+          PY
+
+          SIZE="$(stat -c '%s' "$PAYLOAD")"
+          SHA="$(sha256sum "$PAYLOAD" | awk '{print $1}')"
+          echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+          echo "payload=$PAYLOAD" >> "$GITHUB_OUTPUT"
+          echo "manifest=$WORKDIR/$FILENAME.manifest.json" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Copy validated snapshot and manifest directly to Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          PAYLOAD: ${{ steps.fetch.outputs.payload }}
+          MANIFEST: ${{ steps.fetch.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          rclone copyto "$PAYLOAD" "$REMOTE_NAME:$DRIVE_PATH/$FILENAME" \
+            --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1 --checkers 4
+          rclone copyto "$MANIFEST" "$REMOTE_NAME:$DRIVE_PATH/$FILENAME.manifest.json" \
+            --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 1 --checkers 4
+
+      - name: Verify remote bytes and close manifest
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          LOCAL_SIZE: ${{ steps.fetch.outputs.size }}
+          MANIFEST: ${{ steps.fetch.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          REMOTE_JSON="$(rclone lsjson "$REMOTE_NAME:$DRIVE_PATH/$FILENAME" --config "$CONFIG_FILE" --files-only)"
+          REMOTE_SIZE="$(printf '%s' "$REMOTE_JSON" | jq -r '.[0].Size // empty')"
+          if [[ -z "$REMOTE_SIZE" || "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
+            echo "REMOTE_SIZE_MISMATCH local=$LOCAL_SIZE remote=${REMOTE_SIZE:-missing}" >&2
+            exit 21
+          fi
+          python - "$MANIFEST" <<'PY'
+          import json, sys
+          from pathlib import Path
+          p=Path(sys.argv[1]); d=json.loads(p.read_text(encoding='utf-8'))
+          d['state']='ACQUIRED'
+          d['durable_storage']={
+              'backend':'Google Drive via rclone',
+              'path':'${{ env.DRIVE_PATH }}/${{ env.FILENAME }}',
+              'verified_by':'remote_size'
+          }
+          p.write_text(json.dumps(d,indent=2,ensure_ascii=False),encoding='utf-8')
+          PY
+          rclone copyto "$MANIFEST" "$REMOTE_NAME:$DRIVE_PATH/$FILENAME.manifest.json" \
+            --config "$CONFIG_FILE" --retries 5 --low-level-retries 10 --transfers 1 --checkers 2
+          echo "ACQUIRED feature snapshot: $DRIVE_PATH/$FILENAME"
+          echo "SHA256=${{ steps.fetch.outputs.sha256 }}"
+          echo "SIZE=${{ steps.fetch.outputs.size }}"
+
+      - name: Cleanup temporary rclone configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

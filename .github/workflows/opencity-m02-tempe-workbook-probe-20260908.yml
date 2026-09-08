@@ -1,0 +1,110 @@
+name: OpenCity M02 Tempe Historical Workbook Probe 20260908
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-workbook-probe-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe-workbooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install workbook readers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+          python - <<'PY'
+          import pandas as pd
+          import python_calamine
+          print('pandas',pd.__version__)
+          print('python_calamine',getattr(python_calamine,'__version__','unknown'))
+          PY
+
+      - name: Download and inspect representative Tempe historical count workbooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import re
+          import tempfile
+          import time
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          import pandas as pd
+
+          BASE='https://gis.tempe.gov/traffic-counts/folders/0_On_Continental%20Dr_From_College_To_McAllister/'
+          FILES=[
+              'Vol08_0(ebwb).xls',
+              'Vol10_0_continental%20btwn%20college%20&%20mcallister(ebwb).xlsx',
+              'Vol16_0%20Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave%20(ebwb).xlsx',
+              'Vol19_00_Continental%20Dr%20btwn%20College%20Ave%20and%20McAllister%20Ave.xls',
+          ]
+          UA='OpenCity-Organizer-Reproducibility/2.0'
+          tmp=Path(tempfile.mkdtemp(prefix='tempe-workbook-probe-'))
+
+          def fetch(url, dest):
+              last=None
+              for i in range(5):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':UA})
+                      with urllib.request.urlopen(req,timeout=90) as r:
+                          data=r.read()
+                      dest.write_bytes(data)
+                      return len(data)
+                  except Exception as e:
+                      last=e; time.sleep(min(2**i,8))
+              raise last
+
+          def clean_value(v):
+              if pd.isna(v): return None
+              if hasattr(v,'isoformat'):
+                  try: return v.isoformat()
+                  except Exception: pass
+              return str(v)
+
+          def nonempty_matrix(df, max_rows=80, max_cols=18):
+              arr=[]
+              for _, row in df.iloc[:max_rows,:max_cols].iterrows():
+                  vals=[clean_value(v) for v in row.tolist()]
+                  if any(v not in (None,'') for v in vals): arr.append(vals)
+              return arr
+
+          summary=[]
+          for encoded in FILES:
+              url=BASE+encoded
+              local=tmp/urllib.parse.unquote(encoded).replace('/','_')
+              size=fetch(url,local)
+              print('\n'+'='*100)
+              print('FILE_URL',url)
+              print('LOCAL',local.name,'BYTES',size)
+              xl=pd.ExcelFile(local,engine='calamine')
+              print('SHEETS',json.dumps(xl.sheet_names,ensure_ascii=False))
+              file_info={'url':url,'bytes':size,'sheets':[]}
+              for sheet in xl.sheet_names:
+                  df=pd.read_excel(local,sheet_name=sheet,header=None,engine='calamine')
+                  matrix=nonempty_matrix(df)
+                  print('\nSHEET',sheet,'SHAPE',df.shape,'NONEMPTY_PREVIEW_ROWS',len(matrix))
+                  for ri,row in enumerate(matrix[:60]):
+                      print(f'ROW{ri:03d}',json.dumps(row,ensure_ascii=False))
+                  text='\n'.join('\t'.join('' if v is None else v for v in row) for row in matrix)
+                  signals={
+                      'quarter_hour_tokens':sorted(set(re.findall(r'\b(?:[01]?\d|2[0-3]):(?:00|15|30|45)\b',text)))[:30],
+                      'direction_tokens':sorted(set(re.findall(r'\b(?:NB|SB|EB|WB|North(?:bound)?|South(?:bound)?|East(?:bound)?|West(?:bound)?)\b',text,re.I)))[:30],
+                      'date_like_tokens':sorted(set(re.findall(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',text)))[:30],
+                      'peak_mentions':len(re.findall(r'peak',text,re.I)),
+                      'volume_mentions':len(re.findall(r'vol(?:ume)?',text,re.I)),
+                  }
+                  print('SIGNALS',json.dumps(signals,ensure_ascii=False))
+                  file_info['sheets'].append({'name':sheet,'shape':list(df.shape),'signals':signals})
+              summary.append(file_info)
+          print('\nPROBE_SUMMARY='+json.dumps(summary,ensure_ascii=False))
+          PY

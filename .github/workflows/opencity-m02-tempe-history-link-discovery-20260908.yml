@@ -1,0 +1,82 @@
+name: OpenCity M02 Tempe History Link Discovery 20260908
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-history-link-discovery-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  discover-history-link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch public ArcGIS Web Map configuration and inspect popup links
+        shell: bash
+        env:
+          ITEM_ID: 40ffc90766394604a11206e2369e74d9
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          item_id = os.environ['ITEM_ID']
+          data_url = f'https://www.arcgis.com/sharing/rest/content/items/{item_id}/data?f=json'
+          meta_url = f'https://www.arcgis.com/sharing/rest/content/items/{item_id}?f=json'
+
+          def get_json(url):
+              req = urllib.request.Request(url, headers={'User-Agent':'OpenCity-Organizer-Reproducibility/2.0'})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read().decode('utf-8'))
+
+          meta = get_json(meta_url)
+          data = get_json(data_url)
+          print('ITEM_META')
+          print(json.dumps({k: meta.get(k) for k in ['id','title','type','owner','created','modified','url','access']}, indent=2))
+
+          print('\nOPERATIONAL_LAYERS')
+          for i, layer in enumerate(data.get('operationalLayers', [])):
+              print(json.dumps({
+                  'index': i,
+                  'id': layer.get('id'),
+                  'title': layer.get('title'),
+                  'url': layer.get('url'),
+                  'itemId': layer.get('itemId'),
+                  'layerType': layer.get('layerType'),
+              }, indent=2))
+              if layer.get('popupInfo'):
+                  print('POPUP_INFO')
+                  print(json.dumps(layer['popupInfo'], indent=2, ensure_ascii=False))
+
+          hits=[]
+          url_re=re.compile(r'https?://[^\s"<>]+', re.I)
+          terms=('histor','traffic','count','streetnode','objectid','popup','url','pdf','15-minute','15 minute')
+          def walk(x, path='$'):
+              if isinstance(x, dict):
+                  for k,v in x.items(): walk(v, f'{path}.{k}')
+              elif isinstance(x, list):
+                  for i,v in enumerate(x): walk(v, f'{path}[{i}]')
+              elif isinstance(x, str):
+                  low=x.lower()
+                  urls=url_re.findall(x)
+                  if urls or any(t in low for t in terms):
+                      hits.append((path,x))
+          walk(data)
+
+          print('\nRELEVANT_STRINGS')
+          for path, value in hits:
+              print(f'{path} = {value}')
+
+          # Fail if the public web map no longer contains any obvious historical-count reference.
+          historical=[(p,v) for p,v in hits if 'histor' in v.lower()]
+          if not historical:
+              raise SystemExit('NO_HISTORICAL_REFERENCE_FOUND_IN_WEBMAP')
+          print(f'\nHISTORICAL_REFERENCE_COUNT={len(historical)}')
+          PY

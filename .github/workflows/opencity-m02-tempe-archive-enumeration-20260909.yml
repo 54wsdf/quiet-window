@@ -1,0 +1,140 @@
+name: OpenCity M02 Tempe Archive Enumeration 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-archive-enumeration-20260909.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  enumerate-archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Enumerate only server-published Tempe archive hrefs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p enumeration_output
+          python - <<'PY'
+          import csv,json,time,urllib.parse,urllib.request
+          from collections import Counter,deque
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          ROOT='https://gis.tempe.gov/traffic-counts/folders/'
+          USER_AGENT='OpenCity-Organizer-Reproducibility/2.0'
+          ALLOWED_EXT={'.xls','.xlsx','.pdf'}
+          MAX_PAGES=1000
+
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.hrefs=[]
+              def handle_starttag(self,tag,attrs):
+                  if tag.lower()!='a': return
+                  d=dict(attrs)
+                  if d.get('href'): self.hrefs.append(d['href'])
+
+          def fetch_html(url):
+              last=None
+              for attempt in range(5):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':USER_AGENT})
+                      with urllib.request.urlopen(req,timeout=60) as r:
+                          data=r.read(); status=getattr(r,'status',200)
+                          ctype=r.headers.get('Content-Type','')
+                      if status!=200: raise RuntimeError(f'HTTP {status}')
+                      return data.decode('utf-8','replace'),len(data),ctype
+                  except Exception as e:
+                      last=e; time.sleep(min(2**attempt,8))
+              raise last
+
+          root_parts=urllib.parse.urlsplit(ROOT)
+          root_path=root_parts.path
+          queue=deque([ROOT]); queued={ROOT}; visited=set(); pages=[]; files={}; failures=[]
+
+          while queue:
+              if len(visited)>=MAX_PAGES:
+                  raise RuntimeError(f'page safety limit reached: {MAX_PAGES}')
+              url=queue.popleft()
+              if url in visited: continue
+              visited.add(url)
+              try:
+                  html,nbytes,ctype=fetch_html(url)
+              except Exception as e:
+                  failures.append({'url':url,'error':f'{type(e).__name__}: {e}'})
+                  continue
+              parser=Links(); parser.feed(html)
+              page_links=0
+              for href in parser.hrefs:
+                  href=href.strip()
+                  if not href or href.startswith('#'): continue
+                  child=urllib.parse.urljoin(url,href)
+                  p=urllib.parse.urlsplit(child)
+                  p=p._replace(fragment='',query='')
+                  child=urllib.parse.urlunsplit(p)
+                  if p.scheme not in {'http','https'} or p.netloc!=root_parts.netloc: continue
+                  if not p.path.startswith(root_path): continue
+                  if child==url or child==ROOT: continue
+                  rel=urllib.parse.unquote(p.path[len(root_path):])
+                  if not rel or rel.startswith('../') or '/..' in rel: continue
+                  page_links+=1
+                  suffix=Path(p.path).suffix.lower()
+                  if suffix in ALLOWED_EXT:
+                      files[child]={
+                          'url':child,
+                          'parent_page':url,
+                          'relative_path':rel,
+                          'extension':suffix,
+                          'published_href':href,
+                      }
+                  elif p.path.endswith('/') and child not in queued:
+                      queued.add(child); queue.append(child)
+              pages.append({'url':url,'bytes':nbytes,'content_type':ctype,'published_links_seen':page_links})
+
+          file_rows=sorted(files.values(),key=lambda r:r['url'])
+          ext_counts=Counter(r['extension'] for r in file_rows)
+          summary={
+              'root':ROOT,
+              'enumeration_policy':'follow only hrefs published by pages under the official root; no GIS-field URL synthesis',
+              'pages_visited':len(pages),
+              'page_failures':len(failures),
+              'unique_archive_files':len(file_rows),
+              'extension_counts':dict(sorted(ext_counts.items())),
+              'directory_pages_discovered':len(queued),
+              'safety_page_limit':MAX_PAGES,
+          }
+          out=Path('enumeration_output')
+          (out/'tempe_archive_summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          (out/'tempe_archive_pages.json').write_text(json.dumps(pages,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          (out/'tempe_archive_failures.json').write_text(json.dumps(failures,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          (out/'tempe_archive_files.json').write_text(json.dumps(file_rows,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          with (out/'tempe_archive_files.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=['url','parent_page','relative_path','extension','published_href'])
+              w.writeheader(); w.writerows(file_rows)
+          print(json.dumps(summary,indent=2,ensure_ascii=False))
+          if failures:
+              print('--- PAGE FAILURES (first 20) ---')
+              print(json.dumps(failures[:20],indent=2,ensure_ascii=False))
+          print('--- FILE SAMPLE (first 20) ---')
+          print(json.dumps(file_rows[:20],indent=2,ensure_ascii=False))
+          if not file_rows:
+              raise RuntimeError('official root enumeration returned zero xls/xlsx/pdf files')
+          PY
+
+      - name: Upload enumeration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-archive-enumeration
+          path: enumeration_output/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,339 @@
+name: OpenCity M02 Tempe Historical Counts Bulk 20260908
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-historical-counts-bulk-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  acquire-tempe-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROOT_URL: https://gis.tempe.gov/traffic-counts/folders/
+      DRIVE_PATH: ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data/M02_Tempe_City_Traffic_Counts_Historical_20260908
+
+    steps:
+      - name: Preflight execution repository and Drive credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "54wsdf/quiet-window"
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo 'BLOCKED: GDRIVE_RCLONE_CONFIG_B64 is missing; no source request will be made.' >&2
+            exit 3
+          fi
+          case "$DRIVE_PATH" in
+            ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/*) ;;
+            *) echo "BLOCKED: non-canonical Drive path: $DRIVE_PATH" >&2; exit 4 ;;
+          esac
+
+      - name: Install rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 2
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing canonical historical snapshot
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          if rclone lsf "$REMOTE_NAME:$DRIVE_PATH" --config "$CONFIG_FILE" --max-depth 1 > "$RUNNER_TEMP/existing.txt" 2>/dev/null; then
+            if [[ -s "$RUNNER_TEMP/existing.txt" ]]; then
+              echo "BLOCKED_DUPLICATE: target snapshot path already contains objects: $DRIVE_PATH" >&2
+              cat "$RUNNER_TEMP/existing.txt"
+              exit 20
+            fi
+          fi
+
+      - name: Enumerate real archive tree and download raw historical files
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          SNAPSHOT="$RUNNER_TEMP/tempe-history-snapshot"
+          mkdir -p "$SNAPSHOT/raw" "$SNAPSHOT/_directory_indexes"
+          python - "$SNAPSHOT" <<'PY'
+          import csv
+          import datetime as dt
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          SNAPSHOT=Path(sys.argv[1])
+          ROOT=os.environ['ROOT_URL']
+          UA='OpenCity-Organizer-Reproducibility/2.0'
+          ALLOWED={'.xls','.xlsx','.pdf'}
+          href_re=re.compile(r'href=["\']([^"\']+)["\']', re.I)
+
+          def fetch(url, attempts=6):
+              last=None
+              for i in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':UA})
+                      with urllib.request.urlopen(req,timeout=90) as r:
+                          return r.status, r.geturl(), r.headers.get('Content-Type',''), r.read()
+                  except Exception as e:
+                      last=e
+                      if i+1 < attempts:
+                          time.sleep(min(2**i, 16))
+              raise last
+
+          def safe_token(encoded, fallback_prefix):
+              # Keep the server-published percent-encoded basename as the local identity.
+              token=encoded.strip('/').replace('/', '%2F')
+              token=token or fallback_prefix
+              if len(token) > 180:
+                  token=token[:100]+'__'+hashlib.sha256(token.encode()).hexdigest()[:24]
+              return token
+
+          status, final_root, ctype, root_body=fetch(ROOT)
+          if status != 200:
+              raise SystemExit(f'ROOT_HTTP_{status}')
+          (SNAPSHOT/'_directory_indexes'/'root.html').write_bytes(root_body)
+          root_text=root_body.decode('utf-8',errors='replace')
+          root_hrefs=[html.unescape(x) for x in href_re.findall(root_text)]
+
+          folders=[]
+          seen=set()
+          root_parts=urllib.parse.urlsplit(ROOT)
+          root_path=root_parts.path.rstrip('/')+'/'
+          for href in root_hrefs:
+              abs_url=urllib.parse.urljoin(ROOT,href)
+              p=urllib.parse.urlsplit(abs_url)
+              if p.netloc.lower()!=root_parts.netloc.lower():
+                  continue
+              if not p.path.startswith(root_path) or not p.path.endswith('/'):
+                  continue
+              rel=p.path[len(root_path):].strip('/')
+              if not rel or '/' in rel:
+                  continue
+              key=(p.scheme,p.netloc,p.path,p.query)
+              if key in seen:
+                  continue
+              seen.add(key)
+              folders.append(abs_url)
+          folders.sort()
+          if len(folders) < 100:
+              raise SystemExit(f'Expected >=100 historical folders from root, got {len(folders)}')
+
+          rows=[]
+          folder_errors=[]
+          discovered_files=0
+          downloaded_files=0
+          raw_bytes=0
+          collection_entries=[]
+
+          for fi, folder_url in enumerate(folders,1):
+              folder_path=urllib.parse.urlsplit(folder_url).path.rstrip('/')
+              folder_token=folder_path.rsplit('/',1)[-1]
+              local_folder=safe_token(folder_token,f'folder_{fi:04d}')
+              index_path=SNAPSHOT/'_directory_indexes'/f'{fi:04d}__{local_folder}.html'
+              try:
+                  status, final_url, ctype, body=fetch(folder_url)
+                  if status != 200:
+                      raise RuntimeError(f'HTTP {status}')
+                  index_path.write_bytes(body)
+                  text=body.decode('utf-8',errors='replace')
+                  hrefs=[html.unescape(x) for x in href_re.findall(text)]
+              except Exception as e:
+                  folder_errors.append({'folder_url':folder_url,'error':f'{type(e).__name__}: {e}'})
+                  continue
+
+              files=[]
+              for href in hrefs:
+                  abs_url=urllib.parse.urljoin(final_url,href)
+                  p=urllib.parse.urlsplit(abs_url)
+                  ext=Path(urllib.parse.unquote(p.path)).suffix.lower()
+                  if ext not in ALLOWED:
+                      continue
+                  files.append(abs_url)
+              # Stable dedupe while retaining server order.
+              files=list(dict.fromkeys(files))
+              discovered_files += len(files)
+
+              raw_dir=SNAPSHOT/'raw'/f'{fi:04d}__{local_folder}'
+              raw_dir.mkdir(parents=True,exist_ok=True)
+              for file_url in files:
+                  p=urllib.parse.urlsplit(file_url)
+                  encoded_name=p.path.rsplit('/',1)[-1]
+                  local_name=safe_token(encoded_name,'source_file')
+                  dest=raw_dir/local_name
+                  row={
+                      'folder_index':fi,
+                      'folder_url':folder_url,
+                      'source_url':file_url,
+                      'source_encoded_filename':encoded_name,
+                      'local_relative_path':str(dest.relative_to(SNAPSHOT)),
+                      'extension':Path(urllib.parse.unquote(p.path)).suffix.lower(),
+                      'status':'',
+                      'bytes':'',
+                      'sha256':'',
+                      'content_type':'',
+                      'final_url':'',
+                      'error':''
+                  }
+                  try:
+                      s, f_url, f_ctype, payload=fetch(file_url)
+                      if s != 200:
+                          raise RuntimeError(f'HTTP {s}')
+                      if len(payload) < 100:
+                          raise RuntimeError(f'implausibly small payload: {len(payload)} bytes')
+                      dest.write_bytes(payload)
+                      sha=hashlib.sha256(payload).hexdigest()
+                      row.update({
+                          'status':'ACQUIRED',
+                          'bytes':len(payload),
+                          'sha256':sha,
+                          'content_type':f_ctype,
+                          'final_url':f_url,
+                      })
+                      downloaded_files += 1
+                      raw_bytes += len(payload)
+                      collection_entries.append(f'{file_url}\t{len(payload)}\t{sha}')
+                  except Exception as e:
+                      row.update({'status':'FAILED','error':f'{type(e).__name__}: {e}'})
+                  rows.append(row)
+
+              if fi % 25 == 0 or fi == len(folders):
+                  print(f'PROGRESS folders={fi}/{len(folders)} discovered={discovered_files} acquired={downloaded_files} bytes={raw_bytes}')
+
+          index_fields=['folder_index','folder_url','source_url','source_encoded_filename','local_relative_path','extension','status','bytes','sha256','content_type','final_url','error']
+          with (SNAPSHOT/'historical_file_index.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=index_fields); w.writeheader(); w.writerows(rows)
+
+          (SNAPSHOT/'folder_errors.json').write_text(json.dumps(folder_errors,indent=2,ensure_ascii=False),encoding='utf-8')
+          collection_sha=hashlib.sha256('\n'.join(sorted(collection_entries)).encode()).hexdigest()
+          failed=sum(1 for r in rows if r['status']=='FAILED')
+          ext_counts={}
+          for r in rows:
+              ext_counts[r['extension']]=ext_counts.get(r['extension'],0)+1
+          manifest={
+              'dataset_id':'opencity_m02_tempe_historical_counts_bulk_20260908',
+              'state':'FETCHED_VALIDATED_PENDING_DRIVE',
+              'publisher':'City of Tempe Department of Transportation / TempeData',
+              'source_family':'traffic_count',
+              'historical_root':ROOT,
+              'acquisition_strategy':'enumerate actual root child hrefs, then actual file hrefs; never synthesize folder paths from street attributes',
+              'folder_count_discovered':len(folders),
+              'folder_index_errors':len(folder_errors),
+              'source_files_discovered':discovered_files,
+              'source_files_acquired':downloaded_files,
+              'source_files_failed':failed,
+              'raw_bytes':raw_bytes,
+              'extension_counts':ext_counts,
+              'collection_sha256':collection_sha,
+              'acquired_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+              'git_repository':os.environ.get('GITHUB_REPOSITORY'),
+              'git_sha':os.environ.get('GITHUB_SHA'),
+              'workflow_run_id':os.environ.get('GITHUB_RUN_ID'),
+              'temporal_boundary':'Raw archive only. Filename year tokens and server directory timestamps are not observation dates. Workbook contents must be parsed before any AM agreement or V score.',
+              'success_rule':'All discovered eligible file hrefs must either be ACQUIRED with bytes/SHA256 or appear explicitly as FAILED in historical_file_index.csv.'
+          }
+          (SNAPSHOT/'manifest.json').write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding='utf-8')
+          summary={k:manifest[k] for k in ['folder_count_discovered','folder_index_errors','source_files_discovered','source_files_acquired','source_files_failed','raw_bytes','extension_counts','collection_sha256']}
+          print('BULK_SUMMARY='+json.dumps(summary,sort_keys=True))
+          if discovered_files < 100:
+              raise SystemExit(f'Expected >=100 historical files, discovered {discovered_files}')
+          # Do not silently accept partial source-file download failure.
+          if failed:
+              raise SystemExit(f'Historical file download failures={failed}; inspect historical_file_index.csv')
+          PY
+
+          echo "snapshot=$SNAPSHOT" >> "$GITHUB_OUTPUT"
+          echo "manifest=$SNAPSHOT/manifest.json" >> "$GITHUB_OUTPUT"
+
+      - name: Copy raw archive, indexes and manifest directly to Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          SNAPSHOT: ${{ steps.fetch.outputs.snapshot }}
+        run: |
+          set -euo pipefail
+          rclone copy "$SNAPSHOT" "$REMOTE_NAME:$DRIVE_PATH" \
+            --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --transfers 4 --checkers 8
+
+      - name: Verify remote snapshot and close manifest
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          SNAPSHOT: ${{ steps.fetch.outputs.snapshot }}
+          MANIFEST: ${{ steps.fetch.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          LOCAL_COUNT="$(find "$SNAPSHOT" -type f -printf '.' | wc -c)"
+          LOCAL_BYTES="$(find "$SNAPSHOT" -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')"
+          REMOTE_SIZE_JSON="$(rclone size "$REMOTE_NAME:$DRIVE_PATH" --config "$CONFIG_FILE" --json)"
+          REMOTE_COUNT="$(printf '%s' "$REMOTE_SIZE_JSON" | jq -r '.count')"
+          REMOTE_BYTES="$(printf '%s' "$REMOTE_SIZE_JSON" | jq -r '.bytes')"
+          if [[ "$LOCAL_COUNT" != "$REMOTE_COUNT" || "$LOCAL_BYTES" != "$REMOTE_BYTES" ]]; then
+            echo "REMOTE_SNAPSHOT_MISMATCH local_count=$LOCAL_COUNT remote_count=$REMOTE_COUNT local_bytes=$LOCAL_BYTES remote_bytes=$REMOTE_BYTES" >&2
+            exit 21
+          fi
+
+          python - "$MANIFEST" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          p=Path(sys.argv[1]); d=json.loads(p.read_text(encoding='utf-8'))
+          d['state']='ACQUIRED'
+          d['durable_storage']={
+              'backend':'Google Drive via rclone',
+              'path':os.environ['DRIVE_PATH'],
+              'verification':'exact recursive file count and byte total matched before final manifest closure'
+          }
+          p.write_text(json.dumps(d,indent=2,ensure_ascii=False),encoding='utf-8')
+          PY
+          rclone copyto "$MANIFEST" "$REMOTE_NAME:$DRIVE_PATH/manifest.json" \
+            --config "$CONFIG_FILE" --retries 5 --low-level-retries 10 --transfers 1 --checkers 2
+
+          LOCAL_MANIFEST_BYTES="$(stat -c '%s' "$MANIFEST")"
+          REMOTE_MANIFEST_JSON="$(rclone lsjson "$REMOTE_NAME:$DRIVE_PATH/manifest.json" --config "$CONFIG_FILE" --files-only)"
+          REMOTE_MANIFEST_BYTES="$(printf '%s' "$REMOTE_MANIFEST_JSON" | jq -r '.[0].Size // empty')"
+          test "$LOCAL_MANIFEST_BYTES" = "$REMOTE_MANIFEST_BYTES"
+          echo "ACQUIRED historical snapshot: $DRIVE_PATH"
+          echo "PRE_CLOSURE_FILE_COUNT=$LOCAL_COUNT PRE_CLOSURE_BYTES=$LOCAL_BYTES"
+          cat "$MANIFEST"
+
+      - name: Cleanup temporary rclone configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

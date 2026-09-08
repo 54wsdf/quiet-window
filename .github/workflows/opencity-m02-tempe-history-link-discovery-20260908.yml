@@ -15,68 +15,98 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Fetch public ArcGIS Web Map configuration and inspect popup links
+      - name: Inspect ArcGIS popup template and probe historical-count folders
         shell: bash
         env:
           ITEM_ID: 40ffc90766394604a11206e2369e74d9
         run: |
           set -euo pipefail
           python - <<'PY'
+          import html
           import json
           import os
           import re
+          import urllib.parse
           import urllib.request
+          import urllib.error
 
+          UA='OpenCity-Organizer-Reproducibility/2.0'
           item_id = os.environ['ITEM_ID']
-          data_url = f'https://www.arcgis.com/sharing/rest/content/items/{item_id}/data?f=json'
-          meta_url = f'https://www.arcgis.com/sharing/rest/content/items/{item_id}?f=json'
+
+          def get_bytes(url):
+              req=urllib.request.Request(url,headers={'User-Agent':UA})
+              with urllib.request.urlopen(req,timeout=60) as r:
+                  return r.status, r.geturl(), r.headers.get('Content-Type',''), r.read()
 
           def get_json(url):
-              req = urllib.request.Request(url, headers={'User-Agent':'OpenCity-Organizer-Reproducibility/2.0'})
-              with urllib.request.urlopen(req, timeout=60) as r:
-                  return json.loads(r.read().decode('utf-8'))
+              return json.loads(get_bytes(url)[3].decode('utf-8'))
 
-          meta = get_json(meta_url)
-          data = get_json(data_url)
+          meta = get_json(f'https://www.arcgis.com/sharing/rest/content/items/{item_id}?f=json')
+          data = get_json(f'https://www.arcgis.com/sharing/rest/content/items/{item_id}/data?f=json')
           print('ITEM_META')
-          print(json.dumps({k: meta.get(k) for k in ['id','title','type','owner','created','modified','url','access']}, indent=2))
+          print(json.dumps({k: meta.get(k) for k in ['id','title','type','owner','created','modified','access']}, indent=2))
 
-          print('\nOPERATIONAL_LAYERS')
-          for i, layer in enumerate(data.get('operationalLayers', [])):
-              print(json.dumps({
-                  'index': i,
-                  'id': layer.get('id'),
-                  'title': layer.get('title'),
-                  'url': layer.get('url'),
-                  'itemId': layer.get('itemId'),
-                  'layerType': layer.get('layerType'),
-              }, indent=2))
-              if layer.get('popupInfo'):
-                  print('POPUP_INFO')
-                  print(json.dumps(layer['popupInfo'], indent=2, ensure_ascii=False))
+          template=None
+          layer_url=None
+          for layer in data.get('operationalLayers', []):
+              if layer.get('title') == 'Traffic Count Segments':
+                  layer_url=layer.get('url')
+                  popup=layer.get('popupInfo') or {}
+                  text=(popup.get('description') or '')
+                  m=re.search(r"href=['\"]([^'\"]*traffic-counts/folders/[^'\"]+)['\"]", text, re.I)
+                  if m: template=html.unescape(m.group(1))
+                  print('POPUP_TEMPLATE=', template)
+                  print('LAYER_URL=', layer_url)
 
-          hits=[]
-          url_re=re.compile(r'https?://[^\s"<>]+', re.I)
-          terms=('histor','traffic','count','streetnode','objectid','popup','url','pdf','15-minute','15 minute')
-          def walk(x, path='$'):
-              if isinstance(x, dict):
-                  for k,v in x.items(): walk(v, f'{path}.{k}')
-              elif isinstance(x, list):
-                  for i,v in enumerate(x): walk(v, f'{path}[{i}]')
-              elif isinstance(x, str):
-                  low=x.lower()
-                  urls=url_re.findall(x)
-                  if urls or any(t in low for t in terms):
-                      hits.append((path,x))
-          walk(data)
+          if not template or not layer_url:
+              raise SystemExit('MISSING_POPUP_TEMPLATE_OR_LAYER')
 
-          print('\nRELEVANT_STRINGS')
-          for path, value in hits:
-              print(f'{path} = {value}')
+          q=urllib.parse.urlencode({
+              'where':'StreetNode IS NOT NULL',
+              'outFields':'OBJECTID,StreetNode,StreetOn,StreetFrom,StreetTo,CaptureDate,DirectionFirst,DirectionSecond',
+              'returnGeometry':'false',
+              'orderByFields':'StreetNode ASC',
+              'resultRecordCount':'12',
+              'f':'json'
+          })
+          features=get_json(layer_url + '/query?' + q).get('features',[])
+          if not features:
+              raise SystemExit('NO_FEATURES')
 
-          # Fail if the public web map no longer contains any obvious historical-count reference.
-          historical=[(p,v) for p,v in hits if 'histor' in v.lower()]
-          if not historical:
-              raise SystemExit('NO_HISTORICAL_REFERENCE_FOUND_IN_WEBMAP')
-          print(f'\nHISTORICAL_REFERENCE_COUNT={len(historical)}')
+          href_re=re.compile(r'href=["\']([^"\']+)["\']', re.I)
+          ok=0
+          for feat in features:
+              a=feat.get('attributes') or {}
+              rendered=template
+              for field in ('StreetNode','StreetOn','StreetFrom','StreetTo'):
+                  value=a.get(field)
+                  if field=='StreetNode' and isinstance(value,float) and value.is_integer(): value=int(value)
+                  rendered=rendered.replace('{'+field+'}', '' if value is None else str(value))
+              # Quote only the folder-name path component while retaining scheme/host/path separators.
+              prefix='https://gis.tempe.gov/traffic-counts/folders/'
+              folder=rendered[len(prefix):] if rendered.startswith(prefix) else rendered.rsplit('/',1)[-1]
+              url=prefix + urllib.parse.quote(folder, safe='_-.()')
+              print('\nPROBE_FEATURE')
+              print(json.dumps(a,ensure_ascii=False,indent=2))
+              print('FOLDER_URL=',url)
+              try:
+                  status, final_url, ctype, body=get_bytes(url)
+                  ok += 1
+                  print('HTTP_STATUS=',status)
+                  print('FINAL_URL=',final_url)
+                  print('CONTENT_TYPE=',ctype)
+                  print('BODY_BYTES=',len(body))
+                  text=body[:200000].decode('utf-8',errors='replace')
+                  hrefs=href_re.findall(text)
+                  print('HREF_COUNT=',len(hrefs))
+                  for h in hrefs[:30]: print('HREF=',html.unescape(h))
+                  print('BODY_PREFIX=',text[:3000].replace('\n',' '))
+              except urllib.error.HTTPError as e:
+                  print('HTTP_ERROR=',e.code,e.reason)
+              except Exception as e:
+                  print('FETCH_ERROR=',type(e).__name__,str(e))
+
+          print('\nSUCCESSFUL_FOLDER_PROBES=',ok)
+          if ok == 0:
+              raise SystemExit('NO_HISTORICAL_FOLDER_RESPONDED')
           PY

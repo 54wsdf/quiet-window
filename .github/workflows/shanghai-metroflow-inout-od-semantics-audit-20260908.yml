@@ -1,0 +1,147 @@
+name: Shanghai MetroFlow InOut OD semantics audit 2026-09-08
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/processing/audit_metroflow_inout_od_semantics.py'
+      - '.github/workflows/shanghai-metroflow-inout-od-semantics-audit-20260908.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_URL: https://ndownloader.figshare.com/files/68207551
+      DERIVED_ROOT: transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675/canonical_q6_q10_v1/builds/34219386605
+      AUDIT_ROOT: transport_data_lake/01_rail/CN_Shanghai_MetroFlow/corrected_33436675/canonical_q6_q10_v1/data_audits
+    steps:
+      - name: Check durable-storage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${GDRIVE_CONFIG_B64:-}" ]] || { echo 'Missing storage config' >&2; exit 3; }
+
+      - name: Checkout data worker
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install audit runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'numpy>=2,<3' 'pandas>=2.2,<3' 'requests>=2.32,<3'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          [[ -n "$REMOTE_NAME" ]] || exit 4
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Restore qualified derived inputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/metroflow-audit-input"
+          mkdir -p "$WORK/marginals"
+          rclone copyto "$REMOTE_NAME:$DERIVED_ROOT/manifest.json" "$WORK/manifest.json" --config "$CONFIG_FILE"
+          rclone copyto "$REMOTE_NAME:$DERIVED_ROOT/date_quality.json" "$WORK/date_quality.json" --config "$CONFIG_FILE"
+          rclone copyto "$REMOTE_NAME:$DERIVED_ROOT/station_index.csv" "$WORK/station_index.csv" --config "$CONFIG_FILE"
+          rclone copy "$REMOTE_NAME:$DERIVED_ROOT/marginals" "$WORK/marginals" --config "$CONFIG_FILE" --checkers 8 --transfers 8
+          test "$(find "$WORK/marginals" -maxdepth 1 -name 'entry_clock-*.npz' | wc -l)" -eq 123
+
+      - name: Audit source InOut and derived OD marginals
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/metroflow-audit-input"
+          OUT="$RUNNER_TEMP/metroflow-audit-output"
+          python scripts/processing/audit_metroflow_inout_od_semantics.py \
+            --source-url "$SOURCE_URL" \
+            --derived-manifest "$WORK/manifest.json" \
+            --date-quality "$WORK/date_quality.json" \
+            --station-index "$WORK/station_index.csv" \
+            --marginals-dir "$WORK/marginals" \
+            --output-dir "$OUT" \
+            | tee "$RUNNER_TEMP/metroflow-data-audit.log"
+          test -s "$OUT/audit.json"
+          test -s "$OUT/daily_quality.csv"
+          test -s "$OUT/low_flow_days.csv"
+
+      - name: Upload and download-verify audit results
+        id: upload
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/metroflow-audit-output"
+          BUILD_PATH="$AUDIT_ROOT/builds/${GITHUB_RUN_ID}"
+          rclone copy "$OUT" "$REMOTE_NAME:$BUILD_PATH" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 --checkers 8 --transfers 4
+          rclone check "$OUT" "$REMOTE_NAME:$BUILD_PATH" --config "$CONFIG_FILE" --download --one-way --checkers 8
+          echo "build_path=$BUILD_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Publish latest qualified data-audit pointer
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          BUILD_PATH: ${{ steps.upload.outputs.build_path }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/metroflow-audit-output"
+          POINTER="$RUNNER_TEMP/LATEST_DATA_AUDIT.json"
+          python - "$OUT/audit.json" "$BUILD_PATH" "$POINTER" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          from datetime import datetime, timezone
+          audit_path = pathlib.Path(sys.argv[1]); build_path = sys.argv[2]; pointer = pathlib.Path(sys.argv[3])
+          audit = json.loads(audit_path.read_text(encoding='utf-8'))
+          payload = {
+              'schema': 'shanghai-metroflow-latest-data-audit-v1',
+              'state': audit['state'],
+              'build_path': build_path,
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'github_sha': os.environ.get('GITHUB_SHA'),
+              'audit_sha256': hashlib.sha256(audit_path.read_bytes()).hexdigest(),
+              'flagged_low_flow_dates': audit['low_flow']['flagged_dates'],
+              'published_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          pointer.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+          rclone copyto "$POINTER" "$REMOTE_NAME:$AUDIT_ROOT/LATEST_DATA_AUDIT.json" --config "$CONFIG_FILE" --retries 8 --low-level-retries 20
+          rclone lsjson "$REMOTE_NAME:$AUDIT_ROOT/LATEST_DATA_AUDIT.json" --config "$CONFIG_FILE"
+
+      - name: Clean temporary storage configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

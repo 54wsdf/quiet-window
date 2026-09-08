@@ -1,0 +1,278 @@
+name: OpenCity M02 Tempe V3 Full Archive Candidate Selection 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-v3-full-archive-candidate-selection-20260909.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-candidate-set:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      DRIVE_ARCHIVE: ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data/M02_Tempe_Historical_Traffic_Counts_Archive_20260909
+      V3_META_SUBDIR: metadata_v3_parser_9f1275ff_20260909
+      CURRENT_SEGMENT_URL: 'https://gis.tempe.gov/arcgis/rest/services/Open_Data/TrafficCountSegment/FeatureServer/0/query?where=1%3D1&outFields=*&returnGeometry=true&outSR=4326&f=geojson'
+      CURRENT_SEGMENT_SHA256: a2083155690bdb7443ca5a5cc0ba096851874e9881d2c02cb4f75404f1d82115
+      CANONICAL_V1_BLOB_SHA: 36d1dea2edaede04e2aaf255cd10fec9660a1acb
+      CANONICAL_V2_BLOB_SHA: b067215aa82126cc7d5636ed8de072f64ac3fb30
+      CANONICAL_V3_BLOB_SHA: 9f1275ff01f2080442049a1839bf7a3deb49c627
+
+    steps:
+      - name: Preflight canonical execution channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = '54wsdf/quiet-window'
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          case "$DRIVE_ARCHIVE" in
+            ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/*) ;;
+            *) echo "BLOCKED non-canonical Drive path: $DRIVE_ARCHIVE" >&2; exit 4 ;;
+          esac
+
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify parser mirrors are byte-locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser.py)" = "$CANONICAL_V1_BLOB_SHA"
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser_v2.py)" = "$CANONICAL_V2_BLOB_SHA"
+          test "$(git hash-object .opencity_mirror/round2_m02_tempe_count_parser_v3.py)" = "$CANONICAL_V3_BLOB_SHA"
+
+      - name: Install runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet pandas python-calamine
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Restore temporary rclone configuration
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Recover the previously verified 1,132-object raw archive from Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/tempe-v3-full/raw"
+          mkdir -p "$RAW" v3_output
+          rclone copy "$REMOTE_NAME:$DRIVE_ARCHIVE/raw" "$RAW" --config "$CONFIG_FILE" --transfers 8 --checkers 16 --retries 8 --low-level-retries 20
+          SIZE_JSON="$(rclone size "$RAW" --json)"
+          python - "$SIZE_JSON" <<'PY'
+          import json,sys
+          x=json.loads(sys.argv[1]); print(x)
+          assert x['count']==1132,x
+          assert x['bytes']==72590676,x
+          PY
+          printf '%s\n' "$SIZE_JSON" > v3_output/recovered_raw_size.json
+
+      - name: Fetch and byte-verify current observed-segment geometry
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 300 \
+            -H 'User-Agent: OpenCity-Organizer-Reproducibility/3.0' \
+            "$CURRENT_SEGMENT_URL" -o v3_output/current_traffic_count_segments.geojson
+          test "$(sha256sum v3_output/current_traffic_count_segments.geojson | awk '{print $1}')" = "$CURRENT_SEGMENT_SHA256"
+
+      - name: Run v3 against the frozen full archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/tempe-v3-full/raw"
+          python .opencity_mirror/round2_m02_tempe_count_parser_v3.py \
+            --input-root "$RAW" \
+            --interval-output v3_output/full_archive_v3_intervals.csv \
+            --am-output v3_output/full_archive_v3_am.csv \
+            --audit-output v3_output/full_archive_v3_audit.csv \
+            --summary-output v3_output/full_archive_v3_summary.json
+
+      - name: Build latest complete content-dated candidate table
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv,json,re
+          from collections import Counter,defaultdict
+          from datetime import date
+          from pathlib import Path
+
+          AM=Path('v3_output/full_archive_v3_am.csv')
+          AUDIT=Path('v3_output/full_archive_v3_audit.csv')
+          GEO=Path('v3_output/current_traffic_count_segments.geojson')
+          OUT=Path('v3_output')
+          am=list(csv.DictReader(AM.open(encoding='utf-8-sig')))
+          audits=list(csv.DictReader(AUDIT.open(encoding='utf-8-sig')))
+          geo=json.loads(GEO.read_text(encoding='utf-8'))
+          features=geo['features']
+
+          def node_from_source(path):
+              folder=Path(path).parts[-2]
+              m=re.match(r'^([^_]+)_On_',folder,re.I)
+              return m.group(1).strip() if m else ''
+
+          dir_map={'North Bound':'NB','South Bound':'SB','East Bound':'EB','West Bound':'WB','Null':None,None:None,'':None}
+          current={}
+          for f in features:
+              p=f.get('properties') or {}
+              n=str(p.get('StreetNode','')).strip()
+              expected=[]; noncardinal=[]
+              for raw in (p.get('DirectionFirst'),p.get('DirectionSecond')):
+                  if raw in dir_map:
+                      d=dir_map[raw]
+                      if d and d not in expected: expected.append(d)
+                  elif raw and raw!='Null': noncardinal.append(raw)
+              current[n]={
+                  'street_node':n,'StreetOn':p.get('StreetOn',''),'StreetFrom':p.get('StreetFrom',''),'StreetTo':p.get('StreetTo',''),
+                  'DirectionFirst':p.get('DirectionFirst',''),'DirectionSecond':p.get('DirectionSecond',''),
+                  'expected_cardinal_directions':expected,'noncardinal_directions':noncardinal,
+              }
+          assert len(current)==163,len(current)
+
+          complete=[]
+          for r in am:
+              if r['complete_am']!='True': continue
+              n=node_from_source(r['source_file'])
+              if not n: continue
+              x=dict(r); x['street_node']=n; x['_date']=date.fromisoformat(r['observation_date'])
+              complete.append(x)
+
+          grouped=defaultdict(list)
+          for r in complete: grouped[(r['street_node'],r['direction'])].append(r)
+
+          selected=[]; ties=[]
+          for key,rows in sorted(grouped.items()):
+              max_date=max(r['_date'] for r in rows)
+              latest=[r for r in rows if r['_date']==max_date]
+              latest.sort(key=lambda r:(r['source_file'],r['schema_family']))
+              if len(latest)==1:
+                  r=latest[0]
+                  selected.append({
+                      'street_node':r['street_node'],'direction':r['direction'],'observation_date':r['observation_date'],
+                      'am_average_vph':r['am_average_vph'],'am_total_vehicles':r['am_total_vehicles'],
+                      'resolution_minutes':r['resolution_minutes'],'schema_family':r['schema_family'],'source_file':r['source_file'],
+                      'latest_status':'UNIQUE_LATEST'
+                  })
+              else:
+                  values={r['am_average_vph'] for r in latest}
+                  ties.append({'street_node':key[0],'direction':key[1],'observation_date':max_date.isoformat(),'tie_count':len(latest),'distinct_am_values':len(values),'sources':'|'.join(r['source_file'] for r in latest)})
+                  # Do not silently select among same-date records, even if values happen to agree.
+
+          selected_by={(r['street_node'],r['direction']):r for r in selected}
+          node_rows=[]
+          nodes_any={r['street_node'] for r in complete}
+          fully_covered=0; partially_covered=0; no_expected=0
+          for n,c in sorted(current.items(), key=lambda kv:int(kv[0]) if kv[0].isdigit() else kv[0]):
+              exp=c['expected_cardinal_directions']
+              got=[d for d in exp if (n,d) in selected_by]
+              missing=[d for d in exp if (n,d) not in selected_by]
+              tie_dirs=[t['direction'] for t in ties if t['street_node']==n and t['direction'] in exp]
+              if not exp:
+                  status='NONCARDINAL_CURRENT_DIRECTION' if c['noncardinal_directions'] else 'NO_EXPECTED_DIRECTION'
+                  no_expected+=1
+              elif not missing and not tie_dirs:
+                  status='FULLY_COVERED_UNIQUE'; fully_covered+=1
+              elif got:
+                  status='PARTIALLY_COVERED'; partially_covered+=1
+              else:
+                  status='MISSING_EXPECTED_DIRECTION'
+              node_rows.append({
+                  **{k:c[k] for k in ['street_node','StreetOn','StreetFrom','StreetTo','DirectionFirst','DirectionSecond']},
+                  'expected_cardinal_directions':'|'.join(exp),'observed_unique_latest_directions':'|'.join(got),
+                  'missing_expected_directions':'|'.join(missing),'tie_expected_directions':'|'.join(tie_dirs),
+                  'has_any_complete_observation':n in nodes_any,'candidate_status':status
+              })
+
+          def write_csv(path,rows,fields):
+              with open(path,'w',encoding='utf-8-sig',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
+
+          write_csv(OUT/'latest_complete_observation_by_node_direction.csv',selected,
+                    ['street_node','direction','observation_date','am_average_vph','am_total_vehicles','resolution_minutes','schema_family','source_file','latest_status'])
+          write_csv(OUT/'latest_same_date_ties.csv',ties,
+                    ['street_node','direction','observation_date','tie_count','distinct_am_values','sources'])
+          write_csv(OUT/'current_node_candidate_coverage.csv',node_rows,
+                    ['street_node','StreetOn','StreetFrom','StreetTo','DirectionFirst','DirectionSecond','expected_cardinal_directions','observed_unique_latest_directions','missing_expected_directions','tie_expected_directions','has_any_complete_observation','candidate_status'])
+
+          status_counts=Counter(a['status'] for a in audits)
+          family_counts=Counter(a['schema_family'] for a in audits if a['schema_family'])
+          complete_dates=[r['_date'] for r in complete]
+          summary={
+              'source_objects':len(audits),
+              'parser_status_counts':dict(status_counts),
+              'parser_family_counts':dict(family_counts),
+              'all_am_direction_records':len(am),
+              'complete_am_direction_records':len(complete),
+              'complete_observation_nodes':len(nodes_any),
+              'unique_latest_node_direction_candidates':len(selected),
+              'same_date_latest_ties':len(ties),
+              'current_segments':len(current),
+              'current_segments_fully_covered_by_unique_cardinal_candidates':fully_covered,
+              'current_segments_partially_covered':partially_covered,
+              'current_segments_without_cardinal_expected_direction':no_expected,
+              'candidate_status_counts':dict(Counter(r['candidate_status'] for r in node_rows)),
+              'content_date_min':min(complete_dates).isoformat() if complete_dates else None,
+              'content_date_max':max(complete_dates).isoformat() if complete_dates else None,
+              'noncardinal_current_segments':[r['street_node'] for r in node_rows if r['candidate_status']=='NONCARDINAL_CURRENT_DIRECTION'],
+              'selection_rule':'for each StreetNode and parsed cardinal direction, retain only a unique latest complete AM observation by workbook-content date; same-date ties remain unresolved',
+              'boundary':'candidate observation selection only; no observed-segment to model-link match and no GEH/NMAE/V/OpenScore'
+          }
+          (OUT/'v3_candidate_selection_summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          print(json.dumps(summary,indent=2,ensure_ascii=False))
+          assert len(audits)==1132,len(audits)
+          assert len(nodes_any)>=160,len(nodes_any)
+          PY
+
+      - name: Persist compact v3 outputs without overwriting prior metadata
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          DEST="$DRIVE_ARCHIVE/$V3_META_SUBDIR"
+          EXISTING="$RUNNER_TEMP/existing-v3.txt"
+          if rclone lsf "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --max-depth 1 > "$EXISTING" 2>/dev/null && [[ -s "$EXISTING" ]]; then
+            echo "BLOCKED_DUPLICATE: $DEST already contains objects" >&2
+            cat "$EXISTING" >&2
+            exit 20
+          fi
+          rclone copy v3_output "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --transfers 4 --checkers 8 --retries 8 --low-level-retries 20
+          LOCAL="$(rclone size v3_output --json)"
+          REMOTE="$(rclone size "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --json)"
+          python - "$LOCAL" "$REMOTE" <<'PY'
+          import json,sys
+          a=json.loads(sys.argv[1]);b=json.loads(sys.argv[2]);print('local',a);print('remote',b)
+          assert a['count']==b['count'] and a['bytes']==b['bytes'],(a,b)
+          PY
+
+      - name: Upload compact v3 candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-v3-full-archive-candidate-selection
+          path: v3_output/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,132 @@
+name: OpenCity M02 Tempe Archive Current Segment Bridge 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m02-tempe-archive-current-segment-bridge-20260909.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bridge-archive-current:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ENUMERATION_RUN_ID: '34252106158'
+      CURRENT_SEGMENT_URL: 'https://gis.tempe.gov/arcgis/rest/services/Open_Data/TrafficCountSegment/FeatureServer/0/query?where=1%3D1&outFields=*&returnGeometry=true&outSR=4326&f=geojson'
+    steps:
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download frozen archive enumeration
+        uses: actions/download-artifact@v5
+        with:
+          name: opencity-m02-tempe-archive-enumeration
+          path: enumeration_input
+          github-token: ${{ github.token }}
+          run-id: ${{ env.ENUMERATION_RUN_ID }}
+
+      - name: Fetch current Tempe traffic-count segment layer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bridge_output
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 300 \
+            -H 'User-Agent: OpenCity-Organizer-Reproducibility/2.0' \
+            "$CURRENT_SEGMENT_URL" -o bridge_output/current_traffic_count_segments.geojson
+
+      - name: Compare archive directory IDs with current StreetNode IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv,hashlib,json,re,urllib.parse
+          from collections import Counter,defaultdict
+          from pathlib import Path
+
+          files=json.loads(Path('enumeration_input/tempe_archive_files.json').read_text(encoding='utf-8'))
+          geo_path=Path('bridge_output/current_traffic_count_segments.geojson')
+          geo=json.loads(geo_path.read_text(encoding='utf-8'))
+          feats=geo.get('features') or []
+
+          archive_dirs={}
+          root_path='/traffic-counts/folders/'
+          for r in files:
+              p=urllib.parse.urlsplit(r['parent_page']).path
+              rel=urllib.parse.unquote(p[len(root_path):]).strip('/') if p.startswith(root_path) else ''
+              if not rel: continue
+              folder=rel.split('/')[0]
+              m=re.match(r'^([^_]+)_On_',folder,re.I)
+              node=(m.group(1).strip() if m else '')
+              archive_dirs[folder]={'folder':folder,'street_node':node,'parent_page':r['parent_page']}
+
+          current_by_node=defaultdict(list)
+          for f in feats:
+              props=f.get('properties') or {}
+              node=str(props.get('StreetNode','')).strip()
+              current_by_node[node].append(f)
+
+          archive_nodes={v['street_node'] for v in archive_dirs.values() if v['street_node']!=''}
+          current_nodes={k for k in current_by_node if k!=''}
+          matched=sorted(archive_nodes & current_nodes)
+          archive_only=sorted(archive_nodes-current_nodes)
+          current_only=sorted(current_nodes-archive_nodes)
+          duplicate_current=sorted(k for k,v in current_by_node.items() if k and len(v)>1)
+          folders_without_node=sorted(k for k,v in archive_dirs.items() if not v['street_node'])
+
+          rows=[]
+          for folder,item in sorted(archive_dirs.items()):
+              node=item['street_node']
+              current=current_by_node.get(node,[])
+              row={
+                  'archive_folder':folder,
+                  'street_node':node,
+                  'archive_parent_page':item['parent_page'],
+                  'current_feature_count':len(current),
+                  'bridge_status':'MATCHED_UNIQUE' if len(current)==1 else ('NO_CURRENT_FEATURE' if len(current)==0 else 'AMBIGUOUS_CURRENT_DUPLICATE'),
+                  'StreetOn':'','StreetFrom':'','StreetTo':'','DirectionFirst':'','DirectionSecond':'','TotalVolume':'','CaptureDate':''
+              }
+              if len(current)==1:
+                  p=current[0].get('properties') or {}
+                  for k in ['StreetOn','StreetFrom','StreetTo','DirectionFirst','DirectionSecond','TotalVolume','CaptureDate']:
+                      row[k]=p.get(k,'')
+              rows.append(row)
+
+          summary={
+              'enumeration_run_id':34252106158,
+              'archive_directory_count':len(archive_dirs),
+              'archive_nodes_with_id':len(archive_nodes),
+              'current_feature_count':len(feats),
+              'current_unique_street_nodes':len(current_nodes),
+              'matched_street_nodes':len(matched),
+              'archive_only_street_nodes':archive_only,
+              'current_only_street_nodes':current_only,
+              'duplicate_current_street_nodes':duplicate_current,
+              'archive_folders_without_parseable_street_node':folders_without_node,
+              'current_geojson_bytes':geo_path.stat().st_size,
+              'current_geojson_sha256':hashlib.sha256(geo_path.read_bytes()).hexdigest(),
+              'bridge_status_counts':dict(Counter(r['bridge_status'] for r in rows)),
+              'boundary':'StreetNode bridge only; no model-link spatial match or V is computed here'
+          }
+          Path('bridge_output/archive_current_segment_bridge_summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+          with Path('bridge_output/archive_current_segment_bridge.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0].keys()))
+              w.writeheader(); w.writerows(rows)
+          print(json.dumps(summary,indent=2,ensure_ascii=False))
+          assert len(feats)>=150, len(feats)
+          assert len(archive_dirs)>=160, len(archive_dirs)
+          PY
+
+      - name: Upload bridge evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m02-tempe-archive-current-segment-bridge
+          path: bridge_output/
+          if-no-files-found: error
+          retention-days: 30

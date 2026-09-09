@@ -1,0 +1,227 @@
+name: OpenCity M04 Kearny AZ C6 Homogeneity Probe 20260909
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencity-m04-kearny-c6-probe-20260909.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe-kearny-c6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      GEOFABRIK_URL: https://download.geofabrik.de/north-america/us/arizona-latest.osm.pbf
+      # Deliberately generous bbox around Census Kearny place centroid 33.0563456,-110.9074054.
+      # This captures the incorporated street grid plus the through state highway without
+      # pretending the bbox is an exact municipal boundary.
+      BBOX: '-110.940,33.035,-110.875,33.082'
+      DRIVE_ROOT: ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/01_public_reference_data/M04_Kearny_AZ_OSM_20260909
+      HANDOFF_GATE_CONFIG_SHA256: 9a4529a6ed37134e3d0ebbad31736f5f68ebed9b3a03a1ae299423a5d003ff1d
+      HANDOFF_VALIDATOR_SHA256: e74a88a00c52fb6aa449e4f3873aa2b6acf8a553daf2111fae0f48834fce1b72
+
+    steps:
+      - name: Preflight canonical execution channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = '54wsdf/quiet-window'
+          test -n "${GDRIVE_CONFIG_B64:-}"
+          case "$DRIVE_ROOT" in
+            ResearchData/transport_challenges/OpenCity_Traffic_Challenge_2026/*) ;;
+            *) echo "BLOCKED non-canonical Drive path: $DRIVE_ROOT" >&2; exit 4 ;;
+          esac
+
+      - name: Checkout exact execution commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install extraction runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool rclone
+
+      - name: Fetch current Arizona Geofabrik extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p m04_output
+          curl --fail --location --retry 8 --retry-all-errors --connect-timeout 30 --max-time 1200 \
+            -H 'User-Agent: OpenCity-Organizer-Reproducibility/4.0' \
+            "$GEOFABRIK_URL" -o "$RUNNER_TEMP/arizona-latest.osm.pbf"
+          BYTES="$(stat -c%s "$RUNNER_TEMP/arizona-latest.osm.pbf")"
+          SHA="$(sha256sum "$RUNNER_TEMP/arizona-latest.osm.pbf" | awk '{print $1}')"
+          test "$BYTES" -gt 100000000
+          printf '{"source_url":"%s","bytes":%s,"sha256":"%s","bbox":"%s","census_centroid":{"lat":33.0563456,"lon":-110.9074054},"boundary_note":"bbox probe, not exact municipal polygon","handoff_gate_config_sha256":"%s","handoff_validator_sha256":"%s","execution_commit":"%s"}\n' \
+            "$GEOFABRIK_URL" "$BYTES" "$SHA" "$BBOX" "$HANDOFF_GATE_CONFIG_SHA256" "$HANDOFF_VALIDATOR_SHA256" "$GITHUB_SHA" \
+            > m04_output/source_manifest.json
+
+      - name: Extract Kearny bbox and drivable highway ways
+        shell: bash
+        run: |
+          set -euo pipefail
+          osmium extract -b "$BBOX" --strategy complete_ways \
+            "$RUNNER_TEMP/arizona-latest.osm.pbf" -o m04_output/kearny_bbox.osm.pbf --overwrite
+          osmium tags-filter m04_output/kearny_bbox.osm.pbf w/highway \
+            -o "$RUNNER_TEMP/kearny_highways.osm.pbf" --overwrite
+          osmium export "$RUNNER_TEMP/kearny_highways.osm.pbf" \
+            -o m04_output/kearny_highways.geojson --overwrite
+          test "$(stat -c%s m04_output/kearny_highways.geojson)" -gt 1000
+
+      - name: Build provenance-explicit directed network and execute exact C6 conjunction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv,json,math,re
+          from collections import Counter,defaultdict
+          from pathlib import Path
+
+          src=json.loads(Path('m04_output/kearny_highways.geojson').read_text(encoding='utf-8'))
+          allowed={
+              'motorway','motorway_link','trunk','trunk_link','primary','primary_link',
+              'secondary','secondary_link','tertiary','tertiary_link','unclassified',
+              'residential','living_street'
+          }
+          def norm_hw(v):
+              if isinstance(v,list): v=v[0] if v else ''
+              return str(v or '').strip().lower()
+          def facility(hw):
+              if hw in {'motorway','motorway_link','trunk','trunk_link','primary','primary_link'}: return 'arterial'
+              if hw in {'secondary','secondary_link','tertiary','tertiary_link'}: return 'collector'
+              return 'local'
+          cap_lane={'arterial':1700.0,'collector':1350.0,'local':900.0}
+          speed_default={'arterial':72.0,'collector':50.0,'local':35.0}
+          def num(v):
+              if v is None: return None
+              m=re.search(r'\d+(?:\.\d+)?',str(v))
+              return float(m.group()) if m else None
+          def parse_speed(v):
+              if v is None: return None
+              s=str(v).lower(); x=num(s)
+              if x is None: return None
+              return x*1.609344 if 'mph' in s else x
+          rows=[]; way_count=0
+          for feat in src.get('features',[]):
+              geom=feat.get('geometry') or {}
+              if geom.get('type') not in {'LineString','MultiLineString'}: continue
+              p=feat.get('properties') or {}
+              hw=norm_hw(p.get('highway'))
+              if hw not in allowed: continue
+              way_count+=1
+              fac=facility(hw)
+              oneway=str(p.get('oneway','')).lower() in {'yes','1','true'} or hw=='motorway'
+              total_lanes=num(p.get('lanes'))
+              lf=num(p.get('lanes:forward')); lb=num(p.get('lanes:backward'))
+              if oneway:
+                  lane_f=int(max(1, round(total_lanes or lf or 1)))
+                  dirs=[('F',lane_f,'OSM lanes tag' if (total_lanes or lf) else 'documented directional-lane fallback from OSM highway class')]
+              else:
+                  if lf or lb:
+                      lane_f=int(max(1,round(lf or 1))); lane_b=int(max(1,round(lb or 1)))
+                      dirs=[('F',lane_f,'OSM directional lanes tag'),('B',lane_b,'OSM directional lanes tag')]
+                  elif total_lanes:
+                      per=max(1,int(round(total_lanes/2.0)))
+                      dirs=[('F',per,'documented two-way split of OSM total lanes tag'),('B',per,'documented two-way split of OSM total lanes tag')]
+                  else:
+                      dirs=[('F',1,'documented directional-lane fallback from OSM highway class'),('B',1,'documented directional-lane fallback from OSM highway class')]
+              sp=parse_speed(p.get('maxspeed'))
+              for d,lanes,lsrc in dirs:
+                  rows.append({
+                      'link_id':f"{p.get('@id',p.get('id',way_count))}_{d}",
+                      'osm_way_id':p.get('@id',p.get('id','')),
+                      'highway':hw,'facility_type':fac,'lanes':lanes,
+                      'capacity_vph':cap_lane[fac]*lanes,
+                      'free_speed_kph':sp if sp is not None else speed_default[fac],
+                      'lanes_source':lsrc,
+                      'capacity_source':f'documented M04 facility-class capacity rule from OSM highway={hw}',
+                      'free_speed_source':'OSM maxspeed tag' if sp is not None else f'documented M04 speed fallback from OSM highway={hw}',
+                  })
+          if len(rows)<40: raise SystemExit(f'too few directed links: {len(rows)}')
+          fields=list(rows[0])
+          with open('m04_output/link.csv','w',newline='',encoding='utf-8-sig') as f:
+              w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
+
+          cap_counts=Counter(r['capacity_vph'] for r in rows); lane_counts=Counter(r['lanes'] for r in rows)
+          modal_cap_value,modal_cap_n=cap_counts.most_common(1)[0]
+          modal_lane_value,modal_lane_n=lane_counts.most_common(1)[0]
+          modal_cap_share=modal_cap_n/len(rows); modal_lane_share=modal_lane_n/len(rows)
+          capacity_homogeneous=modal_cap_share>0.6
+          lanes_homogeneous=modal_lane_share>0.8
+          required=['capacity_source','lanes_source','free_speed_source']
+          named=sum(all(str(r[c]).strip().lower() not in {'','none','nan','na','n/a','null'} for c in required) for r in rows)
+          source_coverage=named/len(rows)
+          low_provenance=source_coverage<0.5
+          by_fac=defaultdict(list)
+          for r in rows: by_fac[r['facility_type']].append(float(r['capacity_vph']))
+          medians={k:sorted(v)[len(v)//2] for k,v in by_fac.items()}
+          distinct_medians=len({round(v,1) for v in medians.values()})
+          differentiates=distinct_medians>1 or len(by_fac)==1
+          fails=(capacity_homogeneous or lanes_homogeneous) and (low_provenance or not differentiates)
+          per_lane=[r['capacity_vph']/max(r['lanes'],1) for r in rows]
+          out_speed=sum(not (15.0<=r['free_speed_kph']<=140.0) for r in rows)
+          out_cap=sum(not (300.0<=x<=2600.0) for x in per_lane)
+          summary={
+              'candidate':'Kearny, Arizona','bbox':'-110.940,33.035,-110.875,33.082',
+              'source':'Geofabrik Arizona OpenStreetMap extract','directed_links':len(rows),
+              'osm_highway_ways_retained':way_count,'facility_counts':dict(Counter(r['facility_type'] for r in rows)),
+              'highway_counts':dict(Counter(r['highway'] for r in rows)),
+              'modal_capacity_share':modal_cap_share,'modal_capacity_value':modal_cap_value,
+              'modal_lane_share':modal_lane_share,'modal_lane_value':modal_lane_value,
+              'capacity_homogeneous':capacity_homogeneous,'lanes_homogeneous':lanes_homogeneous,
+              'source_coverage':source_coverage,'low_provenance':low_provenance,
+              'facility_median_capacity_vph':medians,'distinct_facility_medians':distinct_medians,
+              'differentiates':differentiates,'free_speed_out_of_range_links':out_speed,
+              'capacity_per_lane_out_of_range_links':out_cap,
+              'attributes_coded_not_defaulted':'FAIL' if fails else 'PASS',
+              'm04_qualification':'PASS' if ((capacity_homogeneous or lanes_homogeneous) and not fails and source_coverage>=0.5 and differentiates) else 'NOT_QUALIFIED',
+              'rule':'fails = (capacity_homogeneous or lanes_homogeneous) and (low_provenance or not differentiates)',
+              'thresholds':{'max_share_single_capacity_value':0.6,'max_share_single_lane_value':0.8,'min_attribute_source_coverage':0.5},
+              'boundary':'M04 tests the C6 false-positive direction only; this is not a full city-model readiness score.'
+          }
+          Path('m04_output/c6_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          assert capacity_homogeneous or lanes_homogeneous, 'candidate did not trigger homogeneity warning; M04 not exercised'
+          assert source_coverage>=0.5, summary
+          assert differentiates, summary
+          assert not fails, summary
+          assert summary['m04_qualification']=='PASS',summary
+          PY
+
+      - name: Persist successful real-network probe to Drive
+        shell: bash
+        env:
+          CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          DEST="$DRIVE_ROOT/${GITHUB_SHA:0:12}"
+          rclone copy m04_output "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --transfers 4 --checkers 8 --retries 6 --low-level-retries 12
+          LOCAL="$(rclone size m04_output --json)"
+          REMOTE="$(rclone size "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --json)"
+          python - "$LOCAL" "$REMOTE" <<'PY'
+          import json,sys
+          a=json.loads(sys.argv[1]);b=json.loads(sys.argv[2]);print('local',a);print('remote',b)
+          assert a['count']==b['count'] and a['bytes']==b['bytes'],(a,b)
+          PY
+          rm -f "$CONFIG_FILE"
+
+      - name: Upload M04 qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencity-m04-kearny-c6-probe
+          path: m04_output/
+          if-no-files-found: error
+          retention-days: 30

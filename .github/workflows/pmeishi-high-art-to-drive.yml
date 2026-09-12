@@ -1,7 +1,7 @@
 name: PMeishi High-Art Archive to Drive
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     branches: [main]
     paths:
@@ -19,7 +19,7 @@ jobs:
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       MANIFEST: manifests/pmeishi-high-art-20260912.json
-      OUTPUT_DIR: ${{ runner.temp }}/pmeishi-high-art-archive
+      OUTPUT_DIR: /tmp/pmeishi-high-art-archive
       DRIVE_PATH: ResearchData/PMeishi_HighArt_Archive_20260912
     steps:
       - name: Check Google Drive runtime config

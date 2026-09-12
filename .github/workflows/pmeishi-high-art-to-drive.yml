@@ -69,7 +69,7 @@ jobs:
             --manifest "$MANIFEST" \
             --output-dir "$OUTPUT_DIR"
           test -f "$OUTPUT_DIR/archive-index.json"
-          find "$OUTPUT_DIR" -type f | sort | head -n 30
+          find "$OUTPUT_DIR" -type f | sort | sed -n '1,30p'
 
       - name: Measure local archive
         id: local

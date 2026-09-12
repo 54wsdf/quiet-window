@@ -85,6 +85,15 @@ jobs:
           print('bytes=' + str(sum(p.stat().st_size for p in files)))
           PY
 
+      - name: Preserve archive as GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmeishi-high-art-archive-20260912
+          path: /tmp/pmeishi-high-art-archive
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
       - name: Copy archive directly to Google Drive
         shell: bash
         env:

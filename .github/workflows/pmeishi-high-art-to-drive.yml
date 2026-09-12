@@ -1,0 +1,132 @@
+name: PMeishi High-Art Archive to Drive
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'manifests/pmeishi-high-art-20260912.json'
+      - 'scripts/archive_pmeishi_sources_to_drive.py'
+      - '.github/workflows/pmeishi-high-art-to-drive.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  archive-to-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      MANIFEST: manifests/pmeishi-high-art-20260912.json
+      OUTPUT_DIR: ${{ runner.temp }}/pmeishi-high-art-archive
+      DRIVE_PATH: ResearchData/PMeishi_HighArt_Archive_20260912
+    steps:
+      - name: Check Google Drive runtime config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2
+            exit 3
+          fi
+
+      - name: Checkout helper repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests beautifulsoup4 pillow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          rclone version | head -n 2
+
+      - name: Restore temporary rclone config
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire high-art P-card images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/archive_pmeishi_sources_to_drive.py \
+            --manifest "$MANIFEST" \
+            --output-dir "$OUTPUT_DIR"
+          test -f "$OUTPUT_DIR/archive-index.json"
+          find "$OUTPUT_DIR" -type f | sort | head -n 30
+
+      - name: Measure local archive
+        id: local
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from pathlib import Path
+          root = Path(os.environ['OUTPUT_DIR'])
+          files = [p for p in root.rglob('*') if p.is_file()]
+          print('files=' + str(len(files)))
+          print('bytes=' + str(sum(p.stat().st_size for p in files)))
+          PY
+
+      - name: Copy archive directly to Google Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          rclone copy "$OUTPUT_DIR" "$REMOTE_NAME:$DRIVE_PATH" \
+            --config "$CONFIG_FILE" \
+            --retries 8 \
+            --low-level-retries 20 \
+            --transfers 4 \
+            --checkers 8 \
+            --stats 30s \
+            --stats-one-line
+
+      - name: Verify remote file count and bytes
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+          LOCAL_FILES: ${{ steps.local.outputs.files }}
+          LOCAL_BYTES: ${{ steps.local.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          REMOTE_JSON="$(rclone size "$REMOTE_NAME:$DRIVE_PATH" --config "$CONFIG_FILE" --json)"
+          REMOTE_FILES="$(printf '%s' "$REMOTE_JSON" | jq -r '.count')"
+          REMOTE_BYTES="$(printf '%s' "$REMOTE_JSON" | jq -r '.bytes')"
+          echo "local files=$LOCAL_FILES bytes=$LOCAL_BYTES"
+          echo "remote files=$REMOTE_FILES bytes=$REMOTE_BYTES"
+          if [[ "$REMOTE_FILES" != "$LOCAL_FILES" || "$REMOTE_BYTES" != "$LOCAL_BYTES" ]]; then
+            echo 'Remote verification failed' >&2
+            exit 7
+          fi
+          echo 'REMOTE_VERIFIED_DRIVE'
+
+      - name: Clean up temporary rclone config
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

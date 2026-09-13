@@ -1,0 +1,53 @@
+name: PMeishi High-Art R4 Artifact
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'manifests/pmeishi-high-art-r4-20260913.json'
+      - '.github/workflows/pmeishi-high-art-r4-artifact.yml'
+      - 'scripts/archive_pmeishi_sources_to_drive.py'
+
+permissions:
+  contents: read
+
+jobs:
+  acquire-and-preserve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MANIFEST: manifests/pmeishi-high-art-r4-20260913.json
+      OUTPUT_DIR: /tmp/pmeishi-high-art-r4
+    steps:
+      - name: Checkout helper repository
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pillow
+      - name: Acquire round-4 images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/archive_pmeishi_sources_to_drive.py --manifest "$MANIFEST" --output-dir "$OUTPUT_DIR"
+          test -f "$OUTPUT_DIR/archive-index.json"
+      - name: Measure archive
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root=Path(os.environ['OUTPUT_DIR']); files=[p for p in root.rglob('*') if p.is_file()]
+          print(json.dumps({'files':len(files),'bytes':sum(p.stat().st_size for p in files),'images':len([p for p in files if p.suffix.lower() in {'.jpg','.jpeg','.png','.webp','.gif'}])}))
+          PY
+      - name: Preserve round-4 archive as GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmeishi-high-art-r4-20260913
+          path: /tmp/pmeishi-high-art-r4
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

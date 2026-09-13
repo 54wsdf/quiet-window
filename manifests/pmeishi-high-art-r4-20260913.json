@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "dataset_id": "pmeishi-high-art-r4-20260913",
+  "drive_path": "ResearchData/PMeishi_HighArt_R4_20260913",
+  "purpose": "Round-4 private visual-research mirror of high-art Idolmaster producer business-card references.",
+  "rights_note": "Public preview images are mirrored for private research/archive only. Preserve creator/source attribution and do not infer redistribution rights.",
+  "entries": [
+    {"id":"R4-01","tier":"A+","creator":"ちゃありぃ","title":"Folded graduation album / Super Chat UI / sheet-music P-card systems","page_urls":["https://note.com/charlie011/n/nd225bf3f24c9"],"direct_image_urls":[]},
+    {"id":"R4-02","tier":"A+","creator":"Happiness Yamada / OYC","title":"Dark-blue P card with UV emboss and gold foil","page_urls":["https://note.com/oyc_print/n/n937de27f1b2e"],"direct_image_urls":[]},
+    {"id":"R4-03","tier":"A+","creator":"さばみそ","title":"Gakumas interface-reconstruction cards including Shinozawa Hiro x Danganronpa","page_urls":["https://note.com/nifty_auk3307/n/n18c5c4f917d1"],"direct_image_urls":[]},
+    {"id":"R4-04","tier":"A+","creator":"tossie","title":"Gakumas cut-out custom-card trilogy","page_urls":["https://note.com/tossie18/n/n16c1d24936aa","https://note.com/tossie18/n/n2c832b001c3a","https://note.com/tossie18/n/ncc4d2bcdb003"],"direct_image_urls":[]},
+    {"id":"R4-05","tier":"A","creator":"みみks","title":"Shinozawa Hiro low-layer shape-sculpted custom card","page_urls":["https://note.com/large_crow1991/n/nfddd4023475e"],"direct_image_urls":[]},
+    {"id":"R4-06","tier":"A","creator":"ちよこのちかく。","title":"PowerPoint semantic-vector P cards with fictional metadata and integrated QR","page_urls":["https://note.com/chocosoba/n/n89e281e0f002"],"direct_image_urls":[]}
+  ]
+}

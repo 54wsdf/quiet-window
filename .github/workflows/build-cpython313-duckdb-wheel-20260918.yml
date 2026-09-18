@@ -1,0 +1,40 @@
+name: Build CPython 3.13 DuckDB Wheel Cache 2026-09-18
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-cpython313-duckdb-wheel-20260918.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Download binary wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p wheels
+          python -m pip download --only-binary=:all: --no-deps --dest wheels 'duckdb==1.5.5'
+          python - <<'PY'
+          import glob,hashlib,json,os
+          fs=glob.glob('wheels/*.whl')
+          assert len(fs)==1, fs
+          p=fs[0]
+          print(json.dumps({'file':os.path.basename(p),'bytes':os.path.getsize(p),'sha256':hashlib.sha256(open(p,'rb').read()).hexdigest()},indent=2))
+          PY
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cpython313-linux-wheel
+          path: wheels/*.whl
+          if-no-files-found: error
+          retention-days: 3

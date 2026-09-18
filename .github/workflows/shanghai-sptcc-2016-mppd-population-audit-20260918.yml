@@ -1,0 +1,184 @@
+name: Shanghai SPTCC 2016 MPPD Population Audit 2026-09-18
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/shanghai-sptcc-2016-mppd-population-audit-20260918.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/08_mppd_2016_population_audit_20260918
+
+    steps:
+      - name: Prepare runtime and protected storage
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GDRIVE_CONFIG_B64:-}" || { echo 'Missing GDRIVE_RCLONE_CONFIG_B64' >&2; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone jq
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2' 'pandas>=2.2,<3' 'pyarrow>=18,<24'
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/sh-audit/input" "$RUNNER_TEMP/sh-audit/output"
+
+      - name: Download three qualified strict-journey Parquets
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sh-audit/input"
+          for day in 20160701 20160802 20160901; do
+            f="SPTCC-${day}.strict_metro_journeys.parquet"
+            rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$f" "$f" \
+              --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 1 --checkers 4
+          done
+          ls -lh
+
+      - name: Run three-day scientific population audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          export INPUT_DIR="$RUNNER_TEMP/sh-audit/input"
+          export OUTPUT_DIR="$RUNNER_TEMP/sh-audit/output"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import duckdb
+          import pandas as pd
+
+          inp=Path(os.environ['INPUT_DIR']); out=Path(os.environ['OUTPUT_DIR']); out.mkdir(parents=True,exist_ok=True)
+          con=duckdb.connect(str(out/'audit.duckdb'))
+          con.execute('PRAGMA threads=4')
+          con.execute("PRAGMA memory_limit='10GB'")
+          days=['20160701','20160802','20160901']
+          summaries=[]
+          token_sets={}
+          od_sets={}
+
+          for day in days:
+              p=str(inp/f'SPTCC-{day}.strict_metro_journeys.parquet')
+              con.execute(f"CREATE OR REPLACE VIEW j AS SELECT * FROM read_parquet('{p}')")
+              cols=[x[0] for x in con.execute('DESCRIBE j').fetchall()]
+              required={'entry_ts','exit_ts','entry_station','exit_station','duration_sec','entry_line','exit_line','same_station'}
+              missing=sorted(required-set(cols))
+              if missing: raise SystemExit(f'{day}: missing columns {missing}')
+              n=con.execute('SELECT count(*) FROM j').fetchone()[0]
+              station=con.execute('''WITH s AS (SELECT entry_station station FROM j UNION SELECT exit_station FROM j)
+                  SELECT count(*) FROM s''').fetchone()[0]
+              same=con.execute('SELECT count(*) FROM j WHERE entry_line=exit_line AND entry_line<>\'\'').fetchone()[0]
+              cross=con.execute('SELECT count(*) FROM j WHERE entry_line<>exit_line AND entry_line<>\'\' AND exit_line<>\'\'').fetchone()[0]
+              unknown=con.execute("SELECT count(*) FROM j WHERE entry_line='' OR exit_line='' ").fetchone()[0]
+              od_count=con.execute("SELECT count(*) FROM (SELECT entry_station,exit_station FROM j GROUP BY 1,2)").fetchone()[0]
+              od_ge20=con.execute("SELECT count(*) FROM (SELECT entry_station,exit_station,count(*) n FROM j GROUP BY 1,2 HAVING n>=20)").fetchone()[0]
+              od_ge50=con.execute("SELECT count(*) FROM (SELECT entry_station,exit_station,count(*) n FROM j GROUP BY 1,2 HAVING n>=50)").fetchone()[0]
+              od_mass_ge20=con.execute("SELECT coalesce(sum(n),0) FROM (SELECT count(*) n FROM j GROUP BY entry_station,exit_station HAVING count(*)>=20)").fetchone()[0]
+              od_mass_ge50=con.execute("SELECT coalesce(sum(n),0) FROM (SELECT count(*) n FROM j GROUP BY entry_station,exit_station HAVING count(*)>=50)").fetchone()[0]
+              med,p90,p99=con.execute('SELECT quantile_cont(duration_sec,.5),quantile_cont(duration_sec,.9),quantile_cont(duration_sec,.99) FROM j').fetchone()
+              token_df=con.execute('''WITH a AS (SELECT entry_station station,count(*) entry_n,0::BIGINT exit_n FROM j GROUP BY 1),
+                  b AS (SELECT exit_station station,0::BIGINT entry_n,count(*) exit_n FROM j GROUP BY 1),
+                  c AS (SELECT * FROM a UNION ALL SELECT * FROM b)
+                  SELECT station,sum(entry_n)::BIGINT entry_n,sum(exit_n)::BIGINT exit_n FROM c GROUP BY 1 ORDER BY station''').fetchdf()
+              token_df.to_csv(out/f'{day}_station_tokens.csv',index=False)
+              token_sets[day]=set(token_df.station.astype(str))
+              line_df=con.execute('''SELECT entry_line,exit_line,count(*)::BIGINT n FROM j
+                  WHERE entry_line<>'' AND exit_line<>'' GROUP BY 1,2 ORDER BY n DESC''').fetchdf()
+              line_df.to_csv(out/f'{day}_line_pair_matrix.csv',index=False)
+              cross_od=con.execute('''SELECT entry_line,exit_line,entry_station,exit_station,count(*)::BIGINT n,
+                  quantile_cont(duration_sec,.5) duration_p50,quantile_cont(duration_sec,.9) duration_p90
+                  FROM j WHERE entry_line<>exit_line AND entry_line<>'' AND exit_line<>''
+                  GROUP BY 1,2,3,4 ORDER BY n DESC''').fetchdf()
+              cross_od.to_csv(out/f'{day}_cross_line_od.csv',index=False)
+              od_sets[day]=set(zip(cross_od.entry_station.astype(str),cross_od.exit_station.astype(str)))
+              hourly=con.execute('''SELECT extract(hour from entry_ts)::INTEGER entry_hour,count(*)::BIGINT n
+                  FROM j GROUP BY 1 ORDER BY 1''').fetchdf(); hourly.to_csv(out/f'{day}_entry_hourly.csv',index=False)
+              pulse={}
+              for w in (5,15,60):
+                  x=con.execute(f'''WITH b AS (
+                    SELECT exit_station,floor(epoch(exit_ts)/{w})::BIGINT bin,count(*) n FROM j GROUP BY 1,2)
+                    SELECT count(*) bins,quantile_cont(n,.5) p50,quantile_cont(n,.9) p90,quantile_cont(n,.99) p99,max(n) mx,
+                           sum(n) FILTER(WHERE n>=2) ge2,sum(n) FILTER(WHERE n>=5) ge5 FROM b''').fetchone()
+                  pulse[str(w)]={'bins':int(x[0]),'p50':float(x[1]),'p90':float(x[2]),'p99':float(x[3]),'max':int(x[4]),'mass_ge2':int(x[5] or 0),'mass_ge5':int(x[6] or 0)}
+              summaries.append({'day':day,'rows':int(n),'station_tokens':int(station),'same_line_token_journeys':int(same),
+                'cross_line_token_journeys':int(cross),'unknown_line_token_journeys':int(unknown),'od_pairs':int(od_count),
+                'od_pairs_ge20':int(od_ge20),'od_pairs_ge50':int(od_ge50),'journey_mass_in_od_ge20':int(od_mass_ge20),
+                'journey_mass_in_od_ge50':int(od_mass_ge50),'duration_sec':{'median':med,'p90':p90,'p99':p99},'exit_pulse':pulse})
+
+          all_tokens=set.intersection(*(token_sets[d] for d in days))
+          union_tokens=set.union(*(token_sets[d] for d in days))
+          all_cross_od=set.intersection(*(od_sets[d] for d in days))
+          union_cross_od=set.union(*(od_sets[d] for d in days))
+
+          union_sql=' UNION ALL '.join([f"SELECT '{d}' day,* FROM read_parquet('{inp/f'SPTCC-{d}.strict_metro_journeys.parquet'}')" for d in days])
+          con.execute(f'CREATE OR REPLACE VIEW allj AS {union_sql}')
+          recurrence=con.execute('''WITH x AS (
+              SELECT day,entry_station,exit_station,count(*) n FROM allj GROUP BY 1,2,3), y AS (
+              SELECT entry_station,exit_station,count(*) days_present,sum(n) total_n,min(n) min_day_n,max(n) max_day_n
+              FROM x GROUP BY 1,2)
+              SELECT days_present,count(*) od_pairs,sum(total_n) journey_mass FROM y GROUP BY 1 ORDER BY 1''').fetchdf()
+          recurrence.to_csv(out/'crossday_od_recurrence.csv',index=False)
+          line_day=con.execute('''SELECT day,entry_line,exit_line,count(*)::BIGINT n FROM allj
+              WHERE entry_line<>'' AND exit_line<>'' GROUP BY 1,2,3 ORDER BY 2,3,1''').fetchdf()
+          line_day.to_csv(out/'crossday_line_pair_counts.csv',index=False)
+          pv=line_day.pivot_table(index=['entry_line','exit_line'],columns='day',values='n',fill_value=0)
+          corr=pv.corr(method='spearman')
+          corr.to_csv(out/'crossday_line_pair_spearman.csv')
+
+          result={'schema':'mppd.shanghai.sptcc-2016.population-audit.v1','generated_by':'quiet-window GitHub Actions',
+            'days':summaries,'crossday':{'station_tokens_all_days':len(all_tokens),'station_tokens_union':len(union_tokens),
+            'cross_line_od_all_days':len(all_cross_od),'cross_line_od_union':len(union_cross_od),
+            'line_pair_spearman':corr.to_dict()},
+            'boundaries':['Strict journey layer only; no card linkage or virtual-transfer stitching in this audit.',
+            'entry_line/exit_line are source station-token line labels, not inferred passenger routes.',
+            'Cross-line token journey is not equivalent to one-transfer journey until historical topology mapping is applied.']}
+          (out/'qualification.json').write_text(json.dumps(result,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+          print(json.dumps(result,ensure_ascii=False,indent=2,default=str))
+          con.close()
+          PY
+          rm -f "$RUNNER_TEMP/sh-audit/output/audit.duckdb"
+          ls -lh "$OUTPUT_DIR"
+
+      - name: Upload aggregate evidence to Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/${GITHUB_RUN_ID}"
+          rclone copy "$RUNNER_TEMP/sh-audit/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15 --transfers 4 --checkers 8
+          rclone check "$RUNNER_TEMP/sh-audit/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --size-only --one-way
+          printf '{"state":"QUALIFIED_AGGREGATE_AUDIT","github_run_id":"%s","github_sha":"%s","build_path":"%s"}\n' "$GITHUB_RUN_ID" "$GITHUB_SHA" "$BUILD" > "$RUNNER_TEMP/LATEST_QUALIFIED.json"
+          rclone copyto "$RUNNER_TEMP/LATEST_QUALIFIED.json" "$REMOTE_NAME:$OUT_DRIVE/LATEST_QUALIFIED.json" --config "$CONFIG_FILE" --retries 6 --low-level-retries 15
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-sptcc-2016-mppd-population-audit
+          path: ${{ runner.temp }}/sh-audit/output/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean protected configuration
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

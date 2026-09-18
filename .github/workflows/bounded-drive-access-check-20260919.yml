@@ -1,0 +1,63 @@
+name: Bounded Drive Access Check 2026-09-19
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bounded-drive-access-check-20260919.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Install storage client with deadline
+        run: |
+          set -euo pipefail
+          sudo timeout 60s apt-get update -qq
+          sudo timeout 60s apt-get install -y -qq rclone
+      - name: Check authorization without reading passenger data
+        env:
+          CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/access-result"
+          export RESULT="$RUNNER_TEMP/access-result/access.json"
+          export CONFIG="$RUNNER_TEMP/access-rclone.conf"
+          export ERR="$RUNNER_TEMP/access-error.txt"
+          if [[ -z "${CONFIG_B64:-}" ]]; then
+            printf '{"state":"MISSING_CONFIG","passenger_data_read":false}\n' > "$RESULT"
+            cat "$RESULT"
+            exit 3
+          fi
+          printf '%s' "$CONFIG_B64" | base64 --decode > "$CONFIG"
+          REMOTE="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG")"
+          set +e
+          timeout 25s rclone lsf "$REMOTE:" --dirs-only --max-depth 1 --config "$CONFIG" --retries 1 --low-level-retries 1 --contimeout 5s --timeout 10s > /dev/null 2> "$ERR"
+          CODE=$?
+          set -e
+          export CODE
+          python - <<'PY'
+          import json,os,pathlib
+          text=pathlib.Path(os.environ['ERR']).read_text(errors='replace')
+          code=int(os.environ['CODE'])
+          state='AUTHORIZED' if code==0 else ('INVALID_GRANT' if 'invalid_grant' in text else ('DEADLINE' if code==124 else 'ACCESS_FAILED'))
+          result={'state':state,'exit_code':code,'passenger_data_read':False,'error_log_published':False,'run_id':os.environ['GITHUB_RUN_ID'],'source_sha':os.environ['GITHUB_SHA']}
+          pathlib.Path(os.environ['RESULT']).write_text(json.dumps(result,indent=2))
+          print(json.dumps(result))
+          PY
+          rm -f "$ERR" "$CONFIG"
+          exit "$CODE"
+      - name: Preserve only sanitized access receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bounded-drive-access-receipt
+          path: ${{ runner.temp }}/access-result/access.json
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Clean credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/access-rclone.conf" "$RUNNER_TEMP/access-error.txt"

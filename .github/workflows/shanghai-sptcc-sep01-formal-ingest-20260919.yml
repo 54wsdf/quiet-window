@@ -1,6 +1,9 @@
 name: Shanghai SPTCC Sep01 Formal Card Chronology 2026-09-19
 
 on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-sptcc-sep01-formal-ingest-20260919.yml'
   workflow_dispatch:
 
 permissions:
@@ -54,7 +57,7 @@ jobs:
           echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/formal/input" "$RUNNER_TEMP/formal/output"
 
-      - name: Download and verify Jul01 raw
+      - name: Download and verify Sep01 raw
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
@@ -70,7 +73,7 @@ jobs:
           ACTUAL_SHA="$(sha256sum "$RAW" | awk '{print $1}')"
           test "$ACTUAL_SHA" = "$EXPECTED_SHA256"
 
-      - name: Build Jul01 formal card-linked journey candidate
+      - name: Build Sep01 formal card-linked journey candidate
         shell: bash
         run: |
           set -euo pipefail

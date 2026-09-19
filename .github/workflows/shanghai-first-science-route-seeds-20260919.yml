@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       FORMAL_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919
@@ -77,6 +77,17 @@ jobs:
             --station "$RUNNER_TEMP/route-seeds/static/station.txt" \
             --connections "$RUNNER_TEMP/route-seeds/static/connections_by_station_name.json" \
             --out-dir "$RUNNER_TEMP/route-seeds/output"
+      - name: Persist bounded route seeds to protected Drive
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          OUT_DRIVE="transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/route_seeds/builds/$GITHUB_RUN_ID"
+          rclone copy "$RUNNER_TEMP/route-seeds/output" "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/route-seeds/output" "$REMOTE_NAME:$OUT_DRIVE" --config "$CONFIG_FILE" --size-only --one-way
+
       - uses: actions/upload-artifact@v4
         with:
           name: shanghai-first-science-structural-route-seeds

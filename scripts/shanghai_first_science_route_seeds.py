@@ -4,7 +4,7 @@ import argparse,csv,gzip,json,re
 from collections import Counter,defaultdict
 from pathlib import Path
 import duckdb
-from shanghai_route_frontier import build_adjacency,solve_frontier,enumerate_efficient_paths
+from shanghai_route_frontier import build_adjacency,solve_frontier,target_frontier
 
 ALIASES={"淞浜路":"淞滨路","李子园路":"李子园","上海野生动物园":"野生动物园","外高桥保税区北":"外高桥保税区北站","外高桥保税区南":"外高桥保税区南站","上海大学站":"上海大学"}
 HUAQIAO={"花桥","光明路","兆丰路","安亭","上海汽车城","昌吉东路","上海赛车场"}
@@ -98,14 +98,37 @@ def main():
     for day in ["20160701","20160802","20160901"]:
         p=a.journey_dir/f"SPTCC-{day}.formal_mppd_journeys.csv.gz"
         ps=str(p).replace("'","''")
-        parts.append("SELECT '"+day+"' AS day,origin_token,destination_token,substr(entry_time,12,8) AS clock,count(*)::BIGINT AS n FROM read_csv_auto('"+ps+"',header=true,all_varchar=true) GROUP BY 1,2,3,4")
+        parts.append("""
+          SELECT '"""+day+"""' AS day,
+                 origin_line,origin_station,destination_line,destination_station,
+                 CASE
+                   WHEN origin_line='11' AND destination_line='11' THEN
+                     CASE
+                       WHEN substr(entry_time,12,8)>='07:00:00' AND substr(entry_time,12,8)<'08:30:00' THEN 'AM_0700_0830'
+                       WHEN substr(entry_time,12,8)>='09:00:00' AND substr(entry_time,12,8)<'16:00:00' THEN 'OFF_0900_1600'
+                       WHEN substr(entry_time,12,8)>='17:00:00' AND substr(entry_time,12,8)<'19:30:00' THEN 'PM_1700_1930'
+                       ELSE 'OTHER' END
+                   WHEN origin_line='02' AND destination_line='02' THEN
+                     CASE
+                       WHEN substr(entry_time,12,8)>='07:00:00' AND substr(entry_time,12,8)<'09:00:00' THEN 'AM_0700_0900'
+                       WHEN substr(entry_time,12,8)>='09:00:00' AND substr(entry_time,12,8)<'16:00:00' THEN 'OFF_0900_1600'
+                       WHEN substr(entry_time,12,8)>='17:30:00' AND substr(entry_time,12,8)<'19:00:00' THEN 'PM_DOC_1730_1900'
+                       WHEN (substr(entry_time,12,8)>='17:00:00' AND substr(entry_time,12,8)<'17:30:00')
+                         OR (substr(entry_time,12,8)>='19:00:00' AND substr(entry_time,12,8)<'19:30:00') THEN 'PM_SHOULDER'
+                       ELSE 'OTHER' END
+                   ELSE NULL END AS period,
+                 count(*)::BIGINT AS n
+          FROM read_csv_auto('"""+ps+"""',header=true,all_varchar=true)
+          WHERE (origin_line='11' AND destination_line='11')
+             OR (origin_line='02' AND destination_line='02')
+          GROUP BY 1,2,3,4,5,6
+        """)
     rows=con.execute(" UNION ALL ".join(parts)).fetchall(); con.close()
 
     support=Counter(); od_mass=Counter()
-    for day,ot,dt,clock,n in rows:
-        o=parse_token(ot)[2]; d=parse_token(dt)[2]; fam=classify(o,d,trunk)
+    for day,ol,o,dl,d,period,n in rows:
+        fam=classify(o,d,trunk)
         if not fam: continue
-        period=l11_period(clock) if fam.startswith("L11_") else l2_period(clock)
         support[(fam,day,period,o,d)]+=int(n); od_mass[(fam,o,d)]+=int(n)
 
     with (a.out_dir/"first_science_od_support.csv").open("w",encoding="utf-8",newline="") as f:
@@ -117,24 +140,35 @@ def main():
     with gzip.open(a.out_dir/"first_science_structural_route_seeds.jsonl.gz","wt",encoding="utf-8") as out:
         for world_name,world in worlds.items():
             adj=build_adjacency(world["nodes"],world["edges"]); groups=world["endpoint_groups"]
+            edge_cost={}
+            for x,y,kind in world["edges"]:
+                edge_cost[frozenset((x,y))]=(1,0) if kind=="ride" else (0,1)
             by_origin=defaultdict(list)
             for fam,o,d in ods:
                 if o in groups and d in groups: by_origin[o].append((fam,d))
                 else: fstats[fam]["missing_endpoint"]+=1
-            for o,targets in sorted(by_origin.items()):
+            total_origins=len(by_origin)
+            for oi,(o,targets) in enumerate(sorted(by_origin.items()),start=1):
                 labels=solve_frontier(adj,groups[o])
                 for fam,d in sorted(targets):
-                    front=enumerate_efficient_paths(labels,groups[d]); vectors=[]
+                    front=target_frontier(labels,groups[d]); vectors=[]
                     for (rides,changes),rec in front.items():
-                        vectors.append({"ride_intervals":rides,"line_changes":changes,"path_count":rec["count"],"paths":[list(p) for p in rec["paths"]]})
-                        stats["cost_vectors"]+=1; stats["path_instances"]+=rec["count"]
+                        path=list(rec["path"])
+                        rr=tt=0
+                        for x,y in zip(path,path[1:]):
+                            dr,dt=edge_cost[frozenset((x,y))]; rr+=dr; tt+=dt
+                        if (rr,tt)!=(rides,changes):
+                            raise AssertionError((world_name,o,d,(rides,changes),(rr,tt),path))
+                        vectors.append({"ride_intervals":rides,"line_changes":changes,"path_count":rec["count"],"representative_path":path})
+                        stats["cost_vectors"]+=1; stats["path_instances_counted_not_expanded"]+=rec["count"]
                         stats["max_line_changes"]=max(stats["max_line_changes"],changes); stats["max_path_ties"]=max(stats["max_path_ties"],rec["count"])
                     out.write(json.dumps({"world":world_name,"family":fam,"origin":o,"destination":d,"formal_journey_mass_all_days":od_mass[(fam,o,d)],"vectors":vectors},ensure_ascii=False,separators=(",",":"))+"\n")
                     stats["od_world_records"]+=1; fstats[fam]["od_world_records"]+=1
+                print(json.dumps({"phase":"frontier","world":world_name,"origin_index":oi,"origin_total":total_origins,"origin":o,"od_records":stats["od_world_records"]},ensure_ascii=False),flush=True)
 
     families={}
     for fam in sorted({x[0] for x in ods}):
         families[fam]={"unique_od_pairs":len({(o,d) for f,o,d in ods if f==fam}),"formal_journey_mass_all_days":sum(n for (f,o,d),n in od_mass.items() if f==fam),"od_world_records":fstats[fam]["od_world_records"],"missing_endpoint":fstats[fam]["missing_endpoint"]}
-    q={"schema":"mppd.shanghai.first-science-structural-route-seeds.v1","families":families,"candidate_od_count":len(ods),"worlds":sorted(worlds),"route_stats":dict(stats),"boundaries":["Structural Pareto seeds only; not the final service-aware universe.","Station-token line prefixes are not treated as route truth.","Structurally dominated routes are not assigned zero probability.","Only aggregate OD/period support is emitted."]}
+    q={"schema":"mppd.shanghai.first-science-structural-route-seeds.v2","families":families,"candidate_od_count":len(ods),"worlds":sorted(worlds),"route_stats":dict(stats),"boundaries":["Structural Pareto seeds only; not the final service-aware universe.","All tied-path multiplicities are retained exactly as counts, but tied geometries are intentionally not expanded in this bounded stage.","The representative path is for geometry/service diagnostics only and is not assumed to represent all tied paths.","Station-token line prefixes are not treated as route truth.","Structurally dominated routes are not assigned zero probability.","Only aggregate OD/period support is emitted."]}
     (a.out_dir/"qualification.json").write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding="utf-8"); print(json.dumps(q,ensure_ascii=False,indent=2))
 if __name__=="__main__": main()

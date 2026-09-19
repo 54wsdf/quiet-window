@@ -1,0 +1,181 @@
+name: Shanghai SPTCC Aug Sep Raw Qualification 2026-09-19
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-sptcc-aug-sep-raw-qualification-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - day: '20160802'
+            source_file: SPTCC-20160802.csv
+            expected_bytes: '848528365'
+            expected_rows: '14789536'
+            expected_metro: '9729530'
+          - day: '20160901'
+            source_file: SPTCC-20160901.csv
+            expected_bytes: '866509391'
+            expected_rows: '15122570'
+            expected_metro: '9778560'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/09_mppd_raw_qualification_20260919
+      SOURCE_FILE: ${{ matrix.source_file }}
+      SOURCE_DAY: ${{ matrix.day }}
+      EXPECTED_BYTES: ${{ matrix.expected_bytes }}
+      EXPECTED_DATA_ROWS: ${{ matrix.expected_rows }}
+      EXPECTED_METRO_ROWS: ${{ matrix.expected_metro }}
+
+    steps:
+      - name: Prepare rclone
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GDRIVE_CONFIG_B64" || { echo "missing rclone secret" >&2; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/rawq/input" "$RUNNER_TEMP/rawq/output"
+
+      - name: Download raw AFC
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$SOURCE_FILE" \
+            "$RUNNER_TEMP/rawq/input/$SOURCE_FILE" \
+            --config "$CONFIG_FILE" --retries 6 --low-level-retries 20 \
+            --transfers 1 --checkers 4 --drive-chunk-size 128M \
+            --stats 60s --stats-one-line
+          test "$(stat -c%s "$RUNNER_TEMP/rawq/input/$SOURCE_FILE")" -eq "$EXPECTED_BYTES"
+
+      - name: Qualify raw source
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/rawq/input/$SOURCE_FILE"
+          OUT="$RUNNER_TEMP/rawq/output"
+          export RAW OUT EXPECTED_BYTES EXPECTED_DATA_ROWS EXPECTED_METRO_ROWS SOURCE_DAY
+          python - <<'PY'
+          import csv,hashlib,json,os,re
+          from collections import Counter
+          from pathlib import Path
+          raw=Path(os.environ['RAW']); out=Path(os.environ['OUT']); out.mkdir(parents=True,exist_ok=True)
+          exp_b=int(os.environ['EXPECTED_BYTES']); exp_r=int(os.environ['EXPECTED_DATA_ROWS']); exp_m=int(os.environ['EXPECTED_METRO_ROWS'])
+          post_anchor=[
+            "11号线迪士尼","11号线康新公路","11号线秀沿路",
+            "12号线漕宝路","12号线大木桥路","12号线东兰路","12号线顾戴路","12号线桂林公园","12号线汉中路",
+            "12号线虹漕路","12号线虹梅路","12号线虹莘路","12号线嘉善路","12号线龙漕路","12号线龙华",
+            "12号线龙华中路","12号线南京西路","12号线七莘路","12号线陕西南路",
+            "13号线汉中路","13号线淮海中路","13号线江宁路","13号线马当路","13号线南京西路",
+            "13号线世博大道","13号线世博会博物馆","13号线新天地","13号线自然博物馆"
+          ]
+          pa=set(post_anchor); h=hashlib.sha256()
+          with raw.open('rb') as f:
+              for block in iter(lambda:f.read(8*1024*1024),b''): h.update(block)
+          physical=data=metro=malformed=header=0
+          stations=Counter(); lines=Counter(); fares=Counter(); dates=Counter(); post=Counter(); cards=set()
+          min_dt=max_dt=None
+          headers={"卡ID","卡号","刷卡日期","交易日期","刷卡时间","刷卡站点","刷卡乘车类型","card_id"}
+          with raw.open('r',encoding='gb18030',errors='strict',newline='') as f:
+              rd=csv.reader(f)
+              for row in rd:
+                  physical+=1
+                  if not row: continue
+                  if physical==1 and headers.intersection(x.strip() for x in row):
+                      header=1; continue
+                  data+=1
+                  if len(row)!=7:
+                      malformed+=1; continue
+                  card,date,time,station,vehicle,money,prop=[x.strip().replace('\ufeff','') for x in row]
+                  if vehicle!='地铁': continue
+                  metro+=1; cards.add(card); stations[station]+=1; dates[date]+=1
+                  mm=re.match(r'^(\d+)号线',station); lines[mm.group(1).zfill(2) if mm else 'UNPARSED']+=1
+                  if station in pa: post[station]+=1
+                  try:
+                      x=float(money); fares['zero' if x==0 else ('positive' if x>0 else 'negative')]+=1
+                  except Exception: fares['unparsed']+=1
+                  dt=f"{date} {time}"
+                  min_dt=dt if min_dt is None or dt<min_dt else min_dt
+                  max_dt=dt if max_dt is None or dt>max_dt else max_dt
+          with (out/'station_token_counts.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f); w.writerow(['station_token','events']); w.writerows(sorted(stations.items()))
+          with (out/'post_anchor_token_counts.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f); w.writerow(['station_token','events','present'])
+              for k in post_anchor: w.writerow([k,post.get(k,0),post.get(k,0)>0])
+          result={
+            'schema':'mppd.shanghai.sptcc.raw-qualification.v1','source_file':raw.name,'source_day':os.environ['SOURCE_DAY'],
+            'source_bytes':raw.stat().st_size,'sha256':h.hexdigest(),'encoding':'gb18030_strict',
+            'physical_csv_rows':physical,'header_rows':header,'data_rows':data,'malformed_7col_rows':malformed,
+            'metro_rows':metro,'unique_metro_cards':len(cards),'metro_station_tokens':len(stations),
+            'metro_line_prefix_counts':dict(sorted(lines.items())),'metro_date_counts':dict(sorted(dates.items())),
+            'metro_time_range':[min_dt,max_dt],'metro_fare_sign_counts':dict(fares),
+            'post_anchor_registry_tokens_expected':len(post_anchor),
+            'post_anchor_registry_tokens_present':sum(post.get(k,0)>0 for k in post_anchor),
+            'post_anchor_registry_event_mass':sum(post.values()),
+            'post_anchor_present_tokens':[k for k in post_anchor if post.get(k,0)>0],
+            'post_anchor_absent_tokens':[k for k in post_anchor if post.get(k,0)==0],
+            'expected_checks':{
+              'bytes':{'expected':exp_b,'actual':raw.stat().st_size,'pass':raw.stat().st_size==exp_b},
+              'data_rows':{'expected':exp_r,'actual':data,'pass':data==exp_r},
+              'metro_rows':{'expected':exp_m,'actual':metro,'pass':metro==exp_m}},
+            'privacy':'No card identifier, raw row or cross-event passenger linkage is persisted.',
+            'claim_boundary':'Raw-source qualification only; no pairing, transfer stitching, route or train inference.'
+          }
+          (out/'qualification.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          if not all(v['pass'] for v in result['expected_checks'].values()): raise SystemExit('source scale mismatch')
+          PY
+
+      - name: Persist aggregate qualification
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID/$SOURCE_DAY"
+          rclone copy "$RUNNER_TEMP/rawq/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/rawq/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --size-only --one-way
+          printf '{"state":"QUALIFIED","day":"%s","github_run_id":"%s","github_sha":"%s","build_path":"%s"}\n' \
+            "$SOURCE_DAY" "$GITHUB_RUN_ID" "$GITHUB_SHA" "$BUILD" > "$RUNNER_TEMP/LATEST.json"
+          rclone copyto "$RUNNER_TEMP/LATEST.json" "$REMOTE_NAME:$OUT_DRIVE/LATEST_$SOURCE_DAY.json" --config "$CONFIG_FILE"
+
+      - name: Upload aggregate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-sptcc-raw-qualification-${{ matrix.day }}
+          path: ${{ runner.temp }}/rawq/output/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean protected data
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/rawq/input"
+          if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

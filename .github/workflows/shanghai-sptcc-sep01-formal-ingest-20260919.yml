@@ -14,6 +14,10 @@ jobs:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
       OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919
+      STRICT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+      STRICT_FILE: SPTCC-20160901.strict_metro_journeys.parquet
+      EXPECTED_STRICT_BYTES: '37762531'
+      EXPECTED_STRICT_SHA256: '40ed8be91ee916b9d0f5c2e46d9c7c23c8900e5080d232125bf7528a360bee3f'
       SOURCE_FILE: SPTCC-20160901.csv
       SOURCE_DATE: '2016-09-01'
       EXPECTED_BYTES: '866509391'
@@ -76,6 +80,20 @@ jobs:
             --out "$RUNNER_TEMP/formal/output/SPTCC-20160901.formal_mppd_journeys.csv.gz" \
             --audit-out "$RUNNER_TEMP/formal/output/SPTCC-20160901.formal_mppd_journeys.audit.json" \
             | tee "$RUNNER_TEMP/formal/ingest.log"
+
+      - name: Reconcile formal output to qualified strict subset
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2' 'pandas>=2.2,<3'
+          STRICT_LOCAL="$RUNNER_TEMP/formal/input/$STRICT_FILE"
+          rclone copyto "$REMOTE_NAME:$STRICT_DRIVE/$STRICT_FILE" "$STRICT_LOCAL" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          test "$(stat -c%s "$STRICT_LOCAL")" -eq "$EXPECTED_STRICT_BYTES"
+          test "$(sha256sum "$STRICT_LOCAL" | awk '{print $1}')" = "$EXPECTED_STRICT_SHA256"
+          python scripts/shanghai_jul01_formal_vs_strict.py             --strict "$STRICT_LOCAL"             --formal "$RUNNER_TEMP/formal/output/SPTCC-20160901.formal_mppd_journeys.csv.gz"             --formal-audit "$RUNNER_TEMP/formal/output/SPTCC-20160901.formal_mppd_journeys.audit.json"             --out "$RUNNER_TEMP/formal/output/SPTCC-20160901.formal_vs_strict.qualification.json"
 
       - name: Build private output receipt
         shell: bash
@@ -149,6 +167,7 @@ jobs:
           name: shanghai-sptcc-sep01-formal-audit
           path: |
             ${{ runner.temp }}/formal/output/SPTCC-20160901.formal_mppd_journeys.audit.json
+            ${{ runner.temp }}/formal/output/SPTCC-20160901.formal_vs_strict.qualification.json
             ${{ runner.temp }}/formal/output/receipt.json
           if-no-files-found: error
           retention-days: 14

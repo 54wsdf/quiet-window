@@ -1,0 +1,47 @@
+name: Shanghai Progression Prior Topology Crosswalk 2026-09-19
+
+on:
+  push:
+    paths:
+      - 'scripts/shanghai_progression_topology_crosswalk.py'
+      - '.github/workflows/shanghai-progression-topology-crosswalk-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  crosswalk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch pinned SODA static files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/crosswalk/snapshot"; OUT="$RUNNER_TEMP/crosswalk/output"
+          mkdir -p "$ROOT/train/base" "$OUT"
+          BASE='https://raw.githubusercontent.com/jeevanyue/metro/bb78b72ecadc57e0c8deedf9731a78a65ab62ef4'
+          curl -fsSL "$BASE/train/base/station.txt" -o "$ROOT/train/base/station.txt"
+          curl -fsSL "$BASE/train/base/timetable.txt" -o "$ROOT/train/base/timetable.txt"
+          curl -fsSL "$BASE/connections_by_station_name.json" -o "$RUNNER_TEMP/crosswalk/connections_by_station_name.json"
+      - name: Rebuild frozen progression prior
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_station_progression_prior.py --snapshot-root "$RUNNER_TEMP/crosswalk/snapshot" --out-dir "$RUNNER_TEMP/crosswalk/output"
+      - name: Crosswalk to actual ride topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_progression_topology_crosswalk.py \
+            --prior "$RUNNER_TEMP/crosswalk/output/segment_station_progression_prior.csv" \
+            --connections "$RUNNER_TEMP/crosswalk/connections_by_station_name.json" \
+            --out "$RUNNER_TEMP/crosswalk/output/topology_crosswalk.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-progression-topology-crosswalk
+          path: ${{ runner.temp }}/crosswalk/output/*
+          if-no-files-found: error
+          retention-days: 14

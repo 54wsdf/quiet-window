@@ -1,0 +1,156 @@
+name: Shanghai SPTCC Jul01 Formal Card Chronology 2026-09-19
+
+on:
+  push:
+    paths:
+      - 'scripts/shanghai_sptcc_formal_ingest.py'
+      - '.github/workflows/shanghai-sptcc-jul01-formal-ingest-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919
+      SOURCE_FILE: SPTCC-20160701.csv
+      SOURCE_DATE: '2016-07-01'
+      EXPECTED_BYTES: '904976558'
+      EXPECTED_SHA256: '7376c6c9c818b1d45834efd8390c2dc9785694433714ea61b655dda67e1f5e14'
+      EXPECTED_STRICT: '4976623'
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run bounded synthetic chronology tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_sptcc_formal_ingest.py --self-test
+          python -m py_compile scripts/shanghai_sptcc_formal_ingest.py
+
+      - name: Prepare protected rclone
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GDRIVE_CONFIG_B64" || { echo "missing rclone secret" >&2; exit 3; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/formal/input" "$RUNNER_TEMP/formal/output"
+
+      - name: Download and verify Jul01 raw
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/formal/input/$SOURCE_FILE"
+          rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$SOURCE_FILE" "$RAW" \
+            --config "$CONFIG_FILE" --retries 6 --low-level-retries 20 \
+            --transfers 1 --checkers 4 --drive-chunk-size 128M \
+            --stats 60s --stats-one-line
+          test "$(stat -c%s "$RAW")" -eq "$EXPECTED_BYTES"
+          ACTUAL_SHA="$(sha256sum "$RAW" | awk '{print $1}')"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA256"
+
+      - name: Build Jul01 formal card-linked journey candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_sptcc_formal_ingest.py \
+            --input "$RUNNER_TEMP/formal/input/$SOURCE_FILE" \
+            --db "$RUNNER_TEMP/formal/events.sqlite" \
+            --out "$RUNNER_TEMP/formal/output/SPTCC-20160701.formal_mppd_journeys.csv.gz" \
+            --audit "$RUNNER_TEMP/formal/output/SPTCC-20160701.formal_mppd_journeys.audit.json" \
+            --source-date "$SOURCE_DATE" \
+            --expected-strict "$EXPECTED_STRICT" \
+            | tee "$RUNNER_TEMP/formal/ingest.log"
+
+      - name: Build private output receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/formal/output"
+          python - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          f=Path('SPTCC-20160701.formal_mppd_journeys.csv.gz')
+          audit=json.loads(Path('SPTCC-20160701.formal_mppd_journeys.audit.json').read_text())
+          h=hashlib.sha256()
+          with f.open('rb') as x:
+              for b in iter(lambda:x.read(8*1024*1024),b''):h.update(b)
+          receipt={
+            'schema':'mppd.shanghai.formal-journey-private-receipt.v1',
+            'source_date':'2016-07-01',
+            'source_authority_commit':'d0455d314aa55a44cdb05fc3e382f26062919f51',
+            'worker_github_sha':os.environ.get('GITHUB_SHA'),
+            'worker_run_id':os.environ.get('GITHUB_RUN_ID'),
+            'private_output_file':f.name,
+            'private_output_bytes':f.stat().st_size,
+            'private_output_sha256':h.hexdigest(),
+            'gate_segments':audit.get('gate_segments'),
+            'journeys':audit.get('journeys'),
+            'virtual_transfer_stitches':audit.get('virtual_transfer_stitches',0),
+            'gate_segment_delta_vs_strict':audit.get('gate_segment_delta_vs_strict'),
+            'journey_mass_invariant':audit.get('journey_mass_invariant'),
+            'split_mass_invariant':audit.get('split_mass_invariant'),
+            'qualification_state':audit.get('qualification_state'),
+            'privacy':'Card-linked output is private Drive only; public artifact contains receipt/audit but not the journey table.'
+          }
+          Path('receipt.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2))
+          print(json.dumps(receipt,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Persist private candidate to Drive and verify
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID/20160701"
+          rclone copy "$RUNNER_TEMP/formal/output" "$REMOTE_NAME:$BUILD" \
+            --config "$CONFIG_FILE" --retries 8 --low-level-retries 20 \
+            --transfers 3 --checkers 6 --drive-chunk-size 128M
+          rclone check "$RUNNER_TEMP/formal/output" "$REMOTE_NAME:$BUILD" \
+            --config "$CONFIG_FILE" --one-way --checkers 6
+          cp "$RUNNER_TEMP/formal/output/receipt.json" "$RUNNER_TEMP/LATEST_CANDIDATE_20160701.json"
+          rclone copyto "$RUNNER_TEMP/LATEST_CANDIDATE_20160701.json" \
+            "$REMOTE_NAME:$OUT_DRIVE/LATEST_CANDIDATE_20160701.json" \
+            --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+
+      - name: Upload aggregate-only audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-sptcc-jul01-formal-audit
+          path: |
+            ${{ runner.temp }}/formal/output/SPTCC-20160701.formal_mppd_journeys.audit.json
+            ${{ runner.temp }}/formal/output/receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean runner-local private data
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/formal"
+          rm -f "$RUNNER_TEMP/LATEST_CANDIDATE_20160701.json"
+          if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

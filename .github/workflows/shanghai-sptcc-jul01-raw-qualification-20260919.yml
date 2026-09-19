@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      GDRIVE_CONFIG_B64: \${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
       SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
       OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/09_mppd_raw_qualification_20260919
       SOURCE_FILE: SPTCC-20160701.csv
@@ -43,8 +43,8 @@ jobs:
       - name: Download Jul01 raw AFC
         shell: bash
         env:
-          CONFIG_FILE: \${{ steps.storage.outputs.config_file }}
-          REMOTE_NAME: \${{ steps.storage.outputs.remote_name }}
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
         run: |
           set -euo pipefail
           rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$SOURCE_FILE" \
@@ -169,8 +169,8 @@ jobs:
       - name: Persist aggregate qualification to Drive
         shell: bash
         env:
-          CONFIG_FILE: \${{ steps.storage.outputs.config_file }}
-          REMOTE_NAME: \${{ steps.storage.outputs.remote_name }}
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
         run: |
           set -euo pipefail
           BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID"
@@ -187,7 +187,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shanghai-sptcc-jul01-raw-qualification
-          path: \${{ runner.temp }}/rawq/output/*
+          path: ${{ runner.temp }}/rawq/output/*
           if-no-files-found: error
           retention-days: 14
 
@@ -195,7 +195,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          CONFIG_FILE: \${{ steps.storage.outputs.config_file }}
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
         run: |
           rm -rf "$RUNNER_TEMP/rawq/input"
           if [[ -n "\${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then

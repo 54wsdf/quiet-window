@@ -1,0 +1,16 @@
+name: Shanghai Jul01 Formal vs Strict Reconciliation 2026-09-19
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate reconciliation script syntax
+        run: python -m py_compile scripts/shanghai_jul01_formal_vs_strict.py

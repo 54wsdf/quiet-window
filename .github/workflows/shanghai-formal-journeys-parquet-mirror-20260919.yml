@@ -1,6 +1,9 @@
 name: Shanghai Formal Journeys Private Parquet Mirror 2026-09-19
 
 on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-formal-journeys-parquet-mirror-20260919.yml'
   workflow_dispatch:
 
 permissions:

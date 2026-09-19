@@ -1,6 +1,9 @@
 name: Shanghai Jul01 Formal vs Strict Reconciliation 2026-09-19
 
 on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-jul01-formal-vs-strict-reconcile-20260919.yml'
   workflow_dispatch:
 
 permissions:
@@ -10,7 +13,84 @@ jobs:
   reconcile:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      STRICT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/07_mppd_strict_journeys_20260903
+      FORMAL_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919/builds/35418217135/20160701
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/11_mppd_reconciliation_20260919
+      STRICT_FILE: SPTCC-20160701.strict_metro_journeys.parquet
+      FORMAL_FILE: SPTCC-20160701.formal_mppd_journeys.csv.gz
+      AUDIT_FILE: SPTCC-20160701.formal_mppd_journeys.audit.json
+      EXPECTED_STRICT_BYTES: '39976604'
+      EXPECTED_STRICT_SHA256: '81e694cae64982b55bb18620b2f9c8b824c573c4481e0a9bb7e4f90e92ba6634'
+      EXPECTED_FORMAL_BYTES: '114429189'
+      EXPECTED_FORMAL_SHA256: '9311937404c5eac5ec205b8d05ced9408a752220e8b6f36f541eec2682c80cf9'
+
     steps:
       - uses: actions/checkout@v5
-      - name: Validate reconciliation script syntax
-        run: python -m py_compile scripts/shanghai_jul01_formal_vs_strict.py
+
+      - name: Prepare bounded runtime
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2' 'pandas>=2.2,<3'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/reconcile/input" "$RUNNER_TEMP/reconcile/output"
+
+      - name: Download immutable Jul01 inputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          IN="$RUNNER_TEMP/reconcile/input"
+          rclone copyto "$REMOTE_NAME:$STRICT_DRIVE/$STRICT_FILE" "$IN/$STRICT_FILE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone copyto "$REMOTE_NAME:$FORMAL_DRIVE/$FORMAL_FILE" "$IN/$FORMAL_FILE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone copyto "$REMOTE_NAME:$FORMAL_DRIVE/$AUDIT_FILE" "$IN/$AUDIT_FILE" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          test "$(stat -c%s "$IN/$STRICT_FILE")" -eq "$EXPECTED_STRICT_BYTES"
+          test "$(sha256sum "$IN/$STRICT_FILE" | awk '{print $1}')" = "$EXPECTED_STRICT_SHA256"
+          test "$(stat -c%s "$IN/$FORMAL_FILE")" -eq "$EXPECTED_FORMAL_BYTES"
+          test "$(sha256sum "$IN/$FORMAL_FILE" | awk '{print $1}')" = "$EXPECTED_FORMAL_SHA256"
+
+      - name: Run exact formal-vs-strict reconciliation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/shanghai_jul01_formal_vs_strict.py
+          python scripts/shanghai_jul01_formal_vs_strict.py             --strict "$RUNNER_TEMP/reconcile/input/$STRICT_FILE"             --formal "$RUNNER_TEMP/reconcile/input/$FORMAL_FILE"             --formal-audit "$RUNNER_TEMP/reconcile/input/$AUDIT_FILE"             --out "$RUNNER_TEMP/reconcile/output/qualification.json"
+
+      - name: Persist aggregate reconciliation
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID/20160701"
+          rclone copy "$RUNNER_TEMP/reconcile/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/reconcile/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --size-only --one-way
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-jul01-formal-vs-strict-reconciliation
+          path: ${{ runner.temp }}/reconcile/output/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/reconcile/input"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

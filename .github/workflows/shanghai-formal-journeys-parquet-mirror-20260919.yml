@@ -1,0 +1,122 @@
+name: Shanghai Formal Journeys Private Parquet Mirror 2026-09-19
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - day: '20160701'
+            source_run: '35418217135'
+            source_bytes: '114429189'
+            source_sha256: '9311937404c5eac5ec205b8d05ced9408a752220e8b6f36f541eec2682c80cf9'
+            expected_rows: '4942168'
+          - day: '20160802'
+            source_run: '35422980321'
+            source_bytes: '107191858'
+            source_sha256: 'db52f2b5ea51a411e2ce6d9b904b1723c3e2320e617320f2a52722d6ce1a369d'
+            expected_rows: '4649507'
+          - day: '20160901'
+            source_run: '35423928273'
+            source_bytes: '107583938'
+            source_sha256: 'd9f96241f53d87fa89f00937f9cf45c4b4e914cafeb12d4911a256f417c8c397'
+            expected_rows: '4661808'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      FORMAL_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare runtime
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2'
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/formal-parquet/input" "$RUNNER_TEMP/formal-parquet/output" "$RUNNER_TEMP/formal-parquet/audit"
+      - name: Download immutable formal CSV
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          F="SPTCC-${{ matrix.day }}.formal_mppd_journeys.csv.gz"
+          SRC="$FORMAL_DRIVE/builds/${{ matrix.source_run }}/${{ matrix.day }}/$F"
+          DST="$RUNNER_TEMP/formal-parquet/input/$F"
+          rclone copyto "$REMOTE_NAME:$SRC" "$DST" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          test "$(stat -c%s "$DST")" -eq "${{ matrix.source_bytes }}"
+          test "$(sha256sum "$DST" | awk '{print $1}')" = "${{ matrix.source_sha256 }}"
+      - name: Convert and qualify Parquet
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DAY='${{ matrix.day }}' EXPECTED='${{ matrix.expected_rows }}' SOURCE_SHA='${{ matrix.source_sha256 }}'
+          python - <<'PY'
+          import duckdb,hashlib,json,os
+          from pathlib import Path
+          day=os.environ['DAY']; expected=int(os.environ['EXPECTED'])
+          root=Path(os.environ['RUNNER_TEMP'])/'formal-parquet'
+          src=root/'input'/f'SPTCC-{day}.formal_mppd_journeys.csv.gz'
+          out=root/'output'/f'SPTCC-{day}.formal_mppd_journeys.parquet'
+          con=duckdb.connect()
+          con.execute("PRAGMA threads=4")
+          con.execute("COPY (SELECT * FROM read_csv_auto(?,header=true,all_varchar=true)) TO ? (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)",[str(src),str(out)])
+          rows=con.execute("SELECT count(*) FROM read_parquet(?)",[str(out)]).fetchone()[0]
+          cols=[x[0] for x in con.execute("DESCRIBE SELECT * FROM read_parquet(?)",[str(out)]).fetchall()]
+          con.close()
+          if rows!=expected: raise SystemExit((rows,expected))
+          h=hashlib.sha256()
+          with out.open('rb') as f:
+              for b in iter(lambda:f.read(8*1024*1024),b''):h.update(b)
+          receipt={
+            'schema':'mppd.shanghai.formal-journey-parquet-mirror.v1',
+            'day':day,'rows':rows,'columns':cols,
+            'source_csv_sha256':os.environ['SOURCE_SHA'],
+            'parquet_bytes':out.stat().st_size,'parquet_sha256':h.hexdigest(),
+            'privacy':'Same deidentified formal journey rows; no passenger identifier or grouping hash is present.',
+            'claim_boundary':'Storage/compute mirror only; no scientific transformation or route inference.'
+          }
+          (root/'audit'/f'{day}.receipt.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2))
+          print(json.dumps(receipt,ensure_ascii=False,indent=2))
+          PY
+      - name: Persist private Parquet and receipt
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          DEST="$FORMAL_DRIVE/parquet_v1/builds/$GITHUB_RUN_ID/${{ matrix.day }}"
+          rclone copy "$RUNNER_TEMP/formal-parquet/output" "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20 --drive-chunk-size 128M
+          rclone copy "$RUNNER_TEMP/formal-parquet/audit" "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/formal-parquet/output" "$REMOTE_NAME:$DEST" --config "$CONFIG_FILE" --size-only --one-way
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-formal-parquet-receipt-${{ matrix.day }}
+          path: ${{ runner.temp }}/formal-parquet/audit/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/formal-parquet/input" "$RUNNER_TEMP/formal-parquet/output"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

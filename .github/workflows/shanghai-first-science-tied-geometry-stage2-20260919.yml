@@ -1,0 +1,106 @@
+name: Shanghai First-Science Tied Geometry Stage2 2026-09-19
+
+on:
+  workflow_run:
+    workflows:
+      - Shanghai First-Science Service Screening Stage1 2026-09-19
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      stage1_run_id:
+        description: Successful Stage1 workflow run ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      STAGE1_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/stage1/builds/${{ github.event.workflow_run.id || inputs.stage1_run_id }}
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/stage2_tied_geometry
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run bounded tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd scripts
+          python -m unittest -v test_shanghai_first_science_tied_geometry_stage2.py
+          python -m py_compile shanghai_first_science_tied_geometry_stage2.py
+      - name: Prepare runtime and protected Drive
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2'
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/stage2/stage1" "$RUNNER_TEMP/stage2/static" "$RUNNER_TEMP/stage2/soda/train/base" "$RUNNER_TEMP/stage2/prior" "$RUNNER_TEMP/stage2/output"
+      - name: Download immutable Stage1 outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          rclone copy "$REMOTE_NAME:$STAGE1_DRIVE" "$RUNNER_TEMP/stage2/stage1" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          test -s "$RUNNER_TEMP/stage2/stage1/first_science_service_screening_stage1.jsonl.gz"
+          test -s "$RUNNER_TEMP/stage2/stage1/qualification.json"
+      - name: Fetch pinned topology and rebuild frozen progression prior
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://raw.githubusercontent.com/jeevanyue/metro/bb78b72ecadc57e0c8deedf9731a78a65ab62ef4'
+          curl -fsSL "$BASE/train/base/station.txt" -o "$RUNNER_TEMP/stage2/static/station.txt"
+          curl -fsSL "$BASE/connections_by_station_name.json" -o "$RUNNER_TEMP/stage2/static/connections_by_station_name.json"
+          cp "$RUNNER_TEMP/stage2/static/station.txt" "$RUNNER_TEMP/stage2/soda/train/base/station.txt"
+          curl -fsSL "$BASE/train/base/timetable.txt" -o "$RUNNER_TEMP/stage2/soda/train/base/timetable.txt"
+          python scripts/shanghai_station_progression_prior.py --snapshot-root "$RUNNER_TEMP/stage2/soda" --out-dir "$RUNNER_TEMP/stage2/prior"
+          test "$(sha256sum "$RUNNER_TEMP/stage2/prior/segment_station_progression_prior.csv" | awk '{print $1}')" = "804216bbe5c6bde4c882c148d743868e4fddd67d491f5361ffe5c3e493cdd00c"
+      - name: Audit tied geometry over frontier parent DAG
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_first_science_tied_geometry_stage2.py \
+            --stage1 "$RUNNER_TEMP/stage2/stage1/first_science_service_screening_stage1.jsonl.gz" \
+            --stage1-qualification "$RUNNER_TEMP/stage2/stage1/qualification.json" \
+            --station "$RUNNER_TEMP/stage2/static/station.txt" \
+            --connections "$RUNNER_TEMP/stage2/static/connections_by_station_name.json" \
+            --prior "$RUNNER_TEMP/stage2/prior/segment_station_progression_prior.csv" \
+            --out-dir "$RUNNER_TEMP/stage2/output"
+      - name: Persist Stage2 tied-geometry audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID"
+          rclone copy "$RUNNER_TEMP/stage2/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/stage2/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --size-only --one-way
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-first-science-tied-geometry-stage2
+          path: ${{ runner.temp }}/stage2/output/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/stage2/stage1"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

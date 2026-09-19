@@ -1,0 +1,85 @@
+name: Shanghai Jul01 Strict vs Formal Pair Reconciliation 2026-09-19
+on:
+  push:
+    paths:
+      - 'scripts/shanghai_jul01_pair_reconcile.py'
+      - '.github/workflows/shanghai-jul01-pair-reconcile-20260919.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      SOURCE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/source_data
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919/reconciliation
+      SOURCE_FILE: SPTCC-20160701.csv
+      SOURCE_DATE: '2016-07-01'
+      EXPECTED_BYTES: '904976558'
+      EXPECTED_SHA256: '7376c6c9c818b1d45834efd8390c2dc9785694433714ea61b655dda67e1f5e14'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compile reconciliation worker
+        run: python -m py_compile scripts/shanghai_jul01_pair_reconcile.py
+      - name: Prepare protected rclone
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/reconcile"
+      - name: Download and verify raw
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="$RUNNER_TEMP/reconcile/$SOURCE_FILE"
+          rclone copyto "$REMOTE_NAME:$SOURCE_DRIVE/$SOURCE_FILE" "$RAW" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20 --drive-chunk-size 128M
+          test "$(stat -c%s "$RAW")" -eq "$EXPECTED_BYTES"
+          test "$(sha256sum "$RAW"|awk '{print $1}')" = "$EXPECTED_SHA256"
+      - name: Rebuild both pairing rules and reconcile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_jul01_pair_reconcile.py \
+            --input "$RUNNER_TEMP/reconcile/$SOURCE_FILE" \
+            --db "$RUNNER_TEMP/reconcile/reconcile.sqlite" \
+            --out "$RUNNER_TEMP/reconcile/qualification.json" \
+            --source-date "$SOURCE_DATE" \
+            --expected-strict 4976623 \
+            --expected-formal 4958860
+      - name: Persist aggregate reconciliation
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID"
+          rclone copyto "$RUNNER_TEMP/reconcile/qualification.json" "$REMOTE_NAME:$BUILD/qualification.json" --config "$CONFIG_FILE"
+          rclone check "$RUNNER_TEMP/reconcile/qualification.json" "$REMOTE_NAME:$BUILD/qualification.json" --config "$CONFIG_FILE" --size-only --one-way
+      - name: Upload aggregate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-jul01-pair-reconciliation
+          path: ${{ runner.temp }}/reconcile/qualification.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean protected data
+        if: always()
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/reconcile"
+          if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

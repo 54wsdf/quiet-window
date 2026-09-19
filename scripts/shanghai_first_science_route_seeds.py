@@ -96,7 +96,9 @@ def main():
     con=duckdb.connect(); con.execute("PRAGMA threads=4"); con.execute("PRAGMA memory_limit='6GB'")
     parts=[]
     for day in ["20160701","20160802","20160901"]:
-        p=a.journey_dir/f"SPTCC-{day}.formal_mppd_journeys.csv.gz"
+        p=a.journey_dir/f"SPTCC-{day}.formal_mppd_journeys.parquet"
+        if not p.is_file():
+            raise FileNotFoundError(f"qualified Parquet mirror missing: {p}")
         ps=str(p).replace("'","''")
         parts.append("""
           SELECT '"""+day+"""' AS day,
@@ -118,7 +120,7 @@ def main():
                        ELSE 'OTHER' END
                    ELSE NULL END AS period,
                  count(*)::BIGINT AS n
-          FROM read_csv_auto('"""+ps+"""',header=true,all_varchar=true)
+          FROM read_parquet('"""+ps+"""')
           WHERE (origin_line='11' AND destination_line='11')
              OR (origin_line='02' AND destination_line='02')
           GROUP BY 1,2,3,4,5,6

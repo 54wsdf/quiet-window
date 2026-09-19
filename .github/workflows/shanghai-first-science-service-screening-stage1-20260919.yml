@@ -1,18 +1,29 @@
 name: Shanghai First-Science Service Screening Stage1 2026-09-19
 
 on:
+  workflow_run:
+    workflows:
+      - Shanghai First-Science Structural Route Seeds 2026-09-19
+    types:
+      - completed
   workflow_dispatch:
+    inputs:
+      route_run_id:
+        description: Successful structural route-seed workflow run ID
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   screen:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 300
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
-      ROUTE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/route_seeds/builds/35428253164
+      ROUTE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/route_seeds/builds/${{ github.event.workflow_run.id || inputs.route_run_id }}
       OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/stage1
     steps:
       - uses: actions/checkout@v5

@@ -1,0 +1,111 @@
+name: Shanghai Route-Clear AFC Residual Stage3 2026-09-19
+
+on:
+  workflow_run:
+    workflows:
+      - Shanghai First-Science Service Screening Stage1 2026-09-19
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      stage1_run_id:
+        description: Successful Stage1 workflow run ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      STAGE1_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/stage1/builds/${{ github.event.workflow_run.id || inputs.stage1_run_id }}
+      PARQUET_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919/parquet_v1/builds/35428783632
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/stage3_route_clear_residual
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run bounded tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2'
+          cd scripts
+          python -m unittest -v test_shanghai_route_clear_afc_residual_stage3.py
+          python -m py_compile shanghai_route_clear_afc_residual_stage3.py
+      - name: Prepare runtime and protected Drive
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/stage3/stage1" "$RUNNER_TEMP/stage3/formal" "$RUNNER_TEMP/stage3/output"
+      - name: Download immutable Stage1 outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          rclone copy "$REMOTE_NAME:$STAGE1_DRIVE" "$RUNNER_TEMP/stage3/stage1" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          test -s "$RUNNER_TEMP/stage3/stage1/first_science_service_screening_stage1.jsonl.gz"
+          test -s "$RUNNER_TEMP/stage3/stage1/qualification.json"
+      - name: Download qualified formal Parquet mirrors
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          declare -A BYTES=( [20160701]=72698566 [20160802]=67836155 [20160901]=68075378 )
+          declare -A SHA=( [20160701]=0ac5815739f001640af78053723dafb2d0fde5fbb8c965983a29e5edd39bcfd0 [20160802]=bddc44435a4aae9ff85fad952e81a91ec94a9e676d1a9abb538374ca0881912b [20160901]=0bddd2f51a3f77056fbf0a8e0d148dec3c2667312b970c3abb7017012b43d5a5 )
+          for day in 20160701 20160802 20160901; do
+            f="SPTCC-${day}.formal_mppd_journeys.parquet"
+            src="$PARQUET_DRIVE/${day}/$f"
+            dst="$RUNNER_TEMP/stage3/formal/$f"
+            rclone copyto "$REMOTE_NAME:$src" "$dst" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+            test "$(stat -c%s "$dst")" -eq "${BYTES[$day]}"
+            test "$(sha256sum "$dst" | awk '{print $1}')" = "${SHA[$day]}"
+          done
+      - name: Build route-clear AFC residual panel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_route_clear_afc_residual_stage3.py \
+            --stage1 "$RUNNER_TEMP/stage3/stage1/first_science_service_screening_stage1.jsonl.gz" \
+            --stage1-qualification "$RUNNER_TEMP/stage3/stage1/qualification.json" \
+            --journey-dir "$RUNNER_TEMP/stage3/formal" \
+            --out-dir "$RUNNER_TEMP/stage3/output"
+      - name: Persist aggregate Stage3 audit
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID"
+          rclone copy "$RUNNER_TEMP/stage3/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/stage3/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --size-only --one-way
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-route-clear-afc-residual-stage3
+          path: ${{ runner.temp }}/stage3/output/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/stage3/stage1" "$RUNNER_TEMP/stage3/formal"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

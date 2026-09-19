@@ -24,24 +24,43 @@ jobs:
           cd scripts
           python -m unittest -v test_shanghai_station_progression_prior.py
           python -m py_compile shanghai_station_progression_prior.py
-      - name: Fetch pinned public SODA inputs
+      - name: Fetch pinned public SODA files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/progression/input" "$RUNNER_TEMP/progression/output"
+          ROOT="$RUNNER_TEMP/progression/snapshot"
+          OUT="$RUNNER_TEMP/progression/output"
+          mkdir -p "$ROOT/train/base" "$OUT"
           BASE='https://raw.githubusercontent.com/jeevanyue/metro/bb78b72ecadc57e0c8deedf9731a78a65ab62ef4'
-          curl -fsSL "$BASE/train/base/station.txt" -o "$RUNNER_TEMP/progression/input/station.txt"
-          curl -fsSL "$BASE/train/base/timetable.txt" -o "$RUNNER_TEMP/progression/input/timetable.txt"
-          curl -fsSL "$BASE/connections_by_station_name.json" -o "$RUNNER_TEMP/progression/input/connections_by_station_name.json"
-      - name: Materialize and fail-closed reproduce frozen audit
+          curl -fsSL "$BASE/train/base/station.txt" -o "$ROOT/train/base/station.txt"
+          curl -fsSL "$BASE/train/base/timetable.txt" -o "$ROOT/train/base/timetable.txt"
+      - name: Reproduce frozen prior and materialize segment table
         shell: bash
         run: |
           set -euo pipefail
           python scripts/shanghai_station_progression_prior.py \
-            --station "$RUNNER_TEMP/progression/input/station.txt" \
-            --timetable "$RUNNER_TEMP/progression/input/timetable.txt" \
-            --connections "$RUNNER_TEMP/progression/input/connections_by_station_name.json" \
-            --outdir "$RUNNER_TEMP/progression/output"
+            --snapshot-root "$RUNNER_TEMP/progression/snapshot" \
+            --out-dir "$RUNNER_TEMP/progression/output"
+      - name: Fail closed against frozen authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('/home/runner/work/_temp/progression/output/qualification.json')
+          q=json.loads(p.read_text())
+          expected={
+            '01':(27,27,183),'02':(29,29,370),'03':(28,28,695),'04':(25,0,0),
+            '05':(10,9,30),'06':(27,27,398),'07':(32,31,115),'08':(29,29,592),
+            '09':(25,25,134),'10':(30,27,107),'11':(30,26,384),'12':(15,15,56),
+            '13':(9,5,14),'16':(12,7,54)}
+          actual={k:(v['physical_adjacent_segments'],v['covered_segments'],v['accepted_observations']) for k,v in q['line_summary'].items()}
+          expected_rejects={'missing_numeric_first_or_last':661,'first_last_progression_disagreement':177,'outside_progression_bound':14}
+          assert actual==expected,(actual,expected)
+          assert q['rejects']==expected_rejects,(q['rejects'],expected_rejects)
+          print(json.dumps({'state':'FROZEN_AUDIT_EXACTLY_REPRODUCED','lines':len(actual),'rejects':q['rejects']},ensure_ascii=False))
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: shanghai-soda-station-progression-prior

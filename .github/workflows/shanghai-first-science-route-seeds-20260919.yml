@@ -1,6 +1,12 @@
 name: Shanghai First-Science Structural Route Seeds 2026-09-19
 
 on:
+  push:
+    paths:
+      - 'scripts/shanghai_first_science_route_seeds.py'
+      - 'scripts/shanghai_route_frontier.py'
+      - 'scripts/test_shanghai_first_science_route_seeds.py'
+      - '.github/workflows/shanghai-first-science-route-seeds-20260919.yml'
   workflow_dispatch:
 
 permissions:

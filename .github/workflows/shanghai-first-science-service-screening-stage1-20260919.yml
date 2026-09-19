@@ -56,6 +56,7 @@ jobs:
           set -euo pipefail
           rclone copy "$REMOTE_NAME:$ROUTE_DRIVE" "$RUNNER_TEMP/stage1/route" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
           test -s "$RUNNER_TEMP/stage1/route/first_science_structural_route_seeds.jsonl.gz"
+          test -s "$RUNNER_TEMP/stage1/route/first_science_od_support.csv"
           test -s "$RUNNER_TEMP/stage1/route/qualification.json"
       - name: Rebuild frozen progression prior
         shell: bash
@@ -73,6 +74,7 @@ jobs:
           python scripts/shanghai_first_science_service_screen_stage1.py \
             --route-seeds "$RUNNER_TEMP/stage1/route/first_science_structural_route_seeds.jsonl.gz" \
             --route-qualification "$RUNNER_TEMP/stage1/route/qualification.json" \
+            --od-support "$RUNNER_TEMP/stage1/route/first_science_od_support.csv" \
             --prior "$RUNNER_TEMP/stage1/prior/segment_station_progression_prior.csv" \
             --service-worlds "data/shanghai_service_screening_20260919/SHANGHAI_FIRST_SCIENCE_SERVICE_WORLDS_V1.json" \
             --out-dir "$RUNNER_TEMP/stage1/output"

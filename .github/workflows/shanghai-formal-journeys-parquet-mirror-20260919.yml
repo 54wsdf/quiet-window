@@ -1,9 +1,6 @@
 name: Shanghai Formal Journeys Private Parquet Mirror 2026-09-19
 
 on:
-  push:
-    paths:
-      - '.github/workflows/shanghai-formal-journeys-parquet-mirror-20260919.yml'
   workflow_dispatch:
 
 permissions:
@@ -79,9 +76,10 @@ jobs:
           out=root/'output'/f'SPTCC-{day}.formal_mppd_journeys.parquet'
           con=duckdb.connect()
           con.execute("PRAGMA threads=4")
-          con.execute("COPY (SELECT * FROM read_csv_auto(?,header=true,all_varchar=true)) TO ? (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)",[str(src),str(out)])
-          rows=con.execute("SELECT count(*) FROM read_parquet(?)",[str(out)]).fetchone()[0]
-          cols=[x[0] for x in con.execute("DESCRIBE SELECT * FROM read_parquet(?)",[str(out)]).fetchall()]
+          src_sql=str(src).replace("'","''"); out_sql=str(out).replace("'","''")
+          con.execute(f"COPY (SELECT * FROM read_csv_auto('{src_sql}',header=true,all_varchar=true)) TO '{out_sql}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)")
+          rows=con.execute(f"SELECT count(*) FROM read_parquet('{out_sql}')").fetchone()[0]
+          cols=[x[0] for x in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out_sql}')").fetchall()]
           con.close()
           if rows!=expected: raise SystemExit((rows,expected))
           h=hashlib.sha256()

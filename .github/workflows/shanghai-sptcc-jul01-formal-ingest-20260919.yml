@@ -1,6 +1,9 @@
 name: Shanghai SPTCC Jul01 Formal Card Chronology 2026-09-19
 
 on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-sptcc-jul01-formal-ingest-20260919.yml'
   workflow_dispatch:
 
 permissions:

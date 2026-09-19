@@ -1,0 +1,103 @@
+{
+  "schema": "mppd.shanghai.first-science-service-worlds.v1",
+  "date": "2026-09-19",
+  "source_registry": "validation/SHANGHAI_2016_SERVICE_SOURCE_REGISTRY_V4.json",
+  "semantics": {
+    "world": "admissible analytic service configuration, not reconstructed true timetable",
+    "phase": "unobserved unless explicitly stated",
+    "nominal_headway": "source-supported mean/about interval, not guaranteed maximum wait",
+    "walking": "WALK_UNRESOLVED unless separately qualified",
+    "safe_deletion": "No route may be eliminated using a nominal headway as a hard upper bound."
+  },
+  "L11": {
+    "periods": {
+      "AM_0700_0830": {
+        "segment_service_nominal_headway_s": {
+          "嘉定北—嘉定新城": 450,
+          "花桥—嘉定新城": 450,
+          "嘉定新城—南翔": 225,
+          "南翔—三林": 150,
+          "三林—迪士尼": 450
+        },
+        "analytic_rate_identities": [
+          "2/450 = 1/225",
+          "1/150 - 1/225 = 1/450"
+        ],
+        "phase_worlds": [
+          {
+            "id": "L11_AM_BRANCH_225_INTERLEAVE_REFERENCE",
+            "constraint": "two 450-s northern source streams offset by 225 s",
+            "evidence_status": "ANALYTIC_REFERENCE_NOT_OBSERVED_PHASE"
+          },
+          {
+            "id": "L11_AM_THREE_STREAM_150_REFERENCE",
+            "constraint": "three nominal 450-s component streams arranged on 150-s phase grid",
+            "evidence_status": "ANALYTIC_REFERENCE_NOT_OBSERVED_PHASE"
+          },
+          {
+            "id": "L11_AM_PHASE_UNRESOLVED",
+            "constraint": "no fixed relative phase imposed",
+            "evidence_status": "PRIMARY_ADMISSIBLE_UNCERTAINTY_WORLD"
+          }
+        ]
+      },
+      "OFF_0900_1600": {
+        "segment_service_nominal_headway_s": {
+          "嘉定北—嘉定新城": 720,
+          "花桥—嘉定新城": 720,
+          "嘉定新城—迪士尼": 360
+        },
+        "phase_worlds": [
+          {
+            "id": "L11_OFF_PHASE_UNRESOLVED",
+            "constraint": "no fixed relative phase imposed"
+          }
+        ]
+      },
+      "PM_1700_1930": {
+        "segment_service_nominal_headway_s": {
+          "嘉定北—嘉定新城": 420,
+          "花桥—嘉定新城": 420,
+          "嘉定新城—三林": 210,
+          "三林—迪士尼": 420
+        },
+        "phase_worlds": [
+          {
+            "id": "L11_PM_PHASE_UNRESOLVED",
+            "constraint": "no fixed relative phase imposed"
+          }
+        ]
+      }
+    }
+  },
+  "L02": {
+    "date_classes": {
+      "2016-07-01": "PRE_20160812",
+      "2016-08-02": "PRE_20160812",
+      "2016-09-01": "POST_20160812"
+    },
+    "AM_0700_0900": {
+      "all_dates": {
+        "service_pattern": "4/8-car mixed operation at Tangzhen; 8-car terminal alternation Guanglan/Tangzhen retained as pattern prior",
+        "core_nominal_interval_context_s": 180,
+        "stream_specific_headways": "UNRESOLVED",
+        "east_4car_headway": "UNRESOLVED",
+        "phase": "UNRESOLVED"
+      }
+    },
+    "PM": {
+      "PRE_20160812": {
+        "window": "17:30-19:00 relevant to documented change",
+        "service_pattern": "8-car service terminates Guanglan Road; east extension remains differentiated 4-car service",
+        "stream_specific_headways": "UNRESOLVED"
+      },
+      "POST_20160812": {
+        "window": "17:30-19:00",
+        "service_pattern": "some 8-car service extends to Tangzhen; most 8-car service still terminates Guanglan Road; 4-car airport service remains differentiated",
+        "stream_specific_headways": "UNRESOLVED",
+        "stream_share": "UNRESOLVED"
+      }
+    },
+    "classification_rule": "Any route ranking that depends on an unresolved L2 stream headway/share remains SERVICE_UNRESOLVED rather than being forced by the 180-s context anchor."
+  }
+}

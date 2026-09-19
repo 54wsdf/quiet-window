@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse,csv,gzip,hashlib,hmac,json,re,sqlite3
+import argparse,csv,gzip,hashlib,json,re,sqlite3
 from collections import Counter
 from datetime import datetime,timedelta
 from pathlib import Path
@@ -42,8 +42,8 @@ def parse_station(raw:str):
     line=m.group(1).zfill(2); station=m.group(2).strip()
     return line,station,token
 
-def pseudo(card:str,key:bytes):
-    return hmac.new(key,card.encode("utf-8"),hashlib.sha256).hexdigest()[:32]
+def group_token(card:str):
+    return hashlib.sha256(("group:"+card).encode("utf-8")).hexdigest()
 
 def split_name(token:str):
     x=int(hashlib.sha256(("split:"+token).encode()).hexdigest()[:8],16)%10
@@ -60,7 +60,7 @@ def virtual_rule(exit_line,exit_station,entry_line,entry_station,gap,date_text):
             if any(pair==frozenset(x) for x in rule["pairs"]):return rule
     return None
 
-def ingest(raw:Path,db:Path,out:Path,audit_path:Path,key:bytes,max_gate_duration_s=21600):
+def ingest(raw:Path,db:Path,out:Path,audit_path:Path,max_gate_duration_s=21600):
     con=sqlite3.connect(db);cur=con.cursor()
     cur.executescript(
       "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;"
@@ -70,12 +70,14 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,key:bytes,max_gate_duration
     audit=Counter();rejects=Counter();batch=[];blocked=[];epoch=datetime(1970,1,1);seen_dates=set()
     for i,r in enumerate(iter_rows(raw),start=1):
         audit["input_rows"]+=1
+        if i % 1000000 == 0:
+            print(json.dumps({"phase":"scan","rows":i,"metro_events":audit["metro_events"]}),flush=True)
         if (r.get("vehicle") or "").strip()!="地铁":
             audit["non_metro_rows"]+=1;continue
         raw_card=(r.get("card_id") or "").strip()
         if not raw_card:
             rejects["missing_card_id"]+=1;continue
-        card=pseudo(raw_card,key)
+        card=group_token(raw_card)
         try:
             datestr=r["date"].strip()
             if datestr not in TARGET_DATES:raise ValueError("unexpected date")
@@ -97,13 +99,13 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,key:bytes,max_gate_duration
             batch.append((card,ts,datestr,p[0],p[1],p[2],None,i));audit["negative_money_barrier_events"]+=1;audit["metro_events"]+=1
         else:
             batch.append((card,ts,datestr,p[0],p[1],p[2],money,i));audit["metro_events"]+=1
-        if len(batch)>=20000:
-            cur.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",batch);batch.clear()
+        if len(batch)>=100000:
+            cur.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",batch);batch.clear();con.commit()
         if len(blocked)>=5000:
-            cur.executemany("INSERT OR IGNORE INTO blocked VALUES(?)",blocked);blocked.clear()
+            cur.executemany("INSERT OR IGNORE INTO blocked VALUES(?)",blocked);blocked.clear();con.commit()
     if batch:cur.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",batch)
     if blocked:cur.executemany("INSERT OR IGNORE INTO blocked VALUES(?)",blocked)
-    con.commit();cur.execute("CREATE INDEX idx_events_card_ts ON events(card,ts,raw_row)");con.commit()
+    con.commit();print(json.dumps({"phase":"index","events":audit["metro_events"]}),flush=True);cur.execute("CREATE INDEX idx_events_card_ts ON events(card,ts,raw_row)");con.commit()
     blocked_cards={x[0] for x in cur.execute("SELECT card FROM blocked")}
     q=cur.execute("SELECT card,ts,datestr,line,station,raw_token,money,raw_row FROM events ORDER BY card,ts,raw_row")
     def groups():
@@ -116,11 +118,13 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,key:bytes,max_gate_duration
 
     opener=gzip.open if out.suffix.lower()==".gz" else open
     with opener(out,"wt",encoding="utf-8",newline="") as f:
-        fields=["card_token","split","entry_time","exit_time","origin_token","destination_token","origin_line","origin_station",
+        fields=["split","entry_time","exit_time","origin_token","destination_token","origin_line","origin_station",
                 "destination_line","destination_station","duration_s","virtual_transfer_count","virtual_transfer_stations","virtual_transfer_policy_ids"]
         w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
         for card,events in groups():
             audit["unique_hashed_cards"]+=1
+            if audit["unique_hashed_cards"] % 500000 == 0:
+                print(json.dumps({"phase":"pair","cards":audit["unique_hashed_cards"],"gate_segments":audit["gate_segments"]}),flush=True)
             if card in blocked_cards:
                 audit["cards_blocked_by_unordered_reject"]+=1;audit["events_on_blocked_cards"]+=len(events);continue
             ts_counts=Counter(e[1] for e in events);segments=[];open_entry=None
@@ -153,7 +157,7 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,key:bytes,max_gate_duration
                     transfers.append(rule["station"]);policies.append(rule["id"])
                     audit["virtual_transfer_stitches"]+=1;audit["vt_"+rule["id"]]+=1
                     b=nb;j+=1
-                rec={"card_token":card,"split":split_name(card),
+                rec={"split":split_name(card),
                     "entry_time":(epoch+timedelta(seconds=a[1])).isoformat(sep=" "),
                     "exit_time":(epoch+timedelta(seconds=b[1])).isoformat(sep=" "),
                     "origin_token":a[5],"destination_token":b[5],"origin_line":a[3],"origin_station":a[4],
@@ -164,9 +168,9 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,key:bytes,max_gate_duration
     payload={k:v for k,v in sorted(audit.items())}
     payload.update({"rejects":dict(sorted(rejects.items())),"input_dates":sorted(seen_dates),
       "source_file":raw.name,"max_gate_duration_s":max_gate_duration_s,
-      "identity_mode":"SOURCE_TOKEN_LINE_SCOPED","card_pseudonym":"HMAC_SHA256_PRIVATE_KEY_TRUNC32",
+      "identity_mode":"SOURCE_TOKEN_LINE_SCOPED","card_grouping":"TRANSIENT_SHA256_GROUP_KEY_NOT_OUTPUT",
       "active_virtual_policy_ids":[x["id"] for x in VIRTUAL_RULES],
-      "privacy":"Row-level formal journeys are private output; raw card IDs are never persisted outside the transient input file.",
+      "privacy":"Raw card IDs and transient grouping hashes are not written to the journey output; only stable split labels are persisted.",
       "status":"INGEST_EXECUTED"})
     audit_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     con.close();return payload
@@ -175,10 +179,9 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--raw",type=Path,required=True);ap.add_argument("--db",type=Path,required=True)
     ap.add_argument("--out",type=Path,required=True);ap.add_argument("--audit-out",type=Path,required=True)
-    ap.add_argument("--hmac-key-file",type=Path,required=True);ap.add_argument("--max-gate-duration-s",type=int,default=21600)
-    a=ap.parse_args();key=bytes.fromhex(a.hmac_key_file.read_text().strip())
-    if len(key)<32:raise SystemExit("HMAC key must be >=32 bytes")
-    payload=ingest(a.raw,a.db,a.out,a.audit_out,key,a.max_gate_duration_s)
+    ap.add_argument("--max-gate-duration-s",type=int,default=21600)
+    a=ap.parse_args()
+    payload=ingest(a.raw,a.db,a.out,a.audit_out,a.max_gate_duration_s)
     print(json.dumps(payload,ensure_ascii=False))
 
 if __name__=="__main__":main()

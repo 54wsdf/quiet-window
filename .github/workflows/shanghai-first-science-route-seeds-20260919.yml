@@ -25,6 +25,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2'
           cd scripts
           python -m unittest -v test_shanghai_first_science_route_seeds.py
           python -m py_compile shanghai_first_science_route_seeds.py shanghai_route_frontier.py

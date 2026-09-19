@@ -1,12 +1,6 @@
 name: Shanghai First-Science Structural Route Seeds 2026-09-19
 
 on:
-  push:
-    paths:
-      - 'scripts/shanghai_first_science_route_seeds.py'
-      - 'scripts/shanghai_route_frontier.py'
-      - 'scripts/test_shanghai_first_science_route_seeds.py'
-      - '.github/workflows/shanghai-first-science-route-seeds-20260919.yml'
   workflow_dispatch:
 
 permissions:
@@ -15,10 +9,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 300
     env:
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
-      FORMAL_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919
+      PARQUET_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919/parquet_v1/builds/35428783632
     steps:
       - uses: actions/checkout@v5
       - name: Run bounded tests
@@ -43,19 +37,18 @@ jobs:
           echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
           echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/route-seeds/formal" "$RUNNER_TEMP/route-seeds/static" "$RUNNER_TEMP/route-seeds/output"
-      - name: Download immutable formal journey inputs
+      - name: Download qualified formal journey Parquet mirrors
         shell: bash
         env:
           CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
           REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
         run: |
           set -euo pipefail
-          declare -A RUNS=( [20160701]=35418217135 [20160802]=35422980321 [20160901]=35423928273 )
-          declare -A BYTES=( [20160701]=114429189 [20160802]=107191858 [20160901]=107583938 )
-          declare -A SHA=( [20160701]=9311937404c5eac5ec205b8d05ced9408a752220e8b6f36f541eec2682c80cf9 [20160802]=db52f2b5ea51a411e2ce6d9b904b1723c3e2320e617320f2a52722d6ce1a369d [20160901]=d9f96241f53d87fa89f00937f9cf45c4b4e914cafeb12d4911a256f417c8c397 )
+          declare -A BYTES=( [20160701]=72698566 [20160802]=67836155 [20160901]=68075378 )
+          declare -A SHA=( [20160701]=0ac5815739f001640af78053723dafb2d0fde5fbb8c965983a29e5edd39bcfd0 [20160802]=bddc44435a4aae9ff85fad952e81a91ec94a9e676d1a9abb538374ca0881912b [20160901]=0bddd2f51a3f77056fbf0a8e0d148dec3c2667312b970c3abb7017012b43d5a5 )
           for day in 20160701 20160802 20160901; do
-            f="SPTCC-${day}.formal_mppd_journeys.csv.gz"
-            src="$FORMAL_DRIVE/builds/${RUNS[$day]}/$day/$f"
+            f="SPTCC-${day}.formal_mppd_journeys.parquet"
+            src="$PARQUET_DRIVE/${day}/$f"
             dst="$RUNNER_TEMP/route-seeds/formal/$f"
             rclone copyto "$REMOTE_NAME:$src" "$dst" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
             test "$(stat -c%s "$dst")" -eq "${BYTES[$day]}"

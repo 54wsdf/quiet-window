@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/shanghai-jul01-formal-vs-strict-reconcile-20260919.yml'
+      - 'scripts/shanghai_jul01_formal_vs_strict.py'
   workflow_dispatch:
 
 permissions:

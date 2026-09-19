@@ -21,21 +21,27 @@ def main():
       SELECT
         strftime(entry_ts,'%Y-%m-%d %H:%M:%S') entry_time,
         strftime(exit_ts,'%Y-%m-%d %H:%M:%S') exit_time,
-        entry_station origin_token,
-        exit_station destination_token,
+        entry_station origin_token_literal,
+        exit_station destination_token_literal,
+        replace(trim(entry_station), '﻿', '') origin_token,
+        replace(trim(exit_station), '﻿', '') destination_token,
         duration_sec::BIGINT duration_s,
         count(*)::BIGINT n
       FROM read_parquet(?)
-      GROUP BY 1,2,3,4,5
+      GROUP BY 1,2,3,4,5,6,7
     """,[str(a.strict)])
     con.execute("""
       CREATE TABLE formal AS
-      SELECT entry_time,exit_time,origin_token,destination_token,
+      SELECT entry_time,exit_time,
+             origin_token origin_token_literal,
+             destination_token destination_token_literal,
+             replace(trim(origin_token), '﻿', '') origin_token,
+             replace(trim(destination_token), '﻿', '') destination_token,
              try_cast(duration_s AS BIGINT) duration_s,
              try_cast(virtual_transfer_count AS INTEGER) virtual_transfer_count,
              count(*)::BIGINT n
       FROM read_csv_auto(?,header=true,all_varchar=true)
-      GROUP BY 1,2,3,4,5,6
+      GROUP BY 1,2,3,4,5,6,7,8
     """,[str(a.formal)])
 
     strict_rows=con.execute("SELECT sum(n) FROM strict").fetchone()[0]
@@ -48,6 +54,17 @@ def main():
       CREATE TABLE f0 AS SELECT entry_time,exit_time,origin_token,destination_token,duration_s,sum(n)::BIGINT n
       FROM formal WHERE virtual_transfer_count=0 GROUP BY 1,2,3,4,5
     """)
+    literal_exact=con.execute("""
+      WITH s AS (
+        SELECT entry_time,exit_time,origin_token_literal,destination_token_literal,duration_s,sum(n)::BIGINT n
+        FROM strict GROUP BY 1,2,3,4,5
+      ), f AS (
+        SELECT entry_time,exit_time,origin_token_literal,destination_token_literal,duration_s,sum(n)::BIGINT n
+        FROM formal WHERE virtual_transfer_count=0 GROUP BY 1,2,3,4,5
+      )
+      SELECT coalesce(sum(least(s.n,f.n)),0)
+      FROM s JOIN f USING(entry_time,exit_time,origin_token_literal,destination_token_literal,duration_s)
+    """).fetchone()[0]
     exact=con.execute("""
       SELECT coalesce(sum(least(s.n,f.n)),0)
       FROM strict s JOIN f0 f USING(entry_time,exit_time,origin_token,destination_token,duration_s)
@@ -83,18 +100,22 @@ def main():
       "audit_gate_segments":int(audit.get("gate_segments",0)),
       "audit_journeys":int(audit.get("journeys",0)),
       "audit_virtual_transfer_stitches":int(audit.get("virtual_transfer_stitches",0)),
+      "literal_token_exact_retained_strict_segment_rows":int(literal_exact),
+      "literal_token_formal_nonstitched_unmatched":int(nonstitched-literal_exact),
+      "token_normalization":"strip_whitespace_and_remove_U+FEFF",
       "exact_retained_strict_segment_rows":int(exact),
       "strict_rows_not_exactly_retained":int(strict_not_exactly_retained),
       "formal_nonstitched_rows_not_in_strict":int(formal_nonstitched_unmatched),
       "invariants":{
         "formal_matches_audit":int(formal_rows)==int(audit.get("journeys",0)),
         "stitch_mass_matches_audit":int(stitch_ops)==int(audit.get("virtual_transfer_stitches",0)),
-        "nonstitched_formal_subset_of_strict":int(formal_nonstitched_unmatched)==0,
+        "normalized_nonstitched_formal_subset_of_strict":int(formal_nonstitched_unmatched)==0,
         "journey_mass_equals_gate_minus_stitches":int(audit.get("journeys",0))==int(audit.get("gate_segments",0))-int(audit.get("virtual_transfer_stitches",0))
       },
       "barrier_counters":{k:v for k,v in audit.items() if "barrier" in k or "duplicate" in k or "over_max" in k or k in ("entry_before_exit","exit_without_entry","open_entry_at_end")},
       "interpretation_boundary":[
-        "Exact signature reconciliation compares non-stitched formal journeys with pre-existing strict gate segments.",
+        "Exact signature reconciliation compares non-stitched formal journeys with pre-existing strict gate segments after source-token normalization (trim plus U+FEFF removal).",
+        "Literal-token mismatch is retained as a diagnostic because the formal worker normalizes token formatting before output.",
         "Stitched formal journeys are composite rows and are expected not to match one strict segment signature.",
         "A barrier counter is an event/state-machine diagnostic, not automatically a one-to-one count of removed strict journeys.",
         "This reconciliation does not assign routes, trains, or service posterior."

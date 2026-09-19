@@ -1,0 +1,92 @@
+name: Shanghai First-Science Structural Route Seeds 2026-09-19
+
+on:
+  push:
+    paths:
+      - 'scripts/shanghai_first_science_route_seeds.py'
+      - 'scripts/shanghai_route_frontier.py'
+      - 'scripts/test_shanghai_first_science_route_seeds.py'
+      - '.github/workflows/shanghai-first-science-route-seeds-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      FORMAL_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/10_mppd_formal_journeys_20260919
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run bounded tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd scripts
+          python -m unittest -v test_shanghai_first_science_route_seeds.py
+          python -m py_compile shanghai_first_science_route_seeds.py shanghai_route_frontier.py
+      - name: Prepare runtime and protected Drive
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'duckdb>=1.1,<2'
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/route-seeds/formal" "$RUNNER_TEMP/route-seeds/static" "$RUNNER_TEMP/route-seeds/output"
+      - name: Download immutable formal journey inputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          declare -A RUNS=( [20160701]=35418217135 [20160802]=35422980321 [20160901]=35423928273 )
+          declare -A BYTES=( [20160701]=114429189 [20160802]=107191858 [20160901]=107583938 )
+          declare -A SHA=( [20160701]=9311937404c5eac5ec205b8d05ced9408a752220e8b6f36f541eec2682c80cf9 [20160802]=db52f2b5ea51a411e2ce6d9b904b1723c3e2320e617320f2a52722d6ce1a369d [20160901]=d9f96241f53d87fa89f00937f9cf45c4b4e914cafeb12d4911a256f417c8c397 )
+          for day in 20160701 20160802 20160901; do
+            f="SPTCC-${day}.formal_mppd_journeys.csv.gz"
+            src="$FORMAL_DRIVE/builds/${RUNS[$day]}/$day/$f"
+            dst="$RUNNER_TEMP/route-seeds/formal/$f"
+            rclone copyto "$REMOTE_NAME:$src" "$dst" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+            test "$(stat -c%s "$dst")" -eq "${BYTES[$day]}"
+            test "$(sha256sum "$dst" | awk '{print $1}')" = "${SHA[$day]}"
+          done
+      - name: Fetch pinned structural snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://raw.githubusercontent.com/jeevanyue/metro/bb78b72ecadc57e0c8deedf9731a78a65ab62ef4'
+          curl -fsSL "$BASE/train/base/station.txt" -o "$RUNNER_TEMP/route-seeds/static/station.txt"
+          curl -fsSL "$BASE/connections_by_station_name.json" -o "$RUNNER_TEMP/route-seeds/static/connections_by_station_name.json"
+      - name: Aggregate support and replay structural seeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_first_science_route_seeds.py \
+            --journey-dir "$RUNNER_TEMP/route-seeds/formal" \
+            --station "$RUNNER_TEMP/route-seeds/static/station.txt" \
+            --connections "$RUNNER_TEMP/route-seeds/static/connections_by_station_name.json" \
+            --out-dir "$RUNNER_TEMP/route-seeds/output"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-first-science-structural-route-seeds
+          path: ${{ runner.temp }}/route-seeds/output/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Cleanup protected inputs
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/route-seeds/formal"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

@@ -1,6 +1,9 @@
 name: Shanghai Aug02 Formal vs Strict Reconciliation 2026-09-19
 
 on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-aug02-formal-vs-strict-reconcile-20260919.yml'
   workflow_dispatch:
 
 permissions:

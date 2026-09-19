@@ -1,0 +1,91 @@
+name: Shanghai First-Science Service Screening Stage1 2026-09-19
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+      ROUTE_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/route_seeds/builds/35428253164
+      OUT_DRIVE: transport_data_lake/01_rail/CN_Shanghai_Metro_5min_station_counts/12_mppd_service_screening_20260919/stage1
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run bounded tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd scripts
+          python -m unittest -v test_shanghai_first_science_service_screen_stage1.py
+          python -m py_compile shanghai_first_science_service_screen_stage1.py
+      - name: Prepare protected Drive
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"; umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/stage1/route" "$RUNNER_TEMP/stage1/soda/train/base" "$RUNNER_TEMP/stage1/prior" "$RUNNER_TEMP/stage1/output"
+      - name: Download immutable route-seed outputs
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          rclone copy "$REMOTE_NAME:$ROUTE_DRIVE" "$RUNNER_TEMP/stage1/route" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          test -s "$RUNNER_TEMP/stage1/route/first_science_structural_route_seeds.jsonl.gz"
+          test -s "$RUNNER_TEMP/stage1/route/qualification.json"
+      - name: Rebuild frozen progression prior
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://raw.githubusercontent.com/jeevanyue/metro/bb78b72ecadc57e0c8deedf9731a78a65ab62ef4'
+          curl -fsSL "$BASE/train/base/station.txt" -o "$RUNNER_TEMP/stage1/soda/train/base/station.txt"
+          curl -fsSL "$BASE/train/base/timetable.txt" -o "$RUNNER_TEMP/stage1/soda/train/base/timetable.txt"
+          python scripts/shanghai_station_progression_prior.py --snapshot-root "$RUNNER_TEMP/stage1/soda" --out-dir "$RUNNER_TEMP/stage1/prior"
+          test "$(sha256sum "$RUNNER_TEMP/stage1/prior/segment_station_progression_prior.csv" | awk '{print $1}')" = "804216bbe5c6bde4c882c148d743868e4fddd67d491f5361ffe5c3e493cdd00c"
+      - name: Screen service uncertainty conservatively
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_first_science_service_screen_stage1.py \
+            --route-seeds "$RUNNER_TEMP/stage1/route/first_science_structural_route_seeds.jsonl.gz" \
+            --route-qualification "$RUNNER_TEMP/stage1/route/qualification.json" \
+            --prior "$RUNNER_TEMP/stage1/prior/segment_station_progression_prior.csv" \
+            --service-worlds "data/shanghai_service_screening_20260919/SHANGHAI_FIRST_SCIENCE_SERVICE_WORLDS_V1.json" \
+            --out-dir "$RUNNER_TEMP/stage1/output"
+      - name: Persist aggregate and route-vector screening
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          BUILD="$OUT_DRIVE/builds/$GITHUB_RUN_ID"
+          rclone copy "$RUNNER_TEMP/stage1/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --retries 6 --low-level-retries 20
+          rclone check "$RUNNER_TEMP/stage1/output" "$REMOTE_NAME:$BUILD" --config "$CONFIG_FILE" --size-only --one-way
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-first-science-service-screening-stage1
+          path: ${{ runner.temp }}/stage1/output/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Cleanup
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/stage1/route"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"; fi

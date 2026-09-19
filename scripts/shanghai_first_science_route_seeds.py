@@ -98,7 +98,7 @@ def main():
     for day in ["20160701","20160802","20160901"]:
         p=a.journey_dir/f"SPTCC-{day}.formal_mppd_journeys.csv.gz"
         ps=str(p).replace("'","''")
-        parts.append("SELECT '"+day+"' day,origin_token,destination_token,substr(entry_time,12,8) clock,count(*)::BIGINT n FROM read_csv_auto('"+ps+"',header=true,all_varchar=true) GROUP BY 1,2,3,4")
+        parts.append("SELECT '"+day+"' AS day,origin_token,destination_token,substr(entry_time,12,8) AS clock,count(*)::BIGINT AS n FROM read_csv_auto('"+ps+"',header=true,all_varchar=true) GROUP BY 1,2,3,4")
     rows=con.execute(" UNION ALL ".join(parts)).fetchall(); con.close()
 
     support=Counter(); od_mass=Counter()

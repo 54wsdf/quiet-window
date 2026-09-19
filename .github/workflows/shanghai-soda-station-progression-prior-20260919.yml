@@ -1,0 +1,50 @@
+name: Shanghai SODA Station Progression Prior 2026-09-19
+
+on:
+  push:
+    paths:
+      - 'scripts/shanghai_station_progression_prior.py'
+      - 'scripts/test_shanghai_station_progression_prior.py'
+      - '.github/workflows/shanghai-soda-station-progression-prior-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run bounded unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd scripts
+          python -m unittest -v test_shanghai_station_progression_prior.py
+          python -m py_compile shanghai_station_progression_prior.py
+      - name: Fetch pinned public SODA inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/progression/input" "$RUNNER_TEMP/progression/output"
+          BASE='https://raw.githubusercontent.com/jeevanyue/metro/bb78b72ecadc57e0c8deedf9731a78a65ab62ef4'
+          curl -fsSL "$BASE/train/base/station.txt" -o "$RUNNER_TEMP/progression/input/station.txt"
+          curl -fsSL "$BASE/train/base/timetable.txt" -o "$RUNNER_TEMP/progression/input/timetable.txt"
+          curl -fsSL "$BASE/connections_by_station_name.json" -o "$RUNNER_TEMP/progression/input/connections_by_station_name.json"
+      - name: Materialize and fail-closed reproduce frozen audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/shanghai_station_progression_prior.py \
+            --station "$RUNNER_TEMP/progression/input/station.txt" \
+            --timetable "$RUNNER_TEMP/progression/input/timetable.txt" \
+            --connections "$RUNNER_TEMP/progression/input/connections_by_station_name.json" \
+            --outdir "$RUNNER_TEMP/progression/output"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-soda-station-progression-prior
+          path: ${{ runner.temp }}/progression/output/*
+          if-no-files-found: error
+          retention-days: 14

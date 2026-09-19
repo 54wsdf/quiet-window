@@ -125,7 +125,7 @@ jobs:
           all_cross_od=set.intersection(*(od_sets[d] for d in days))
           union_cross_od=set.union(*(od_sets[d] for d in days))
 
-          union_sql=' UNION ALL '.join([f"SELECT '{d}' day,* FROM read_parquet('{inp/f'SPTCC-{d}.strict_metro_journeys.parquet'}')" for d in days])
+          union_sql=' UNION ALL '.join([f"SELECT '{d}' AS day,* FROM read_parquet('{inp/f'SPTCC-{d}.strict_metro_journeys.parquet'}')" for d in days])
           con.execute(f'CREATE OR REPLACE VIEW allj AS {union_sql}')
           recurrence=con.execute('''WITH x AS (
               SELECT day,entry_station,exit_station,count(*) n FROM allj GROUP BY 1,2,3), y AS (

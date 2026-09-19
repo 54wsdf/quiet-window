@@ -39,8 +39,7 @@ def parse_station(raw:str):
     token=(raw or "").replace("\ufeff","").strip()
     m=re.match(r"^(\d+)号线(.+)$",token)
     if not m:return None
-    line=m.group(1).zfill(2); station=m.group(2).strip()
-    return line,station,token
+    return m.group(1).zfill(2),m.group(2).strip(),token
 
 def group_token(card:str):
     return hashlib.sha256(("group:"+card).encode("utf-8")).hexdigest()
@@ -65,49 +64,63 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,max_gate_duration_s=21600):
     cur.executescript(
       "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;"
       "DROP TABLE IF EXISTS events;DROP TABLE IF EXISTS blocked;"
-      "CREATE TABLE events(card TEXT,ts INTEGER,datestr TEXT,line TEXT,station TEXT,raw_token TEXT,money REAL,raw_row INTEGER);"
+      "CREATE TABLE events(card TEXT,ts INTEGER,datestr TEXT,line TEXT,station TEXT,raw_token TEXT,money REAL,raw_row INTEGER,barrier TEXT);"
       "CREATE TABLE blocked(card TEXT PRIMARY KEY);")
     audit=Counter();rejects=Counter();batch=[];blocked=[];epoch=datetime(1970,1,1);seen_dates=set()
+
+    def flush(force=False):
+        if batch and (force or len(batch)>=100000):
+            cur.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?)",batch);batch.clear();con.commit()
+        if blocked and (force or len(blocked)>=5000):
+            cur.executemany("INSERT OR IGNORE INTO blocked VALUES(?)",blocked);blocked.clear();con.commit()
+
     for i,r in enumerate(iter_rows(raw),start=1):
         audit["input_rows"]+=1
-        if i % 1000000 == 0:
-            print(json.dumps({"phase":"scan","rows":i,"metro_events":audit["metro_events"]}),flush=True)
-        if (r.get("vehicle") or "").strip()!="地铁":
-            audit["non_metro_rows"]+=1;continue
+        if i%1000000==0:
+            print(json.dumps({"phase":"scan","rows":i,"metro_source_rows":audit["metro_source_rows"]}),flush=True)
         raw_card=(r.get("card_id") or "").strip()
         if not raw_card:
             rejects["missing_card_id"]+=1;continue
         card=group_token(raw_card)
         try:
             datestr=r["date"].strip()
-            if datestr not in TARGET_DATES:raise ValueError("unexpected date")
+            if datestr not in TARGET_DATES:raise ValueError("unexpected source date")
             dt=datetime.strptime(datestr+" "+r["time"].strip(),"%Y-%m-%d %H:%M:%S")
         except Exception:
-            rejects["datetime_or_date"]+=1;blocked.append((card,));continue
+            rejects["datetime_or_date"]+=1;blocked.append((card,));flush();continue
         seen_dates.add(datestr);ts=int((dt-epoch).total_seconds())
+        vehicle=(r.get("vehicle") or "").strip()
+        if vehicle!="地铁":
+            audit["non_metro_rows"]+=1;audit["non_metro_barrier_events"]+=1;audit["timestamped_card_events"]+=1
+            batch.append((card,ts,datestr,"","","",None,i,"NON_METRO"));flush();continue
+
+        audit["metro_source_rows"]+=1
         p=parse_station(r.get("station",""))
         try:money=float(r["money"])
         except Exception:money=None
         if p is None:
             rejects["station_parse"]+=1
-            batch.append((card,ts,datestr,"","","",None,i));audit["station_barrier_events"]+=1;audit["metro_events"]+=1
+            batch.append((card,ts,datestr,"","","",None,i,"STATION_PARSE"))
+            audit["station_barrier_events"]+=1;audit["metro_events"]+=1;audit["timestamped_card_events"]+=1
         elif money is None:
             rejects["money_parse"]+=1
-            batch.append((card,ts,datestr,p[0],p[1],p[2],None,i));audit["money_barrier_events"]+=1;audit["metro_events"]+=1
+            batch.append((card,ts,datestr,p[0],p[1],p[2],None,i,"MONEY_PARSE"))
+            audit["money_barrier_events"]+=1;audit["metro_events"]+=1;audit["timestamped_card_events"]+=1
         elif money<0:
             rejects["negative_money"]+=1
-            batch.append((card,ts,datestr,p[0],p[1],p[2],None,i));audit["negative_money_barrier_events"]+=1;audit["metro_events"]+=1
+            batch.append((card,ts,datestr,p[0],p[1],p[2],None,i,"NEGATIVE_MONEY"))
+            audit["negative_money_barrier_events"]+=1;audit["metro_events"]+=1;audit["timestamped_card_events"]+=1
         else:
-            batch.append((card,ts,datestr,p[0],p[1],p[2],money,i));audit["metro_events"]+=1
-        if len(batch)>=100000:
-            cur.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",batch);batch.clear();con.commit()
-        if len(blocked)>=5000:
-            cur.executemany("INSERT OR IGNORE INTO blocked VALUES(?)",blocked);blocked.clear();con.commit()
-    if batch:cur.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",batch)
-    if blocked:cur.executemany("INSERT OR IGNORE INTO blocked VALUES(?)",blocked)
-    con.commit();print(json.dumps({"phase":"index","events":audit["metro_events"]}),flush=True);cur.execute("CREATE INDEX idx_events_card_ts ON events(card,ts,raw_row)");con.commit()
+            batch.append((card,ts,datestr,p[0],p[1],p[2],money,i,""))
+            audit["metro_events"]+=1;audit["timestamped_card_events"]+=1
+        flush()
+    flush(force=True)
+
+    print(json.dumps({"phase":"index","timestamped_card_events":audit["timestamped_card_events"]}),flush=True)
+    cur.execute("CREATE INDEX idx_events_card_ts ON events(card,ts,raw_row)");con.commit()
     blocked_cards={x[0] for x in cur.execute("SELECT card FROM blocked")}
-    q=cur.execute("SELECT card,ts,datestr,line,station,raw_token,money,raw_row FROM events ORDER BY card,ts,raw_row")
+    q=cur.execute("SELECT card,ts,datestr,line,station,raw_token,money,raw_row,barrier FROM events ORDER BY card,ts,raw_row")
+
     def groups():
         current=None;g=[]
         for row in q:
@@ -122,54 +135,59 @@ def ingest(raw:Path,db:Path,out:Path,audit_path:Path,max_gate_duration_s=21600):
                 "destination_line","destination_station","duration_s","virtual_transfer_count","virtual_transfer_stations","virtual_transfer_policy_ids"]
         w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
         for card,events in groups():
-            audit["unique_hashed_cards"]+=1
-            if audit["unique_hashed_cards"] % 500000 == 0:
-                print(json.dumps({"phase":"pair","cards":audit["unique_hashed_cards"],"gate_segments":audit["gate_segments"]}),flush=True)
+            audit["unique_grouped_cards"]+=1
+            if audit["unique_grouped_cards"]%500000==0:
+                print(json.dumps({"phase":"pair","cards":audit["unique_grouped_cards"],"gate_segments":audit["gate_segments"]}),flush=True)
             if card in blocked_cards:
                 audit["cards_blocked_by_unordered_reject"]+=1;audit["events_on_blocked_cards"]+=len(events);continue
-            ts_counts=Counter(e[1] for e in events);segments=[];open_entry=None
-            for e in events:
-                _card,ts,datestr,line,station,raw_token,money,raw_row=e
+            ts_counts=Counter(e[1] for e in events);segments=[];open_entry=None;open_pos=None
+            for pos,e in enumerate(events):
+                _card,ts,datestr,line,station,raw_token,money,raw_row,barrier=e
                 if ts_counts[ts]>1:
-                    audit["duplicate_timestamp_events"]+=1;open_entry=None;continue
-                if money is None:
-                    audit["barrier_events"]+=1;open_entry=None;continue
+                    audit["duplicate_timestamp_events"]+=1;open_entry=None;open_pos=None;continue
+                if barrier or money is None:
+                    audit["barrier_events"]+=1
+                    if barrier:audit["barrier_"+barrier.lower()]+=1
+                    open_entry=None;open_pos=None;continue
                 if money==0:
                     if open_entry is not None:audit["entry_before_exit"]+=1
-                    open_entry=e
+                    open_entry=e;open_pos=pos
                 elif money>0:
                     if open_entry is None:
                         audit["exit_without_entry"]+=1;continue
                     if ts<=open_entry[1]:
-                        audit["nonpositive_duration"]+=1;open_entry=None;continue
+                        audit["nonpositive_duration"]+=1;open_entry=None;open_pos=None;continue
                     if ts-open_entry[1]>max_gate_duration_s:
-                        audit["gate_segment_over_max_duration"]+=1;open_entry=None;continue
-                    segments.append([open_entry,e]);open_entry=None
+                        audit["gate_segment_over_max_duration"]+=1;open_entry=None;open_pos=None;continue
+                    segments.append([open_entry,e,open_pos,pos]);open_entry=None;open_pos=None
             if open_entry is not None:audit["open_entry_at_end"]+=1
             audit["gate_segments"]+=len(segments)
+
             i=0
             while i<len(segments):
-                a,b=segments[i];transfers=[];policies=[];j=i+1
+                a,b,a_pos,b_pos=segments[i];transfers=[];policies=[];j=i+1
                 while j<len(segments):
-                    na,nb=segments[j];gap=na[1]-b[1]
+                    na,nb,na_pos,nb_pos=segments[j];gap=na[1]-b[1]
                     rule=virtual_rule(b[3],b[4],na[3],na[4],gap,na[2])
                     if rule is None:break
+                    if na_pos!=b_pos+1:
+                        audit["virtual_transfer_candidate_blocked_by_intervening_event"]+=1;break
                     transfers.append(rule["station"]);policies.append(rule["id"])
-                    audit["virtual_transfer_stitches"]+=1;audit["vt_"+rule["id"]]+=1
-                    b=nb;j+=1
-                rec={"split":split_name(card),
-                    "entry_time":(epoch+timedelta(seconds=a[1])).isoformat(sep=" "),
+                    audit["virtual_transfer_stitches"]+=1;audit["virtual_transfer_source_event_adjacency_verified"]+=1
+                    audit["vt_"+rule["id"]]+=1
+                    b=nb;b_pos=nb_pos;j+=1
+                rec={"split":split_name(card),"entry_time":(epoch+timedelta(seconds=a[1])).isoformat(sep=" "),
                     "exit_time":(epoch+timedelta(seconds=b[1])).isoformat(sep=" "),
                     "origin_token":a[5],"destination_token":b[5],"origin_line":a[3],"origin_station":a[4],
                     "destination_line":b[3],"destination_station":b[4],"duration_s":b[1]-a[1],
                     "virtual_transfer_count":len(transfers),"virtual_transfer_stations":"|".join(transfers),
                     "virtual_transfer_policy_ids":"|".join(policies)}
                 w.writerow(rec);audit["journeys"]+=1;audit["split_"+rec["split"]]+=1;i=j
+
     payload={k:v for k,v in sorted(audit.items())}
-    payload.update({"rejects":dict(sorted(rejects.items())),"input_dates":sorted(seen_dates),
-      "source_file":raw.name,"max_gate_duration_s":max_gate_duration_s,
-      "identity_mode":"SOURCE_TOKEN_LINE_SCOPED","card_grouping":"TRANSIENT_SHA256_GROUP_KEY_NOT_OUTPUT",
-      "active_virtual_policy_ids":[x["id"] for x in VIRTUAL_RULES],
+    payload.update({"rejects":dict(sorted(rejects.items())),"input_dates":sorted(seen_dates),"source_file":raw.name,
+      "max_gate_duration_s":max_gate_duration_s,"identity_mode":"SOURCE_TOKEN_LINE_SCOPED",
+      "card_grouping":"TRANSIENT_SHA256_GROUP_KEY_NOT_OUTPUT","active_virtual_policy_ids":[x["id"] for x in VIRTUAL_RULES],
       "privacy":"Raw card IDs and transient grouping hashes are not written to the journey output; only stable split labels are persisted.",
       "status":"INGEST_EXECUTED"})
     audit_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
@@ -180,8 +198,7 @@ def main():
     ap.add_argument("--raw",type=Path,required=True);ap.add_argument("--db",type=Path,required=True)
     ap.add_argument("--out",type=Path,required=True);ap.add_argument("--audit-out",type=Path,required=True)
     ap.add_argument("--max-gate-duration-s",type=int,default=21600)
-    a=ap.parse_args()
-    payload=ingest(a.raw,a.db,a.out,a.audit_out,a.max_gate_duration_s)
+    a=ap.parse_args();payload=ingest(a.raw,a.db,a.out,a.audit_out,a.max_gate_duration_s)
     print(json.dumps(payload,ensure_ascii=False))
 
 if __name__=="__main__":main()

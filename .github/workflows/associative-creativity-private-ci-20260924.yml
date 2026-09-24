@@ -1,0 +1,192 @@
+name: Associative Creativity Private CI 2026-09-24
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/associative-creativity-private-ci-20260924.yml'
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact associative-creativity source SHA staged in private Drive
+        required: true
+        default: '2a18ffc5f067a24e5723fca0199803efe1bab0b2'
+        type: string
+      staging_title:
+        description: Google Docs staging title without .txt export suffix
+        required: true
+        default: 'associative-creativity-ci-2a18ffc5f067a24e5723fca0199803efe1bab0b2'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha || '2a18ffc5f067a24e5723fca0199803efe1bab0b2' }}
+      STAGING_TITLE: ${{ inputs.staging_title || 'associative-creativity-ci-2a18ffc5f067a24e5723fca0199803efe1bab0b2' }}
+      STAGING_DIR: ChatGPT-CI-Staging
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+
+    steps:
+      - name: Prepare private Drive client
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo '::error::GDRIVE_RCLONE_CONFIG_B64 is missing.'
+            exit 2
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          CONFIG_FILE="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          test -n "$REMOTE_NAME"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download private staged source bundle
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          SRC="$REMOTE_NAME:$STAGING_DIR/$STAGING_TITLE.txt"
+          DST="$RUNNER_TEMP/associative-creativity-bundle.txt"
+          echo "staging_title=$STAGING_TITLE"
+          rclone copyto "$SRC" "$DST"             --config "$CONFIG_FILE"             --drive-export-formats txt             --retries 4             --low-level-retries 8
+          test -s "$DST"
+          echo "bundle_bytes=$(stat -c%s "$DST")"
+
+      - name: Reconstruct exact private snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BUNDLE="$RUNNER_TEMP/associative-creativity-bundle.txt"
+          export WORK="$RUNNER_TEMP/associative-creativity"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          bundle = Path(os.environ["BUNDLE"])
+          work = Path(os.environ["WORK"])
+          lines = [line for line in bundle.read_text(encoding="utf-8").splitlines() if line.strip()]
+          if not lines:
+              raise SystemExit("empty staging bundle")
+
+          meta = json.loads(lines[0])
+          expected_sha = os.environ["SOURCE_SHA"]
+          if meta.get("schema") != "associative-creativity-ci-bundle/v1":
+              raise SystemExit(f"unexpected bundle schema: {meta!r}")
+          if meta.get("source_repo") != "54wsdf/associative-creativity":
+              raise SystemExit(f"unexpected source repo: {meta!r}")
+          if meta.get("source_sha") != expected_sha:
+              raise SystemExit(
+                  f"source SHA mismatch: bundle={meta.get('source_sha')} expected={expected_sha}"
+              )
+
+          work.mkdir(parents=True, exist_ok=True)
+          seen = set()
+          for raw in lines[1:]:
+              row = json.loads(raw)
+              rel = Path(row["path"])
+              if rel.is_absolute() or ".." in rel.parts:
+                  raise SystemExit(f"unsafe staged path: {rel}")
+              key = rel.as_posix()
+              if key in seen:
+                  raise SystemExit(f"duplicate staged path: {key}")
+              seen.add(key)
+              dst = work / rel
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_text(row["content"], encoding="utf-8")
+
+          required = {
+              "plugin.json",
+              ".codex-plugin/plugin.json",
+              "skills/associative-creativity/SKILL.md",
+              ".agents/skills/associative-creativity/SKILL.md",
+              "src/associative_creativity/wander.py",
+              "src/associative_creativity/data/remote_catalog.json",
+              "scripts/verify.py",
+          }
+          missing = sorted(required - seen)
+          if missing:
+              raise SystemExit(f"staging bundle missing required paths: {missing}")
+
+          receipt = {
+              "schema": "associative-creativity-ci-reconstruction/v1",
+              "source_repo": meta["source_repo"],
+              "source_sha": meta["source_sha"],
+              "staged_file_count": len(seen),
+          }
+          receipt_path = Path(os.environ["RUNNER_TEMP"]) / "ac-ci-reconstruction.json"
+          receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+          print(json.dumps(receipt))
+          PY
+
+      - name: Run repository verification
+        working-directory: ${{ runner.temp }}/associative-creativity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 scripts/verify.py
+
+      - name: Write PASS receipt
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          src = Path(os.environ["RUNNER_TEMP"]) / "ac-ci-reconstruction.json"
+          data = json.loads(src.read_text(encoding="utf-8"))
+          data["verification"] = "PASS"
+          data["executor_repo"] = "54wsdf/quiet-window"
+          data["run_id"] = os.environ["GITHUB_RUN_ID"]
+          data["runner_os"] = os.environ.get("RUNNER_OS")
+          data["runner_arch"] = os.environ.get("RUNNER_ARCH")
+          out = Path(os.environ["RUNNER_TEMP"]) / "ac-ci-pass.json"
+          out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+          print(json.dumps(data))
+          PY
+
+      - name: Upload receipt only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: associative-creativity-ci-receipt-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ac-ci-reconstruction.json
+            ${{ runner.temp }}/ac-ci-pass.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove private staging document after success
+        if: success()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+          REMOTE_NAME: ${{ steps.storage.outputs.remote_name }}
+        run: |
+          set -euo pipefail
+          rclone deletefile "$REMOTE_NAME:$STAGING_DIR/$STAGING_TITLE.txt"             --config "$CONFIG_FILE"             --drive-export-formats txt             --retries 3             --low-level-retries 5
+
+      - name: Cleanup credentials and private bytes
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          rm -rf "$RUNNER_TEMP/associative-creativity"                  "$RUNNER_TEMP/associative-creativity-bundle.txt"
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

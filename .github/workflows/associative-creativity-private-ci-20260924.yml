@@ -77,7 +77,7 @@ jobs:
 
           bundle = Path(os.environ["BUNDLE"])
           work = Path(os.environ["WORK"])
-          lines = [line for line in bundle.read_text(encoding="utf-8").splitlines() if line.strip()]
+          lines = [line for line in bundle.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
           if not lines:
               raise SystemExit("empty staging bundle")
 

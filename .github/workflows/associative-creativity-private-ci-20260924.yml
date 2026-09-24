@@ -10,12 +10,12 @@ on:
       source_sha:
         description: Exact associative-creativity source SHA staged in private Drive
         required: true
-        default: '2a18ffc5f067a24e5723fca0199803efe1bab0b2'
+        default: '0664c358c901f59001b525c73fec84648429d17f'
         type: string
       staging_title:
         description: Google Docs staging title without .txt export suffix
         required: true
-        default: 'associative-creativity-ci-2a18ffc5f067a24e5723fca0199803efe1bab0b2'
+        default: 'associative-creativity-ci-0664c358c901f59001b525c73fec84648429d17f'
         type: string
 
 permissions:
@@ -26,8 +26,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      SOURCE_SHA: ${{ inputs.source_sha || '2a18ffc5f067a24e5723fca0199803efe1bab0b2' }}
-      STAGING_TITLE: ${{ inputs.staging_title || 'associative-creativity-ci-2a18ffc5f067a24e5723fca0199803efe1bab0b2' }}
+      SOURCE_SHA: ${{ inputs.source_sha || '0664c358c901f59001b525c73fec84648429d17f' }}
+      STAGING_TITLE: ${{ inputs.staging_title || 'associative-creativity-ci-0664c358c901f59001b525c73fec84648429d17f' }}
       STAGING_DIR: transport_data_lake/ci_staging_associative_creativity
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
 

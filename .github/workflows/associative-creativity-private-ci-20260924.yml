@@ -28,7 +28,7 @@ jobs:
     env:
       SOURCE_SHA: ${{ inputs.source_sha || '2a18ffc5f067a24e5723fca0199803efe1bab0b2' }}
       STAGING_TITLE: ${{ inputs.staging_title || 'associative-creativity-ci-2a18ffc5f067a24e5723fca0199803efe1bab0b2' }}
-      STAGING_DIR: ChatGPT-CI-Staging
+      STAGING_DIR: transport_data_lake/ci_staging_associative_creativity
       GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
 
     steps:

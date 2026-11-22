@@ -1,0 +1,39 @@
+name: BART Historical Monthly OD Full Archive
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: ${{ matrix.group }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        group:
+          - bart_annual_od_2001_2010
+          - bart_annual_od_2011_2017
+          - bart_annual_od_2018_2025
+          - bart_monthly_od_2026
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install --disable-pip-version-check requests beautifulsoup4
+      - name: Acquire original published OD spreadsheets
+        run: python scripts/fetchers/bart_monthly_od_archive_20261123.py --group "${{ matrix.group }}" --output-root out
+      - name: Publish data and manifest for Drive transfer
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.group }}
+          path: out/${{ matrix.group }}/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 3

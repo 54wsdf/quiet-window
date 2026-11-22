@@ -1,0 +1,29 @@
+name: NYC Subway Matched Daily Public Sample 2025-01-08
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check requests
+      - name: Fetch date-matched schedule and AFC sample
+        run: python scripts/fetchers/nyc_one_day_matched_20261123.py
+      - name: Save verified public data sample
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyc_day_sample_20250108
+          path: out/nyc_day_sample_20250108/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0

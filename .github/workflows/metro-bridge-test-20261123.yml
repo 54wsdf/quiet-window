@@ -1,0 +1,39 @@
+name: Metro Data Cloud Connector Bridge Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download and validate BART official GTFS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          curl -fL --retry 4 --max-time 180 -A 'Research public timetable archive' \
+             -o staging/bart_gtfs_20261123.zip \
+             'https://www.bart.gov/dev/schedules/google_transit.zip'
+          file staging/bart_gtfs_20261123.zip
+          python - <<'PY'
+          import os,zipfile,hashlib
+          p='staging/bart_gtfs_20261123.zip'
+          with zipfile.ZipFile(p) as z:
+              names=z.namelist()
+              assert 'stops.txt' in names and 'stop_times.txt' in names and 'trips.txt' in names, names
+              assert z.testzip() is None
+          print('VALID_GTFS bytes=',os.path.getsize(p),'sha256=',hashlib.sha256(open(p,'rb').read()).hexdigest())
+          PY
+      - name: Publish bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bart-official-gtfs-20261123
+          path: staging/bart_gtfs_20261123.zip
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error

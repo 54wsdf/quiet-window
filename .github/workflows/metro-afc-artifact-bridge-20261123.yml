@@ -1,0 +1,76 @@
+name: Full Metro AFC and Timetables via Artifact Bridge
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metro-afc-artifact-bridge-20261123
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        task:
+          - taipei_od_2017
+          - taipei_od_2018
+          - taipei_od_2019
+          - taipei_od_2020
+          - taipei_od_2021
+          - taipei_od_2022
+          - taipei_od_2023
+          - taipei_od_2024
+          - taipei_od_2025
+          - taipei_od_2026
+          - taipei_timetables
+          - bart_od_2011_2014
+          - bart_od_2015_2018
+          - bart_od_2019_2022
+          - bart_od_2023_2026
+          - nyc_schedule_2025_01
+          - nyc_schedule_2025_02
+          - nyc_schedule_2025_03
+          - nyc_schedule_2025_04
+          - nyc_schedule_2025_05
+          - nyc_schedule_2025_06
+          - nyc_schedule_2025_07
+          - nyc_schedule_2025_08
+          - nyc_schedule_2025_09
+          - nyc_schedule_2025_10
+          - nyc_schedule_2025_11
+          - nyc_schedule_2025_12
+          - nyc_od_2025
+          - nyc_hourly_2025on
+          - nyc_hourly_2020_2024
+          - nyc_gtfs
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install HTTP and HTML clients
+        run: pip install --disable-pip-version-check requests beautifulsoup4
+      - name: Acquire and validate source data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetchers/metro_afc_artifact_fetch_20261123.py \
+            --task "${{ matrix.task }}" \
+            --output-root out
+      - name: Upload independently checkable source bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.task }}
+          path: out/${{ matrix.task }}/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 1

@@ -1,0 +1,98 @@
+name: Full Public Metro AFC and Timetable Archive 2026-11-23
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metro-afc-timetable-full-20261123
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        task:
+          - taipei_od
+          - taipei_timetables
+          - bart_od
+          - bart_gtfs
+          - nyc_gtfs
+          - nyc_od_2025
+          - nyc_hourly_2025on
+          - nyc_hourly_2020_2024
+          - nyc_schedule_2025_01
+          - nyc_schedule_2025_02
+          - nyc_schedule_2025_03
+          - nyc_schedule_2025_04
+          - nyc_schedule_2025_05
+          - nyc_schedule_2025_06
+          - nyc_schedule_2025_07
+          - nyc_schedule_2025_08
+          - nyc_schedule_2025_09
+          - nyc_schedule_2025_10
+          - nyc_schedule_2025_11
+          - nyc_schedule_2025_12
+    env:
+      GDRIVE_CONFIG_B64: ${{ secrets.GDRIVE_RCLONE_CONFIG_B64 }}
+    steps:
+      - name: Check authorized Drive archive configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GDRIVE_CONFIG_B64:-}" ]]; then
+            echo 'Missing Drive storage secret; no download attempted' >&2
+            exit 3
+          fi
+      - name: Checkout archive fetchers
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests beautifulsoup4
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+      - name: Set up temporary Drive credentials
+        id: storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="$RUNNER_TEMP/rclone_metro_archive.conf"
+          umask 077
+          printf '%s' "$GDRIVE_CONFIG_B64" | base64 --decode > "$CONFIG_FILE"
+          REMOTE_NAME="$(awk -F'[][]' '/^\[[^]]+\]/{print $2; exit}' "$CONFIG_FILE")"
+          if [[ -z "$REMOTE_NAME" ]]; then
+            echo 'Rclone remote section absent' >&2
+            exit 4
+          fi
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+          echo "remote_name=$REMOTE_NAME" >> "$GITHUB_OUTPUT"
+      - name: Fetch official public metro data and verify Drive byte sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetchers/metro_afc_timetable_archive_20261123.py \
+            --task "${{ matrix.task }}" \
+            --config "${{ steps.storage.outputs.config_file }}" \
+            --remote "${{ steps.storage.outputs.remote_name }}"
+      - name: Destroy temporary credentials
+        if: always()
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ steps.storage.outputs.config_file }}
+        run: |
+          if [[ -n "${CONFIG_FILE:-}" && -f "$CONFIG_FILE" ]]; then
+            shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+          fi

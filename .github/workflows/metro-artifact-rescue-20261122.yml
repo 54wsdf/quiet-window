@@ -1,4 +1,4 @@
-name: Rescue Metro Historical Hourly Artifact to Transferable Chunks
+name: Rescue Metro 2025 Estimated OD Artifact to Transferable Chunks
 on:
   push:
     branches: [metro-artifact-rescue-20261122]
@@ -10,440 +10,1525 @@ permissions:
 jobs:
   rescue:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
-      - name: Retrieve historical hourly artifact from source run
+      - name: Download 2025 estimated OD source artifact
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: '14774585863'
+          artifact-ids: '14776167381'
           run-id: '45044957634'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: incoming
           merge-multiple: true
-      - name: Verify original SHA256 and split into 64 MiB chunks
+      - name: Validate original source SHA256 and prepare 64 MiB recovery manifest
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          import hashlib,json
+          import hashlib,json,math
+          source=Path('incoming/nyc_od_2025.csv.gz')
           manifest=Path('incoming/manifest.json')
-          assert manifest.exists(), 'Missing source manifest'
+          assert source.is_file() and manifest.is_file(), 'Missing expected incoming files'
           m=json.loads(manifest.read_text())
-          assert m['task']=='nyc_hourly_2020_2024' and m['status']=='COLLECTED', m
-          sources=list(Path('incoming').glob('*.csv.gz'))
-          assert len(sources)==1, f'Unexpected csv.gz sources: {sources}'
-          source=sources[0]
+          assert m['task']=='nyc_od_2025' and m['status']=='COLLECTED',m
           match=[v for v in m['items'] if v.get('file')==source.name]
-          assert len(match)==1 and match[0].get('sha256'),f'Missing SHA256 record for {source.name}'
-          expected=match[0]['sha256']
+          assert len(match)==1 and match[0].get('sha256'),'No original SHA256'
           out=Path('out'); (out/'parts').mkdir(parents=True,exist_ok=True)
-          total=hashlib.sha256(); entries=[]
+          h=hashlib.sha256();entries=[];n=0
           with source.open('rb') as f:
-              i=0
-              while (buf:=f.read(64*1024*1024)):
-                  total.update(buf)
-                  name=f'{source.name}.part{i:03}'
-                  (out/'parts'/name).write_bytes(buf)
-                  entries.append({'name':name,'bytes':len(buf),'sha256':hashlib.sha256(buf).hexdigest()})
-                  i+=1
-          assert total.hexdigest()==expected, f'Original SHA256 mismatch {total.hexdigest()} != {expected}'
-          assert len(entries)<=48 and len(entries)>=45, f'Unexpected chunk count: {len(entries)}'
+              while (b:=f.read(64*1024*1024)):
+                  h.update(b)
+                  name=f'{source.name}.part{n:03}'
+                  entries.append({'name':name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+                  n+=1
+          assert h.hexdigest()==match[0]['sha256'],f'Original SHA256 mismatch: {h.hexdigest()} != {match[0]["sha256"]}'
+          assert len(entries)==67,f'Expected 67 parts but got {len(entries)}'
           (out/'original_manifest.json').write_bytes(manifest.read_bytes())
-          recovery={'task':'nyc_hourly_2020_2024','source_run_id':45044957634,'source_artifact_id':14774585863,'original_file':source.name,'original_bytes':source.stat().st_size,'original_sha256':total.hexdigest(),'parts':entries,'reassemble':'cat '+ ' '.join(e['name'] for e in entries)+' > '+source.name,'note':'Each part is inside one GitHub Artifact ZIP; extract parts and concatenate in ascending index order.'}
+          recovery={'task':'nyc_od_2025','source_run_id':45044957634,'source_artifact_id':14776167381,'original_file':source.name,'original_bytes':source.stat().st_size,'original_sha256':h.hexdigest(),'parts':entries,'reassemble':'cat '+' '.join(e['name'] for e in entries)+' > '+source.name,'note':'Each 64MiB data chunk is in a separate Actions Artifact ZIP; extract each and concatenate by ascending part number. SHA256 matches source.'}
           (out/'recovery_manifest.json').write_text(json.dumps(recovery,indent=2)+'\n')
-          print('RECOVERED', source.name,source.stat().st_size,'PARTS',len(entries),'SHA',total.hexdigest(),flush=True)
+          print('VERIFIED',source.name,source.stat().st_size,'PARTS',len(entries),'SHA',h.hexdigest(),flush=True)
           PY
       - name: Upload original and recovery manifests
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_manifest
+          name: rescued_nyc_od_2025_manifest
           path: |
             out/original_manifest.json
             out/recovery_manifest.json
           retention-days: 3
           compression-level: 0
           if-no-files-found: error
-      - name: Upload data chunk 000
+      - name: Prepare chunk 000 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=0; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part000')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 000'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 000
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part000
-          path: out/parts/*.part000
+          name: rescued_nyc_od_2025_part000
+          path: out/parts/nyc_od_2025.csv.gz.part000
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 001
+          if-no-files-found: error
+      - name: Prepare chunk 001 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=1; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part001')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 001'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 001
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part001
-          path: out/parts/*.part001
+          name: rescued_nyc_od_2025_part001
+          path: out/parts/nyc_od_2025.csv.gz.part001
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 002
+          if-no-files-found: error
+      - name: Prepare chunk 002 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=2; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part002')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 002'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 002
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part002
-          path: out/parts/*.part002
+          name: rescued_nyc_od_2025_part002
+          path: out/parts/nyc_od_2025.csv.gz.part002
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 003
+          if-no-files-found: error
+      - name: Prepare chunk 003 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=3; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part003')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 003'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 003
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part003
-          path: out/parts/*.part003
+          name: rescued_nyc_od_2025_part003
+          path: out/parts/nyc_od_2025.csv.gz.part003
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 004
+          if-no-files-found: error
+      - name: Prepare chunk 004 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=4; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part004')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 004'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 004
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part004
-          path: out/parts/*.part004
+          name: rescued_nyc_od_2025_part004
+          path: out/parts/nyc_od_2025.csv.gz.part004
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 005
+          if-no-files-found: error
+      - name: Prepare chunk 005 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=5; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part005')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 005'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 005
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part005
-          path: out/parts/*.part005
+          name: rescued_nyc_od_2025_part005
+          path: out/parts/nyc_od_2025.csv.gz.part005
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 006
+          if-no-files-found: error
+      - name: Prepare chunk 006 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=6; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part006')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 006'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 006
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part006
-          path: out/parts/*.part006
+          name: rescued_nyc_od_2025_part006
+          path: out/parts/nyc_od_2025.csv.gz.part006
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 007
+          if-no-files-found: error
+      - name: Prepare chunk 007 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=7; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part007')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 007'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 007
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part007
-          path: out/parts/*.part007
+          name: rescued_nyc_od_2025_part007
+          path: out/parts/nyc_od_2025.csv.gz.part007
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 008
+          if-no-files-found: error
+      - name: Prepare chunk 008 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=8; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part008')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 008'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 008
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part008
-          path: out/parts/*.part008
+          name: rescued_nyc_od_2025_part008
+          path: out/parts/nyc_od_2025.csv.gz.part008
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 009
+          if-no-files-found: error
+      - name: Prepare chunk 009 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=9; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part009')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 009'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 009
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part009
-          path: out/parts/*.part009
+          name: rescued_nyc_od_2025_part009
+          path: out/parts/nyc_od_2025.csv.gz.part009
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 010
+          if-no-files-found: error
+      - name: Prepare chunk 010 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=10; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part010')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 010'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 010
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part010
-          path: out/parts/*.part010
+          name: rescued_nyc_od_2025_part010
+          path: out/parts/nyc_od_2025.csv.gz.part010
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 011
+          if-no-files-found: error
+      - name: Prepare chunk 011 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=11; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part011')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 011'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 011
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part011
-          path: out/parts/*.part011
+          name: rescued_nyc_od_2025_part011
+          path: out/parts/nyc_od_2025.csv.gz.part011
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 012
+          if-no-files-found: error
+      - name: Prepare chunk 012 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=12; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part012')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 012'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 012
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part012
-          path: out/parts/*.part012
+          name: rescued_nyc_od_2025_part012
+          path: out/parts/nyc_od_2025.csv.gz.part012
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 013
+          if-no-files-found: error
+      - name: Prepare chunk 013 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=13; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part013')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 013'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 013
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part013
-          path: out/parts/*.part013
+          name: rescued_nyc_od_2025_part013
+          path: out/parts/nyc_od_2025.csv.gz.part013
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 014
+          if-no-files-found: error
+      - name: Prepare chunk 014 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=14; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part014')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 014'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 014
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part014
-          path: out/parts/*.part014
+          name: rescued_nyc_od_2025_part014
+          path: out/parts/nyc_od_2025.csv.gz.part014
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 015
+          if-no-files-found: error
+      - name: Prepare chunk 015 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=15; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part015')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 015'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 015
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part015
-          path: out/parts/*.part015
+          name: rescued_nyc_od_2025_part015
+          path: out/parts/nyc_od_2025.csv.gz.part015
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 016
+          if-no-files-found: error
+      - name: Prepare chunk 016 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=16; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part016')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 016'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 016
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part016
-          path: out/parts/*.part016
+          name: rescued_nyc_od_2025_part016
+          path: out/parts/nyc_od_2025.csv.gz.part016
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 017
+          if-no-files-found: error
+      - name: Prepare chunk 017 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=17; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part017')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 017'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 017
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part017
-          path: out/parts/*.part017
+          name: rescued_nyc_od_2025_part017
+          path: out/parts/nyc_od_2025.csv.gz.part017
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 018
+          if-no-files-found: error
+      - name: Prepare chunk 018 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=18; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part018')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 018'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 018
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part018
-          path: out/parts/*.part018
+          name: rescued_nyc_od_2025_part018
+          path: out/parts/nyc_od_2025.csv.gz.part018
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 019
+          if-no-files-found: error
+      - name: Prepare chunk 019 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=19; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part019')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 019'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 019
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part019
-          path: out/parts/*.part019
+          name: rescued_nyc_od_2025_part019
+          path: out/parts/nyc_od_2025.csv.gz.part019
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 020
+          if-no-files-found: error
+      - name: Prepare chunk 020 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=20; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part020')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 020'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 020
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part020
-          path: out/parts/*.part020
+          name: rescued_nyc_od_2025_part020
+          path: out/parts/nyc_od_2025.csv.gz.part020
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 021
+          if-no-files-found: error
+      - name: Prepare chunk 021 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=21; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part021')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 021'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 021
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part021
-          path: out/parts/*.part021
+          name: rescued_nyc_od_2025_part021
+          path: out/parts/nyc_od_2025.csv.gz.part021
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 022
+          if-no-files-found: error
+      - name: Prepare chunk 022 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=22; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part022')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 022'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 022
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part022
-          path: out/parts/*.part022
+          name: rescued_nyc_od_2025_part022
+          path: out/parts/nyc_od_2025.csv.gz.part022
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 023
+          if-no-files-found: error
+      - name: Prepare chunk 023 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=23; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part023')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 023'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 023
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part023
-          path: out/parts/*.part023
+          name: rescued_nyc_od_2025_part023
+          path: out/parts/nyc_od_2025.csv.gz.part023
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 024
+          if-no-files-found: error
+      - name: Prepare chunk 024 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=24; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part024')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 024'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 024
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part024
-          path: out/parts/*.part024
+          name: rescued_nyc_od_2025_part024
+          path: out/parts/nyc_od_2025.csv.gz.part024
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 025
+          if-no-files-found: error
+      - name: Prepare chunk 025 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=25; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part025')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 025'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 025
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part025
-          path: out/parts/*.part025
+          name: rescued_nyc_od_2025_part025
+          path: out/parts/nyc_od_2025.csv.gz.part025
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 026
+          if-no-files-found: error
+      - name: Prepare chunk 026 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=26; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part026')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 026'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 026
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part026
-          path: out/parts/*.part026
+          name: rescued_nyc_od_2025_part026
+          path: out/parts/nyc_od_2025.csv.gz.part026
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 027
+          if-no-files-found: error
+      - name: Prepare chunk 027 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=27; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part027')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 027'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 027
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part027
-          path: out/parts/*.part027
+          name: rescued_nyc_od_2025_part027
+          path: out/parts/nyc_od_2025.csv.gz.part027
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 028
+          if-no-files-found: error
+      - name: Prepare chunk 028 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=28; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part028')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 028'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 028
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part028
-          path: out/parts/*.part028
+          name: rescued_nyc_od_2025_part028
+          path: out/parts/nyc_od_2025.csv.gz.part028
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 029
+          if-no-files-found: error
+      - name: Prepare chunk 029 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=29; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part029')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 029'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 029
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part029
-          path: out/parts/*.part029
+          name: rescued_nyc_od_2025_part029
+          path: out/parts/nyc_od_2025.csv.gz.part029
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 030
+          if-no-files-found: error
+      - name: Prepare chunk 030 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=30; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part030')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 030'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 030
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part030
-          path: out/parts/*.part030
+          name: rescued_nyc_od_2025_part030
+          path: out/parts/nyc_od_2025.csv.gz.part030
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 031
+          if-no-files-found: error
+      - name: Prepare chunk 031 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=31; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part031')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 031'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 031
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part031
-          path: out/parts/*.part031
+          name: rescued_nyc_od_2025_part031
+          path: out/parts/nyc_od_2025.csv.gz.part031
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 032
+          if-no-files-found: error
+      - name: Prepare chunk 032 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=32; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part032')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 032'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 032
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part032
-          path: out/parts/*.part032
+          name: rescued_nyc_od_2025_part032
+          path: out/parts/nyc_od_2025.csv.gz.part032
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 033
+          if-no-files-found: error
+      - name: Prepare chunk 033 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=33; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part033')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 033'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 033
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part033
-          path: out/parts/*.part033
+          name: rescued_nyc_od_2025_part033
+          path: out/parts/nyc_od_2025.csv.gz.part033
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 034
+          if-no-files-found: error
+      - name: Prepare chunk 034 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=34; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part034')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 034'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 034
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part034
-          path: out/parts/*.part034
+          name: rescued_nyc_od_2025_part034
+          path: out/parts/nyc_od_2025.csv.gz.part034
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 035
+          if-no-files-found: error
+      - name: Prepare chunk 035 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=35; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part035')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 035'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 035
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part035
-          path: out/parts/*.part035
+          name: rescued_nyc_od_2025_part035
+          path: out/parts/nyc_od_2025.csv.gz.part035
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 036
+          if-no-files-found: error
+      - name: Prepare chunk 036 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=36; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part036')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 036'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 036
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part036
-          path: out/parts/*.part036
+          name: rescued_nyc_od_2025_part036
+          path: out/parts/nyc_od_2025.csv.gz.part036
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 037
+          if-no-files-found: error
+      - name: Prepare chunk 037 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=37; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part037')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 037'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 037
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part037
-          path: out/parts/*.part037
+          name: rescued_nyc_od_2025_part037
+          path: out/parts/nyc_od_2025.csv.gz.part037
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 038
+          if-no-files-found: error
+      - name: Prepare chunk 038 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=38; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part038')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 038'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 038
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part038
-          path: out/parts/*.part038
+          name: rescued_nyc_od_2025_part038
+          path: out/parts/nyc_od_2025.csv.gz.part038
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 039
+          if-no-files-found: error
+      - name: Prepare chunk 039 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=39; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part039')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 039'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 039
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part039
-          path: out/parts/*.part039
+          name: rescued_nyc_od_2025_part039
+          path: out/parts/nyc_od_2025.csv.gz.part039
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 040
+          if-no-files-found: error
+      - name: Prepare chunk 040 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=40; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part040')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 040'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 040
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part040
-          path: out/parts/*.part040
+          name: rescued_nyc_od_2025_part040
+          path: out/parts/nyc_od_2025.csv.gz.part040
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 041
+          if-no-files-found: error
+      - name: Prepare chunk 041 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=41; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part041')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 041'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 041
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part041
-          path: out/parts/*.part041
+          name: rescued_nyc_od_2025_part041
+          path: out/parts/nyc_od_2025.csv.gz.part041
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 042
+          if-no-files-found: error
+      - name: Prepare chunk 042 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=42; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part042')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 042'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 042
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part042
-          path: out/parts/*.part042
+          name: rescued_nyc_od_2025_part042
+          path: out/parts/nyc_od_2025.csv.gz.part042
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 043
+          if-no-files-found: error
+      - name: Prepare chunk 043 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=43; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part043')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 043'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 043
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part043
-          path: out/parts/*.part043
+          name: rescued_nyc_od_2025_part043
+          path: out/parts/nyc_od_2025.csv.gz.part043
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 044
+          if-no-files-found: error
+      - name: Prepare chunk 044 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=44; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part044')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 044'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 044
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part044
-          path: out/parts/*.part044
+          name: rescued_nyc_od_2025_part044
+          path: out/parts/nyc_od_2025.csv.gz.part044
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 045
+          if-no-files-found: error
+      - name: Prepare chunk 045 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=45; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part045')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 045'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 045
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part045
-          path: out/parts/*.part045
+          name: rescued_nyc_od_2025_part045
+          path: out/parts/nyc_od_2025.csv.gz.part045
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 046
+          if-no-files-found: error
+      - name: Prepare chunk 046 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=46; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part046')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 046'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 046
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part046
-          path: out/parts/*.part046
+          name: rescued_nyc_od_2025_part046
+          path: out/parts/nyc_od_2025.csv.gz.part046
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
-      - name: Upload data chunk 047
+          if-no-files-found: error
+      - name: Prepare chunk 047 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=47; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part047')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 047'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 047
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2020_2024_part047
-          path: out/parts/*.part047
+          name: rescued_nyc_od_2025_part047
+          path: out/parts/nyc_od_2025.csv.gz.part047
           retention-days: 3
           compression-level: 0
-          if-no-files-found: ignore
+          if-no-files-found: error
+      - name: Prepare chunk 048 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=48; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part048')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 048'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 048
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part048
+          path: out/parts/nyc_od_2025.csv.gz.part048
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 049 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=49; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part049')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 049'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 049
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part049
+          path: out/parts/nyc_od_2025.csv.gz.part049
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 050 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=50; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part050')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 050'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 050
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part050
+          path: out/parts/nyc_od_2025.csv.gz.part050
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 051 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=51; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part051')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 051'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 051
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part051
+          path: out/parts/nyc_od_2025.csv.gz.part051
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 052 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=52; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part052')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 052'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 052
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part052
+          path: out/parts/nyc_od_2025.csv.gz.part052
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 053 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=53; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part053')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 053'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 053
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part053
+          path: out/parts/nyc_od_2025.csv.gz.part053
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 054 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=54; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part054')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 054'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 054
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part054
+          path: out/parts/nyc_od_2025.csv.gz.part054
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 055 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=55; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part055')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 055'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 055
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part055
+          path: out/parts/nyc_od_2025.csv.gz.part055
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 056 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=56; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part056')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 056'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 056
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part056
+          path: out/parts/nyc_od_2025.csv.gz.part056
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 057 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=57; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part057')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 057'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 057
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part057
+          path: out/parts/nyc_od_2025.csv.gz.part057
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 058 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=58; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part058')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 058'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 058
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part058
+          path: out/parts/nyc_od_2025.csv.gz.part058
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 059 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=59; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part059')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 059'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 059
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part059
+          path: out/parts/nyc_od_2025.csv.gz.part059
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 060 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=60; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part060')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 060'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 060
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part060
+          path: out/parts/nyc_od_2025.csv.gz.part060
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 061 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=61; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part061')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 061'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 061
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part061
+          path: out/parts/nyc_od_2025.csv.gz.part061
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 062 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=62; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part062')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 062'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 062
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part062
+          path: out/parts/nyc_od_2025.csv.gz.part062
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 063 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=63; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part063')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 063'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 063
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part063
+          path: out/parts/nyc_od_2025.csv.gz.part063
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 064 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=64; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part064')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 064'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 064
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part064
+          path: out/parts/nyc_od_2025.csv.gz.part064
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 065 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=65; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part065')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 065'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 065
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part065
+          path: out/parts/nyc_od_2025.csv.gz.part065
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+      - name: Prepare chunk 066 and release previous chunk
+        shell: bash
+        run: |
+          rm -f out/parts/*
+          python - <<'PY'
+          from pathlib import Path
+          n=66; source=Path('incoming/nyc_od_2025.csv.gz'); dest=Path('out/parts/nyc_od_2025.csv.gz.part066')
+          with source.open('rb') as f:
+              f.seek(n*67108864)
+              data=f.read(67108864)
+          assert data, 'Missing data for chunk 066'
+          dest.write_bytes(data)
+          print('READY',dest,len(data),flush=True)
+          PY
+      - name: Upload chunk 066
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_od_2025_part066
+          path: out/parts/nyc_od_2025.csv.gz.part066
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error

@@ -1,4 +1,4 @@
-name: Rescue Metro Hourly Large Artifact to Transferable Chunks
+name: Rescue Metro Historical Hourly Artifact to Transferable Chunks
 on:
   push:
     branches: [metro-artifact-rescue-20261122]
@@ -12,49 +12,51 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Retrieve original 1.15 GB artifact from source run
+      - name: Retrieve historical hourly artifact from source run
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: '14771599104'
+          artifact-ids: '14774585863'
           run-id: '45044957634'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: incoming
           merge-multiple: true
-      - name: Validate SHA256 and split into 64 MiB chunks
+      - name: Verify original SHA256 and split into 64 MiB chunks
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          import hashlib, json, os
-          source=Path('incoming/nyc_station_hourly_2025on.csv.gz')
+          import hashlib,json
           manifest=Path('incoming/manifest.json')
-          assert source.is_file() and manifest.is_file(), 'Missing source artifact files'
-          src_manifest=json.loads(manifest.read_text())
-          assert src_manifest['task']=='nyc_hourly_2025on' and src_manifest['status']=='COLLECTED'
-          expected=next(x['sha256'] for x in src_manifest['items'] if x.get('file')==source.name)
+          assert manifest.exists(), 'Missing source manifest'
+          m=json.loads(manifest.read_text())
+          assert m['task']=='nyc_hourly_2020_2024' and m['status']=='COLLECTED', m
+          sources=list(Path('incoming').glob('*.csv.gz'))
+          assert len(sources)==1, f'Unexpected csv.gz sources: {sources}'
+          source=sources[0]
+          match=[v for v in m['items'] if v.get('file')==source.name]
+          assert len(match)==1 and match[0].get('sha256'),f'Missing SHA256 record for {source.name}'
+          expected=match[0]['sha256']
           out=Path('out'); (out/'parts').mkdir(parents=True,exist_ok=True)
-          def sha(b):return hashlib.sha256(b).hexdigest()
-          total=hashlib.sha256(); entries=[]; n=0
+          total=hashlib.sha256(); entries=[]
           with source.open('rb') as f:
-              while True:
-                  buf=f.read(64*1024*1024)
-                  if not buf:break
+              i=0
+              while (buf:=f.read(64*1024*1024)):
                   total.update(buf)
-                  name=f'{source.name}.part{n:03}'
+                  name=f'{source.name}.part{i:03}'
                   (out/'parts'/name).write_bytes(buf)
-                  entries.append({'name':name,'bytes':len(buf),'sha256':sha(buf)})
-                  n+=1
-          assert total.hexdigest()==expected, f'Manifest sha256 mismatch: {total.hexdigest()} != {expected}'
-          assert len(entries)==18, f'Unexpected parts count {len(entries)}'
+                  entries.append({'name':name,'bytes':len(buf),'sha256':hashlib.sha256(buf).hexdigest()})
+                  i+=1
+          assert total.hexdigest()==expected, f'Original SHA256 mismatch {total.hexdigest()} != {expected}'
+          assert len(entries)<=48 and len(entries)>=45, f'Unexpected chunk count: {len(entries)}'
           (out/'original_manifest.json').write_bytes(manifest.read_bytes())
-          info={'task':'nyc_hourly_2025on','source_run_id':45044957634,'source_artifact_id':14771599104,'original_file':source.name,'original_bytes':source.stat().st_size,'original_sha256':total.hexdigest(),'parts':entries,'reassemble':'cat '+ ' '.join('part'+str(i).zfill(3) for i in range(len(entries)))+' > '+source.name,'note':'Each part is stored inside an individual GitHub Actions artifact ZIP; extract each part and concatenate in ascending order.'}
-          (out/'recovery_manifest.json').write_text(json.dumps(info,indent=2)+'\n')
-          print('RECOVERED',source.name, source.stat().st_size,'PARTS',len(entries),'SHA',total.hexdigest(),flush=True)
+          recovery={'task':'nyc_hourly_2020_2024','source_run_id':45044957634,'source_artifact_id':14774585863,'original_file':source.name,'original_bytes':source.stat().st_size,'original_sha256':total.hexdigest(),'parts':entries,'reassemble':'cat '+ ' '.join(e['name'] for e in entries)+' > '+source.name,'note':'Each part is inside one GitHub Artifact ZIP; extract parts and concatenate in ascending index order.'}
+          (out/'recovery_manifest.json').write_text(json.dumps(recovery,indent=2)+'\n')
+          print('RECOVERED', source.name,source.stat().st_size,'PARTS',len(entries),'SHA',total.hexdigest(),flush=True)
           PY
-      - name: Upload source manifest and reconstruction instructions
+      - name: Upload original and recovery manifests
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_manifest
+          name: rescued_nyc_hourly_2020_2024_manifest
           path: |
             out/original_manifest.json
             out/recovery_manifest.json
@@ -64,144 +66,384 @@ jobs:
       - name: Upload data chunk 000
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part000
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part000
+          name: rescued_nyc_hourly_2020_2024_part000
+          path: out/parts/*.part000
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 001
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part001
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part001
+          name: rescued_nyc_hourly_2020_2024_part001
+          path: out/parts/*.part001
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 002
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part002
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part002
+          name: rescued_nyc_hourly_2020_2024_part002
+          path: out/parts/*.part002
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 003
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part003
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part003
+          name: rescued_nyc_hourly_2020_2024_part003
+          path: out/parts/*.part003
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 004
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part004
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part004
+          name: rescued_nyc_hourly_2020_2024_part004
+          path: out/parts/*.part004
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 005
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part005
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part005
+          name: rescued_nyc_hourly_2020_2024_part005
+          path: out/parts/*.part005
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 006
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part006
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part006
+          name: rescued_nyc_hourly_2020_2024_part006
+          path: out/parts/*.part006
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 007
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part007
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part007
+          name: rescued_nyc_hourly_2020_2024_part007
+          path: out/parts/*.part007
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 008
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part008
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part008
+          name: rescued_nyc_hourly_2020_2024_part008
+          path: out/parts/*.part008
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 009
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part009
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part009
+          name: rescued_nyc_hourly_2020_2024_part009
+          path: out/parts/*.part009
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 010
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part010
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part010
+          name: rescued_nyc_hourly_2020_2024_part010
+          path: out/parts/*.part010
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 011
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part011
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part011
+          name: rescued_nyc_hourly_2020_2024_part011
+          path: out/parts/*.part011
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 012
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part012
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part012
+          name: rescued_nyc_hourly_2020_2024_part012
+          path: out/parts/*.part012
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 013
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part013
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part013
+          name: rescued_nyc_hourly_2020_2024_part013
+          path: out/parts/*.part013
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 014
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part014
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part014
+          name: rescued_nyc_hourly_2020_2024_part014
+          path: out/parts/*.part014
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 015
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part015
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part015
+          name: rescued_nyc_hourly_2020_2024_part015
+          path: out/parts/*.part015
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 016
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part016
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part016
+          name: rescued_nyc_hourly_2020_2024_part016
+          path: out/parts/*.part016
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload data chunk 017
         uses: actions/upload-artifact@v4
         with:
-          name: rescued_nyc_hourly_2025on_part017
-          path: out/parts/nyc_station_hourly_2025on.csv.gz.part017
+          name: rescued_nyc_hourly_2020_2024_part017
+          path: out/parts/*.part017
           retention-days: 3
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: ignore
+      - name: Upload data chunk 018
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part018
+          path: out/parts/*.part018
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 019
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part019
+          path: out/parts/*.part019
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 020
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part020
+          path: out/parts/*.part020
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 021
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part021
+          path: out/parts/*.part021
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 022
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part022
+          path: out/parts/*.part022
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 023
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part023
+          path: out/parts/*.part023
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 024
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part024
+          path: out/parts/*.part024
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 025
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part025
+          path: out/parts/*.part025
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 026
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part026
+          path: out/parts/*.part026
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 027
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part027
+          path: out/parts/*.part027
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 028
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part028
+          path: out/parts/*.part028
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 029
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part029
+          path: out/parts/*.part029
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 030
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part030
+          path: out/parts/*.part030
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 031
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part031
+          path: out/parts/*.part031
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 032
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part032
+          path: out/parts/*.part032
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 033
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part033
+          path: out/parts/*.part033
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 034
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part034
+          path: out/parts/*.part034
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 035
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part035
+          path: out/parts/*.part035
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 036
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part036
+          path: out/parts/*.part036
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 037
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part037
+          path: out/parts/*.part037
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 038
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part038
+          path: out/parts/*.part038
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 039
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part039
+          path: out/parts/*.part039
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 040
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part040
+          path: out/parts/*.part040
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 041
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part041
+          path: out/parts/*.part041
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 042
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part042
+          path: out/parts/*.part042
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 043
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part043
+          path: out/parts/*.part043
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 044
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part044
+          path: out/parts/*.part044
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 045
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part045
+          path: out/parts/*.part045
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 046
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part046
+          path: out/parts/*.part046
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Upload data chunk 047
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescued_nyc_hourly_2020_2024_part047
+          path: out/parts/*.part047
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore

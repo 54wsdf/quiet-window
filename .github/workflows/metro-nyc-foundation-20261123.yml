@@ -1,0 +1,56 @@
+name: NYC Metro GTFS and Official Dataset Metadata 2026-11-23
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nyc-foundation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install clients
+        run: pip install --disable-pip-version-check requests beautifulsoup4
+      - name: Get official NYC subway GTFS snapshot
+        run: |
+          python scripts/fetchers/metro_afc_artifact_fetch_20261123.py --task nyc_gtfs --output-root out
+      - name: Save MTA dataset metadata and data dictionaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/nyc_gtfs/mta_metadata
+          for entry in \
+            'q9nv-uegs_2025-schedules' \
+            'y2qv-fytt_2025-estimated-OD' \
+            '5wq4-mkjj_2025plus-hourly-entry' \
+            '28vm-gjqr_2026plus-estimated-OD'; do
+            id="${entry%%_*}"
+            curl -fL --retry 4 --max-time 120 \
+              "https://data.ny.gov/api/views/$id.json" \
+              -o "out/nyc_gtfs/mta_metadata/$entry.dataset.json"
+            curl -fL --retry 4 --max-time 120 \
+              "https://data.ny.gov/api/views/$id/columns.json" \
+              -o "out/nyc_gtfs/mta_metadata/$entry.columns.json"
+          done
+          python - <<'PY'
+          import json,glob
+          for f in glob.glob("out/nyc_gtfs/mta_metadata/*.json"):
+              with open(f) as fd: data=json.load(fd)
+              assert data
+          print("MTA metadata files validated:",len(glob.glob("out/nyc_gtfs/mta_metadata/*.json")))
+          PY
+      - name: Upload to transfer bridge
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyc_gtfs_foundation_20261123
+          path: out/nyc_gtfs/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error

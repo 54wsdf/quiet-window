@@ -1,0 +1,41 @@
+name: ATS Public Historical Parquet Validation 20261123
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - { provider: mbta, month: '2025-01' }
+          - { provider: mbta, month: '2026-10' }
+          - { provider: transitlab, month: '2025-01' }
+          - { provider: transitlab, month: '2026-10' }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install --disable-pip-version-check requests
+      - name: Collect monthly actual train observations
+        run: >
+          python scripts/fetchers/ats_public_monthly_archive_20261123.py
+          --provider "${{ matrix.provider }}"
+          --month "${{ matrix.month }}"
+      - name: Save validated files and manifest to transfer bridge
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.provider }}_${{ matrix.month }}
+          path: out/${{ matrix.provider }}_${{ matrix.month }}/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn

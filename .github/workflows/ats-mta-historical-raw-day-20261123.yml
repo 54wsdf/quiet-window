@@ -1,0 +1,29 @@
+name: ATS MTA Historical Raw Realtime and CSV Matched Day
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install --disable-pip-version-check requests
+      - name: Download January 8 2025 actual GTFS-RT protobuf archive and CSV
+        run: python scripts/fetchers/ats_mta_historical_raw_day_20261123.py
+      - name: Publish original archival packages with SHA-256 manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mta_historical_raw_day_2025-01-08
+          path: out/subwaydata_20250108/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: warn

@@ -1,0 +1,31 @@
+name: ATS Public Data Discovery and Realtime Snapshots 20261123
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install downloader
+        run: pip install --disable-pip-version-check requests
+      - name: Download actual public data and inspect sources
+        shell: bash
+        run: python scripts/fetchers/ats_public_discovery_20261123.py
+      - name: Publish verified data for Google Drive bridge
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ats_discovery_20261123
+          path: out/ats_discovery_20261123/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

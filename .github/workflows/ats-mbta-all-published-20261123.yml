@@ -1,0 +1,66 @@
+name: ATS MBTA Complete Published Daily Subway Performance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ats-mbta-all-20261123
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      months: ${{ steps.months.outputs.months }}
+    steps:
+      - name: Discover official index dates and months
+        id: months
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, urllib.request, re, json, csv, io, datetime
+          url='https://performancedata.mbta.com/lamp/subway-on-time-performance-v1/index.csv'
+          with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent':'Public-Academic-Transit-Archive/1.0'}),timeout=90) as r:
+              data=r.read().decode('utf-8-sig',errors='replace')
+          months=sorted(set(x[:7] for x in re.findall(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}',data)))
+          months=[m for m in months if m<'2026-12']
+          if not months: raise SystemExit('No published MBTA service dates found')
+          print('Official MBTA months',len(months),months[:4],months[-4:])
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('months='+json.dumps(months,separators=(',',':'))+'\n')
+          PY
+  acquire:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        month: ${{ fromJson(needs.discover.outputs.months) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install --disable-pip-version-check requests
+      - name: Collect official MBTA daily parquet
+        shell: bash
+        run: |
+          python scripts/fetchers/ats_public_monthly_archive_20261123.py \
+            --provider mbta \
+            --month "${{ matrix.month }}" \
+            --output-root out
+      - name: Retain original daily files and manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ats_mbta_${{ matrix.month }}
+          path: out/mbta_${{ matrix.month }}/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7

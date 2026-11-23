@@ -1,0 +1,66 @@
+name: ATS NYC Complete TransitLab Subway Departure Events
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ats-transitlab-all-20261123
+  cancel-in-progress: false
+
+jobs:
+  months:
+    runs-on: ubuntu-latest
+    outputs:
+      months: ${{ steps.build.outputs.months }}
+    steps:
+      - name: Enumerate April 2021 to current published calendar month
+        id: build
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json,datetime,os
+          today=datetime.datetime.now(datetime.timezone.utc).date()-datetime.timedelta(days=2)
+          months=[]
+          for y in range(2021,today.year+1):
+              for m in range(1,13):
+                  if (y,m)<(2021,4) or (y,m)>(today.year,today.month): continue
+                  months.append(f'{y}-{m:02d}')
+          print('TransitLab calendar months',len(months),months[0],months[-1])
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('months='+json.dumps(months,separators=(',',':'))+'\n')
+          PY
+  acquire:
+    needs: months
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        month: ${{ fromJson(needs.months.outputs.months) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install HTTP client
+        run: pip install --disable-pip-version-check requests
+      - name: Fetch original departure event Parquet files for month
+        shell: bash
+        run: |
+          python scripts/fetchers/ats_public_monthly_archive_20261123.py \
+            --provider transitlab \
+            --month "${{ matrix.month }}" \
+            --output-root out
+      - name: Upload data and per-day checksums as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ats_transitlab_${{ matrix.month }}
+          path: out/transitlab_${{ matrix.month }}/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
